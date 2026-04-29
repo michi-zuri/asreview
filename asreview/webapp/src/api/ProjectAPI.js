@@ -364,7 +364,9 @@ class ProjectAPI {
     const url = api_url + `projects/${variables.project_id}/train`;
 
     let data = new FormData();
-    data.set("ranking", variables.ranking);
+    if (variables.ranking) {
+      data.set("ranking", variables.ranking);
+    }
 
     return new Promise((resolve, reject) => {
       axios({
@@ -386,6 +388,21 @@ class ProjectAPI {
   static fetchProjectStatus({ queryKey }) {
     const { project_id } = queryKey[1];
     const url = api_url + `projects/${project_id}/status`;
+    return new Promise((resolve, reject) => {
+      axios
+        .get(url, { withCredentials: true })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static fetchTrainingProgress({ queryKey }) {
+    const { project_id } = queryKey[1];
+    const url = api_url + `projects/${project_id}/training_progress`;
     return new Promise((resolve, reject) => {
       axios
         .get(url, { withCredentials: true })
