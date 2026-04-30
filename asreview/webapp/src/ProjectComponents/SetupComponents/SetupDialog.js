@@ -227,6 +227,7 @@ const SetupDialog = ({ project_id, mode, open, onClose }) => {
                   setStatus({
                     project_id: data?.id,
                     status: projectStatuses.REVIEW,
+                    trigger_model: true,
                   });
                 }}
               >

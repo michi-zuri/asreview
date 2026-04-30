@@ -802,6 +802,29 @@ def api_get_status(project):  # noqa: F401
     return jsonify({"status": project.review["status"]})
 
 
+@bp.route("/projects/<project_id>/training_progress", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_training_progress(project):  # noqa: F401
+    """Get the current training progress.
+
+    Returns the current phase of model training (feature extraction,
+    fitting, ranking, etc.) so the frontend can display meaningful
+    progress instead of just a spinner.
+    """
+    from asreview.webapp._tasks import TRAINING_PROGRESS_FILE
+
+    progress_path = Path(project.project_path) / TRAINING_PROGRESS_FILE
+    if progress_path.exists():
+        try:
+            data = json.loads(progress_path.read_text())
+            return jsonify(data)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return jsonify({"phase": None, "label": None})
+
+
 @bp.route("/projects/<project_id>/review", methods=["GET"])
 @login_required
 @project_authorization

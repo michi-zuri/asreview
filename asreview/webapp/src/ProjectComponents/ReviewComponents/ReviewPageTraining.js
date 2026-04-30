@@ -1,6 +1,6 @@
 import * as React from "react";
 import ReactLoading from "react-loading";
-import { useMutation } from "react-query";
+import { useMutation, useQuery } from "react-query";
 import { ProjectAPI } from "api";
 
 import {
@@ -13,6 +13,8 @@ import {
   DialogContentText,
   DialogActions,
   Fade,
+  LinearProgress,
+  Box,
 } from "@mui/material";
 import { styled, useTheme } from "@mui/material/styles";
 
@@ -52,20 +54,65 @@ const Root = styled("div")(({ theme }) => ({
   },
 }));
 
+const TRAINING_PHASES = [
+  "loading",
+  "feature_extraction",
+  "fitting",
+  "ranking",
+  "saving",
+];
+
+const phaseToStep = (phase) => {
+  const idx = TRAINING_PHASES.indexOf(phase);
+  return idx >= 0 ? idx : 0;
+};
+
+// Seconds after which we consider training to not be running
+// and show the retry button
+const TRAINING_STALE_SECONDS = 15;
+
 const FinishSetup = ({ project_id, refetch }) => {
   const theme = useTheme();
 
   const [openSkipTraining, toggleSkipTraining] = useToggle();
+  const autoTriggered = React.useRef(false);
 
-  // mutate and start new training
-  const { mutate: startTraining, isLoading: isTraining } = useMutation(
-    ProjectAPI.mutateTraining,
+  // Poll training progress every 3 seconds
+  const { data: progress } = useQuery(
+    ["fetchTrainingProgress", { project_id }],
+    ProjectAPI.fetchTrainingProgress,
     {
-      onSuccess: () => {
-        refetch();
-      },
+      refetchInterval: 500,
+      refetchIntervalInBackground: true,
+      refetchOnWindowFocus: false,
     },
   );
+
+  // mutate and start new training
+  const {
+    mutate: startTraining,
+    isLoading: isTraining,
+    isError: isTrainingError,
+  } = useMutation(ProjectAPI.mutateTraining, {
+    onSuccess: () => {
+      refetch();
+    },
+  });
+
+  // Auto-trigger training on mount. This is a safety net: if the
+  // setup->review transition failed to start training, this ensures
+  // it gets started. The backend is idempotent — duplicate queue
+  // entries for the same project are rejected by the task manager.
+  React.useEffect(() => {
+    if (autoTriggered.current) return;
+    autoTriggered.current = true;
+    startTraining({ project_id: project_id });
+  }, [project_id, startTraining]);
+
+  const retryTraining = () => {
+    autoTriggered.current = true;
+    startTraining({ project_id: project_id });
+  };
 
   const skipTraining = (method) => {
     if (method === "random") {
@@ -74,6 +121,22 @@ const FinishSetup = ({ project_id, refetch }) => {
       startTraining({ project_id: project_id, ranking: "top_down" });
     }
   };
+
+  const currentStep = progress?.phase ? phaseToStep(progress.phase) : 0;
+  const progressPercent = ((currentStep + 1) / TRAINING_PHASES.length) * 100;
+
+  const progressLabel = progress?.label || "Warming up the AI!";
+
+  const datasetInfo =
+    progress?.n_records && progress?.n_labeled
+      ? `${progress.n_labeled.toLocaleString()} labeled records out of ${progress.n_records.toLocaleString()}`
+      : null;
+
+  // Show retry if we auto-triggered but still no progress after a while,
+  // or if the training mutation returned an error
+  const showRetry =
+    isTrainingError ||
+    (autoTriggered.current && !isTraining && !progress?.phase);
 
   return (
     <Root aria-label="review page training">
@@ -90,12 +153,47 @@ const FinishSetup = ({ project_id, refetch }) => {
           <Typography className={classes.textTitle} variant="h5">
             Warming up the AI!
           </Typography>
-          <ReactLoading
-            type="bubbles"
-            color={theme.palette.primary.main}
-            height={60}
-            width={60}
-          />
+          {progress?.phase ? (
+            <Box sx={{ width: "60%", maxWidth: 400 }}>
+              <LinearProgress
+                variant="determinate"
+                value={progressPercent}
+                sx={{ height: 8, borderRadius: 4 }}
+              />
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ mt: 1, textAlign: "center" }}
+              >
+                {progressLabel}
+              </Typography>
+              {datasetInfo && (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ textAlign: "center", display: "block" }}
+                >
+                  {datasetInfo}
+                </Typography>
+              )}
+            </Box>
+          ) : (
+            <ReactLoading
+              type="bubbles"
+              color={theme.palette.primary.main}
+              height={60}
+              width={60}
+            />
+          )}
+          {showRetry && (
+            <Button
+              variant="outlined"
+              onClick={retryTraining}
+              disabled={isTraining}
+            >
+              Retry training
+            </Button>
+          )}
           <Button onClick={toggleSkipTraining} disabled={isTraining}>
             I can't wait
           </Button>
