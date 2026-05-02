@@ -84,7 +84,7 @@ def create_app(**config_vars):
         # Login Manager
         login_manager = LoginManager(app)
         login_manager.init_app(app)
-        login_manager.session_protection = "strong"
+        login_manager.session_protection = "basic"
 
         # set authentication to True when no auth. arguments are provided.
         app.config["AUTHENTICATION"] = True
