@@ -554,7 +554,7 @@ def api_get_labeled(project):  # noqa: F401
     """Get all records classified as labeled documents"""
 
     page = request.args.get("page", default=None, type=int)
-    per_page = request.args.get("per_page", default=20, type=int)
+    per_page = request.args.get("per_page", default=200, type=int)
     subset = request.args.get("subset", default="all", type=str)
     filters = request.args.getlist("filter", type=str)
     latest_first = request.args.get("latest_first", default=1, type=int)
