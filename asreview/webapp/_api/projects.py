@@ -556,9 +556,26 @@ def api_get_labeled(project):  # noqa: F401
     filters = request.args.getlist("filter", type=str)
     latest_first = request.args.get("latest_first", default=1, type=int)
 
+    # Parse boolean filters. Supported formats:
+    #   "is_prior" or "is_prior=true"  → only priors
+    #   "is_prior=false"               → exclude priors
+    #   "has_note" or "has_note=true"  → only records with notes
+    #   "has_note=false"               → only records without notes
+    parsed_filters = {}
+    for f in filters:
+        if "=" in f:
+            key, val = f.split("=", 1)
+            parsed_filters[key] = val.lower() == "true"
+        else:
+            parsed_filters[f] = True
+
     with project.db as db:
-        if "is_prior" in filters:
+        filter_is_prior = parsed_filters.get("is_prior")
+        if filter_is_prior is True:
             state_data = db.get_priors()
+        elif filter_is_prior is False:
+            # All labeled records that are NOT priors
+            state_data = db.get_results_table(priors=False)
         else:
             state_data = db.get_results_table()
 
@@ -569,8 +586,28 @@ def api_get_labeled(project):  # noqa: F401
     else:
         state_data = state_data[~state_data["label"].isnull()]
 
-    if "has_note" in filters:
+    filter_has_note = parsed_filters.get("has_note")
+    if filter_has_note is True:
         state_data = state_data[~state_data["note"].isnull()]
+    elif filter_has_note is False:
+        state_data = state_data[state_data["note"].isnull()]
+
+    # Tag filters. Supported format:
+    #   "tag_{group_export}_{value_export}" or "...=true"  → tag is set
+    #   "tag_{group_export}_{value_export}=false"           → tag is not set
+    tag_filters = {
+        k: v for k, v in parsed_filters.items() if k.startswith("tag_")
+    }
+    if tag_filters:
+        tags_config = read_tags_data(project)
+        if tags_config is not None:
+            state_data = _flatten_tags(state_data.copy(), tags_config)
+            for tag_col, want_set in tag_filters.items():
+                if tag_col in state_data.columns:
+                    if want_set:
+                        state_data = state_data[state_data[tag_col] == 1]
+                    else:
+                        state_data = state_data[state_data[tag_col] != 1]
 
     if latest_first == 1:
         state_data = state_data.iloc[::-1]
