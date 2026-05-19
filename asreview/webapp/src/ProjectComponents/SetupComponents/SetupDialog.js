@@ -20,6 +20,7 @@ import useMediaQuery from "@mui/material/useMediaQuery";
 
 import {
   DatasetCard,
+  HighlightCard,
   ModelCard,
   PriorCard,
   TagCard,
@@ -201,6 +202,9 @@ const SetupDialog = ({ project_id, mode, open, onClose }) => {
                         project_id={data?.id}
                         mobileScreen={fullScreen}
                       />
+                    </Box>
+                    <Box sx={{ mb: 3 }}>
+                      <HighlightCard project_id={data?.id} />
                     </Box>
                     <Box sx={{ my: 3 }}>
                       <ModelCard mode={mode} />

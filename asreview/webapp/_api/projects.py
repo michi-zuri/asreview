@@ -1078,6 +1078,73 @@ def update_tag_group(project, group_id):
         return jsonify(message="Failed to update tag group."), 500
 
 
+@bp.route("/projects/<project_id>/highlights", methods=["GET"])
+@login_required
+@project_authorization
+def get_highlights(project):
+    """Return the highlight configuration for the project.
+
+    If the file is missing, the feature is considered disabled and an
+    empty/disabled config is returned without creating the file.
+    """
+    highlights_path = Path(project.project_path, "highlights.json")
+
+    try:
+        with open(highlights_path, "r") as f:
+            return jsonify(json.load(f))
+    except FileNotFoundError:
+        return jsonify({"groups": []})
+    except Exception as err:
+        logging.exception(err)
+        return jsonify({"groups": []}), 500
+
+
+@bp.route("/projects/<project_id>/highlights", methods=["PUT"])
+@login_required
+@project_authorization
+def update_highlights(project):
+    """Replace the entire highlight configuration for the project."""
+    highlights_path = Path(project.project_path, "highlights.json")
+
+    try:
+        config = json.loads(request.form.get("config", "{}"))
+    except json.JSONDecodeError:
+        return jsonify(message="Invalid JSON for highlight config."), 400
+
+    if not isinstance(config, dict):
+        return jsonify(message="Highlight config must be an object."), 400
+
+    groups_in = config.get("groups", [])
+    if not isinstance(groups_in, list):
+        return jsonify(message="Highlight 'groups' must be a list."), 400
+
+    cleaned_groups = []
+    for idx, g in enumerate(groups_in):
+        if not isinstance(g, dict):
+            return jsonify(message="Each highlight group must be an object."), 400
+        words = [str(w).strip() for w in g.get("words", []) if str(w).strip()]
+        if not words:
+            # Drop empty groups silently per spec.
+            continue
+        cleaned_groups.append(
+            {
+                "id": int(g.get("id", idx + 1)),
+                "color": str(g.get("color", "yellow")),
+                "words": words,
+            }
+        )
+
+    cleaned = {"groups": cleaned_groups}
+
+    try:
+        with open(highlights_path, "w") as f:
+            json.dump(cleaned, f)
+        return jsonify(cleaned)
+    except Exception as err:
+        logging.exception(err)
+        return jsonify(message="Failed to save highlight config."), 500
+
+
 def _flatten_tags(results, tags_config):
     if tags_config is None:
         del results["tags"]
