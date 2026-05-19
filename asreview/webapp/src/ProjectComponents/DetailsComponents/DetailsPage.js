@@ -2,6 +2,7 @@ import { Container, Stack } from "@mui/material";
 import { useLocation, useParams } from "react-router-dom";
 
 import {
+  HighlightCard,
   ModelCard,
   PriorCard,
   ScreeningCard,
@@ -22,6 +23,7 @@ const DetailsPage = () => {
         <Stack spacing={3}>
           {mode !== projectModes.SIMULATION && <TagCard editable={false} />}
           {mode !== projectModes.SIMULATION && <ScreeningCard />}
+          {mode !== projectModes.SIMULATION && <HighlightCard />}
           <ModelCard mode={mode} editable={mode !== projectModes.SIMULATION} />
           <PriorCard mode={mode} editable={mode !== projectModes.SIMULATION} />
         </Stack>

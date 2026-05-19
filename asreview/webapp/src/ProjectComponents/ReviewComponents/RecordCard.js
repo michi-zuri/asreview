@@ -15,11 +15,21 @@ import {
   Typography,
 } from "@mui/material";
 import React from "react";
+import { useQuery } from "react-query";
 
+import { ProjectAPI } from "api";
 import { StyledIconButton } from "StyledComponents/StyledButton";
 import { useToggle } from "hooks/useToggle";
+import { useHighlightToggle } from "hooks/useHighlightToggle";
 import { DOIIcon } from "icons";
 import { RecordCardLabeler, RecordCardModelTraining } from ".";
+import { useTheme } from "@mui/material/styles";
+import {
+  buildHighlightPatterns,
+  highlightText,
+  matchesAnyEntry,
+  resolveColor,
+} from "utils/highlight";
 
 import { fontSizeOptions } from "globals.js";
 
@@ -28,8 +38,16 @@ const RecordCardContent = ({
   fontSize,
   collapseAbstract,
   hideLinks = false,
+  highlightEntries,
+  highlightOn,
+  paletteMode,
 }) => {
   const [readMoreOpen, toggleReadMore] = useToggle();
+
+  const renderText = (text) =>
+    highlightOn && highlightEntries && highlightEntries.length > 0
+      ? highlightText(text, highlightEntries, paletteMode)
+      : text;
 
   return (
     <CardContent aria-label="record title abstract" sx={{ m: 1 }}>
@@ -54,7 +72,7 @@ const RecordCardContent = ({
 
           {!(record.title === "" || record.title === null) && (
             <Box className={"fontSize" + fontSizeOptions[fontSize]}>
-              {record.title}
+              {renderText(record.title)}
             </Box>
           )}
         </Typography>
@@ -129,7 +147,7 @@ const RecordCardContent = ({
               <>
                 {!readMoreOpen ? (
                   <>
-                    {record.abstract.substring(0, 500)}...
+                    {renderText(record.abstract.substring(0, 500))}...
                     <Button
                       onClick={toggleReadMore}
                       startIcon={<ExpandMoreIcon />}
@@ -141,7 +159,7 @@ const RecordCardContent = ({
                   </>
                 ) : (
                   <>
-                    {record.abstract}
+                    {renderText(record.abstract)}
                     <Button
                       onClick={toggleReadMore}
                       startIcon={<ExpandLessIcon />}
@@ -154,19 +172,40 @@ const RecordCardContent = ({
                 )}
               </>
             ) : (
-              record.abstract
+              renderText(record.abstract)
             )}
           </Typography>
         </Box>
         {record.keywords && (
           <Box sx={{ pt: 1 }}>
             <Typography sx={{ color: "text.secondary", fontWeight: "bold" }}>
-              {record.keywords.map((keyword, index) => (
-                <span key={index}>
-                  {index > 0 && " • "}
-                  {keyword}
-                </span>
-              ))}
+              {record.keywords.map((keyword, index) => {
+                const matched =
+                  highlightOn && highlightEntries
+                    ? matchesAnyEntry(keyword, highlightEntries)
+                    : null;
+                const bg = matched
+                  ? resolveColor(matched.color, paletteMode)
+                  : null;
+                return (
+                  <span key={index}>
+                    {index > 0 && " • "}
+                    {bg ? (
+                      <span
+                        style={{
+                          backgroundColor: bg,
+                          padding: "0 4px",
+                          borderRadius: 3,
+                        }}
+                      >
+                        {keyword}
+                      </span>
+                    ) : (
+                      keyword
+                    )}
+                  </span>
+                );
+              })}
             </Typography>
           </Box>
         )}
@@ -193,6 +232,32 @@ const RecordCard = ({
   changeDecision = true,
 }) => {
   const [open, setOpen] = React.useState(true);
+  const theme = useTheme();
+  const [highlightOn, toggleHighlight] = useHighlightToggle();
+
+  const { data: highlightConfig } = useQuery(
+    ["fetchHighlights", { project_id }],
+    ProjectAPI.fetchHighlights,
+    {
+      enabled: !!project_id,
+      refetchOnWindowFocus: false,
+      staleTime: 60 * 1000,
+    },
+  );
+
+  const highlightAvailable = !!(
+    highlightConfig &&
+    Array.isArray(highlightConfig.groups) &&
+    highlightConfig.groups.some(
+      (g) => Array.isArray(g.words) && g.words.length > 0,
+    )
+  );
+
+  const highlightEntries = React.useMemo(
+    () =>
+      highlightAvailable ? buildHighlightPatterns(highlightConfig.groups) : [],
+    [highlightAvailable, highlightConfig],
+  );
 
   const styledRepoCard = (
     <Box>
@@ -221,6 +286,9 @@ const RecordCard = ({
               fontSize={fontSize}
               collapseAbstract={collapseAbstract}
               hideLinks={hideLinks}
+              highlightEntries={highlightEntries}
+              highlightOn={highlightOn && highlightAvailable}
+              paletteMode={theme.palette.mode}
             />
           </Grid>
           <Grid size={landscape ? 2 : 5}>
@@ -245,6 +313,9 @@ const RecordCard = ({
               landscape={landscape}
               hotkeys={hotkeys}
               changeDecision={changeDecision}
+              highlightAvailable={highlightAvailable}
+              highlightOn={highlightOn}
+              onToggleHighlight={toggleHighlight}
             />
           </Grid>
         </Grid>

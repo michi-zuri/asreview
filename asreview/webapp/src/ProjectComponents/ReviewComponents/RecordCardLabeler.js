@@ -34,6 +34,7 @@ import LibraryAddOutlinedIcon from "@mui/icons-material/LibraryAddOutlined";
 import MoreVert from "@mui/icons-material/MoreVert";
 import NotInterestedOutlinedIcon from "@mui/icons-material/NotInterestedOutlined";
 import NoteAltOutlinedIcon from "@mui/icons-material/NoteAltOutlined";
+import FormatColorFillIcon from "@mui/icons-material/FormatColorFill";
 import { ProjectAPI } from "api";
 import { useToggle } from "hooks/useToggle";
 import TimeAgo from "javascript-time-ago";
@@ -276,6 +277,9 @@ const RecordCardLabeler = ({
   landscape = false,
   retrainAfterDecision = true,
   changeDecision = true,
+  highlightAvailable = false,
+  highlightOn = false,
+  onToggleHighlight = null,
 }) => {
   const [editState] = useToggle(!(label === 1 || label === 0));
   const [showNotesDialog, toggleShowNotesDialog] = useToggle(false);
@@ -551,6 +555,25 @@ const RecordCardLabeler = ({
             </>
           )}
           <Box sx={{ flexGrow: 1 }} />
+
+          {highlightAvailable && (
+            <Tooltip
+              title={
+                highlightOn
+                  ? "Hide keyword highlights"
+                  : "Show keyword highlights"
+              }
+              placement="bottom"
+            >
+              <IconButton
+                onClick={onToggleHighlight}
+                aria-label="toggle keyword highlighting"
+                sx={{ color: highlightOn ? "primary.main" : undefined }}
+              >
+                <FormatColorFillIcon />
+              </IconButton>
+            </Tooltip>
+          )}
 
           {editState && showNotes && (
             <>
