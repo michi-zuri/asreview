@@ -8,6 +8,7 @@ import errno
 from collections import deque
 
 from sqlalchemy import create_engine
+from sqlalchemy import event
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
