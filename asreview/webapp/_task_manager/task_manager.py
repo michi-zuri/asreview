@@ -108,6 +108,14 @@ class TaskManager:
         # set up database
         database_url = f"sqlite:///{asreview_path()}/queue.sqlite"
         engine = create_engine(database_url, pool_size=5, max_overflow=10)
+
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.close()
+
         Base.metadata.create_all(engine)
 
         Session = sessionmaker(bind=engine)
@@ -476,6 +484,15 @@ class TaskManager:
                     break
                 logger.error(f"Socket error occurred: {e}")
                 break  # Exit the loop if the socket is closed
+
+            except Exception as e:
+                logger.exception(f"Unexpected error in task manager loop: {e}")
+                try:
+                    if self.session:
+                        self.session.rollback()
+                except Exception:
+                    pass
+                continue
 
         # After exiting main loop, clean up client thread
         if self.client_thread and self.client_conn:
