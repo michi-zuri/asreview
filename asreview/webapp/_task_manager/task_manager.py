@@ -485,7 +485,7 @@ class TaskManager:
                 logger.error(f"Socket error occurred: {e}")
                 break  # Exit the loop if the socket is closed
 
-            except Exception as e:                       # <-- add this block
+            except Exception as e:
                 logger.exception(f"Unexpected error in task manager loop: {e}")
                 try:
                     if self.session:
