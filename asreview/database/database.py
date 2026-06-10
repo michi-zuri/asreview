@@ -103,6 +103,9 @@ def open_db(fp, read_only=False):
                 " read-only mode"
             ) from e
         db.create_tables()
+    if not read_only:
+        # Backfill indexes on projects created before they were introduced.
+        db.ensure_indexes()
     return db
 
 
@@ -234,9 +237,33 @@ class Database:
                             user_id INTEGER)"""
         )
 
+        # Composite index supporting keyset pagination of the labeled view:
+        # ORDER BY time {ASC|DESC}, record_id {ASC|DESC} with a (time, record_id)
+        # cursor seek. A single index serves both directions (scanned forward
+        # or backward).
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_results_time_record "
+            "ON results(time, record_id)"
+        )
+
         self._conn.commit()
 
         self._set_results_changes_triggers()
+
+    def ensure_indexes(self):
+        """Create indexes that may be missing on pre-existing project DBs.
+
+        Idempotent and cheap (instant on tables of this size, online under WAL),
+        so it is safe to call on every writable open. Existing projects created
+        before the index was introduced pick it up here on next open.
+        """
+        if self.read_only:
+            return
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_results_time_record "
+            "ON results(time, record_id)"
+        )
+        self._conn.commit()
 
     def _is_valid(self):
         if self.user_version != CURRENT_DATABASE_VERSION:
@@ -719,6 +746,93 @@ class Database:
 
         if columns is None or "tags" in columns:
             df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
+        return df_results
+
+    def get_labeled_page(
+        self,
+        per_page=20,
+        cursor=None,
+        latest_first=True,
+        subset="all",
+        has_note=False,
+        is_prior=False,
+    ):
+        """Get one keyset-paginated page of labeled records.
+
+        Pushes filtering, ordering, and pagination down into SQL so that a page
+        load reads ~`per_page` index entries instead of materializing the whole
+        results table. Backed by the ``idx_results_time_record`` composite index.
+
+        Pagination uses a ``(time, record_id)`` cursor rather than LIMIT/OFFSET.
+        ``time`` alone is not unique, so the ``record_id`` tiebreaker is required
+        to give a total order; without it, rows sharing a timestamp would be
+        skipped or duplicated across page boundaries.
+
+        Parameters
+        ----------
+        per_page : int
+            Maximum number of rows to return.
+        cursor : tuple[float, int] | None
+            The ``(time, record_id)`` of the last row of the previous page, or
+            None for the first page.
+        latest_first : bool
+            If True, order most-recent first (``time DESC, record_id DESC``).
+        subset : str
+            One of "all", "relevant" (label = 1), or "irrelevant" (label = 0).
+        has_note : bool
+            If True, only return rows whose note is not NULL.
+        is_prior : bool
+            If True, only return prior records (querier IS NULL).
+
+        Returns
+        -------
+        pd.DataFrame
+            At most ``per_page`` rows with columns record_id, label, time, note,
+            tags (parsed), ordered as requested.
+        """
+        params = {"per_page": int(per_page)}
+        where = [
+            "label IS NOT NULL",
+            f"record_id IN (SELECT group_id FROM {self.record_table_name})",
+        ]
+
+        if subset == "relevant":
+            where.append("label = 1")
+        elif subset == "irrelevant":
+            where.append("label = 0")
+        if has_note:
+            where.append("note IS NOT NULL")
+        if is_prior:
+            where.append("querier IS NULL")
+
+        if cursor is not None:
+            params["ct"] = float(cursor[0])
+            params["cr"] = int(cursor[1])
+            # Direction must match the ORDER BY direction. The row-value
+            # comparison is what lets SQLite seek into the composite index.
+            op = "<" if latest_first else ">"
+            where.append(f"(time, record_id) {op} (:ct, :cr)")
+
+        order = "DESC" if latest_first else "ASC"
+        cols = ["record_id", "label", "time", "note", "tags"]
+        query = (
+            f"SELECT {', '.join(cols)} FROM results "
+            f"WHERE {' AND '.join(where)} "
+            f"ORDER BY time {order}, record_id {order} "
+            f"LIMIT :per_page"
+        )
+
+        df_results = pd.read_sql_query(
+            query,
+            self._conn,
+            params=params,
+            dtype={
+                k: v
+                for k, v in RESULTS_TABLE_COLUMNS_PANDAS_DTYPES.items()
+                if k in cols
+            },
+        )
+        df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
         return df_results
 
     def get_priors(self):

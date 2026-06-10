@@ -544,62 +544,61 @@ def api_search_data(project):  # noqa: F401
     return jsonify({"result": result})
 
 
+def _encode_cursor(time_val, record_id):
+    """Encode a (time, record_id) keyset cursor as an opaque token."""
+    raw = json.dumps({"t": float(time_val), "r": int(record_id)}).encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def _decode_cursor(token):
+    """Decode an opaque cursor token back to a (time, record_id) tuple."""
+    if not token:
+        return None
+    try:
+        data = json.loads(base64.urlsafe_b64decode(token.encode()))
+        return (float(data["t"]), int(data["r"]))
+    except (ValueError, KeyError, TypeError):
+        abort(400, description="Invalid pagination cursor")
+
+
 @bp.route("/projects/<project_id>/labeled", methods=["GET"])
 @login_required
 @project_authorization
 def api_get_labeled(project):  # noqa: F401
-    """Get all records classified as labeled documents"""
+    """Get a keyset-paginated page of labeled records.
 
-    page = request.args.get("page", default=None, type=int)
+    Pagination is cursor-based (forward-only): pass the ``next_cursor`` returned
+    by the previous response as ``?cursor=...`` to fetch the following page.
+    """
+
     per_page = request.args.get("per_page", default=20, type=int)
     subset = request.args.get("subset", default="all", type=str)
     filters = request.args.getlist("filter", type=str)
-    latest_first = request.args.get("latest_first", default=1, type=int)
+    latest_first = request.args.get("latest_first", default=1, type=int) == 1
+    cursor = _decode_cursor(request.args.get("cursor", default=None, type=str))
 
+    # Fetch one extra row to detect whether a further page exists, without a
+    # separate COUNT query.
     with project.db as db:
-        if "is_prior" in filters:
-            state_data = db.get_priors()
-        else:
-            state_data = db.get_results_table()
+        page_df = db.get_labeled_page(
+            per_page=per_page + 1,
+            cursor=cursor,
+            latest_first=latest_first,
+            subset=subset,
+            has_note=("has_note" in filters),
+            is_prior=("is_prior" in filters),
+        )
 
-    if subset == "relevant":
-        state_data = state_data[state_data["label"] == 1]
-    elif subset == "irrelevant":
-        state_data = state_data[state_data["label"] == 0]
-    else:
-        state_data = state_data[~state_data["label"].isnull()]
+    has_more = len(page_df) > per_page
+    page_df = page_df.iloc[:per_page].copy()
 
-    if "has_note" in filters:
-        state_data = state_data[~state_data["note"].isnull()]
+    if len(page_df) == 0:
+        return jsonify({"next_cursor": None, "result": []})
 
-    if latest_first == 1:
-        state_data = state_data.iloc[::-1]
-
-    # count labeled records and max pages
-    if len(state_data) == 0:
-        payload = {
-            "count": 0,
-            "next_page": None,
-            "previous_page": None,
-            "result": [],
-        }
-        return jsonify(payload)
-
-    max_page = math.ceil(len(state_data) / per_page)
-
-    if page is not None:
-        if page > max_page:
-            return abort(404)
-
-        idx_start = (page - 1) * per_page
-        idx_end = page * per_page
-        state_data = state_data.iloc[idx_start:idx_end].copy()
-
-        next_page = page + 1 if page < max_page else None
-        previous_page = page - 1 if page > 1 else None
-    else:
-        next_page = None
-        previous_page = None
+    next_cursor = None
+    if has_more:
+        last = page_df.iloc[-1]
+        next_cursor = _encode_cursor(last["time"], last["record_id"])
 
     if current_app.config.get("AUTHENTICATION", True):
         project_entry = Project.query.filter(
@@ -617,9 +616,11 @@ def api_get_labeled(project):  # noqa: F401
             for i, u in users.items()
         }
 
-    records = project.db.input.get_records(state_data["record_id"].to_list())
+    # get_records re-sorts to the order of the id list passed in, so the records
+    # line up positionally with page_df rows in (time, record_id) order.
+    records = project.db.input.get_records(page_df["record_id"].to_list())
     result = []
-    for (_, state), record in zip(state_data.iterrows(), records):
+    for (_, state), record in zip(page_df.iterrows(), records):
         record_d = asdict(record)
         record_d["state"] = state.to_dict()
         record_d["tags_form"] = read_tags_data(project)
@@ -634,9 +635,7 @@ def api_get_labeled(project):  # noqa: F401
 
     return jsonify(
         {
-            "count": len(state_data),
-            "next_page": next_page,
-            "previous_page": previous_page,
+            "next_cursor": next_cursor,
             "result": result,
         }
     )
