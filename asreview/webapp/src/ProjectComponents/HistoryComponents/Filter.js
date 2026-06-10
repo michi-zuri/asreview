@@ -31,7 +31,31 @@ const STATIC_FILTER_DEFS = [
       { value: "is_prior=false", label: "False", symbol: "\u20E0" },
     ],
   },
+  {
+    key: "pdf",
+    label: "Full text (Zotero)",
+    options: [
+      { value: "pdf", label: "True", symbol: "✓" },
+      { value: "pdf=false", label: "False", symbol: "\u20E0" },
+    ],
+  },
 ];
+
+/**
+ * Build user (decider) filter definitions from the project's users.
+ * Each user becomes a filter row with a True/False toggle.
+ */
+function buildUserFilterDefs(users) {
+  if (!users || !Array.isArray(users)) return [];
+  return users.map((user) => ({
+    key: `user_${user.id}`,
+    label: `Decisions by ${user.name}`,
+    options: [
+      { value: `user_${user.id}`, label: "True", symbol: "✓" },
+      { value: `user_${user.id}=false`, label: "False", symbol: "\u20E0" },
+    ],
+  }));
+}
 
 /**
  * Build tag filter definitions from the project's tag configuration.
@@ -106,6 +130,8 @@ export default function Filter(props) {
   const [search, setSearch] = React.useState("");
   const [tagDefs, setTagDefs] = React.useState([]);
   const [tagsLoading, setTagsLoading] = React.useState(false);
+  const [userDefs, setUserDefs] = React.useState([]);
+  const [usersLoading, setUsersLoading] = React.useState(false);
 
   const activeFilters = props.filterQuery || [];
 
@@ -128,21 +154,42 @@ export default function Filter(props) {
       });
   }, [props.project_id]);
 
-  const allFilterDefs = [...STATIC_FILTER_DEFS, ...tagDefs];
+  // Fetch project users when the popover opens (authenticated mode only)
+  const fetchUsers = React.useCallback(() => {
+    if (!props.project_id || !window.authentication) return;
+    setUsersLoading(true);
+    axios
+      .get(api_url + `projects/${props.project_id}/users`, {
+        withCredentials: true,
+      })
+      .then((res) => {
+        setUserDefs(buildUserFilterDefs(res.data));
+      })
+      .catch(() => {
+        setUserDefs([]);
+      })
+      .finally(() => {
+        setUsersLoading(false);
+      });
+  }, [props.project_id]);
+
+  const allFilterDefs = [...STATIC_FILTER_DEFS, ...userDefs, ...tagDefs];
 
   const activeKeys = new Set(
     activeFilters.map((f) => (f.value || "").split("=")[0]).filter(Boolean),
   );
 
   const getFilterState = (key) => {
-    const entry = activeFilters.find((f) => f.value && f.value.startsWith(key));
+    const entry = activeFilters.find(
+      (f) => f.value && f.value.split("=")[0] === key,
+    );
     if (!entry) return null;
     return entry.value;
   };
 
   const setFilterState = (key, value) => {
     const others = activeFilters.filter(
-      (f) => !f.value || !f.value.startsWith(key),
+      (f) => !f.value || f.value.split("=")[0] !== key,
     );
     const def = allFilterDefs.find((d) => d.key === key);
     const opt = def?.options.find((o) => o.value === value);
@@ -190,6 +237,9 @@ export default function Filter(props) {
     if (tagDefs.length === 0 && !tagsLoading) {
       fetchTags();
     }
+    if (userDefs.length === 0 && !usersLoading) {
+      fetchUsers();
+    }
     setOpen(true);
   };
 
@@ -236,11 +286,11 @@ export default function Filter(props) {
             onChange={(e) => setSearch(e.target.value)}
             autoFocus
           />
-          {tagsLoading ? (
+          {tagsLoading || usersLoading ? (
             <Stack direction="row" spacing={1} alignItems="center">
               <CircularProgress size={16} />
               <Typography variant="body2" color="text.secondary">
-                Loading tag filters...
+                Loading filters...
               </Typography>
             </Stack>
           ) : availableFilters.length === 0 ? (

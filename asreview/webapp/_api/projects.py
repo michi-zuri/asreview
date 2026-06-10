@@ -611,13 +611,53 @@ def api_get_labeled(project):  # noqa: F401
     if tag_filters:
         tags_config = read_tags_data(project)
         if tags_config is not None:
-            state_data = _flatten_tags(state_data.copy(), tags_config)
+            # Filter on a flattened copy so the original `tags` column (needed by the
+            # frontend to render the tag checkboxes) stays intact on `state_data`.
+            flattened = _flatten_tags(state_data.copy(), tags_config)
             for tag_col, want_set in tag_filters.items():
-                if tag_col in state_data.columns:
+                if tag_col in flattened.columns:
                     if want_set:
-                        state_data = state_data[state_data[tag_col] == 1]
+                        flattened = flattened[flattened[tag_col] == 1]
                     else:
-                        state_data = state_data[state_data[tag_col] != 1]
+                        flattened = flattened[flattened[tag_col] != 1]
+            state_data = state_data.loc[flattened.index]
+
+    # User filters. Supported format:
+    #   "user_{user_id}" or "...=true"  → record was decided by this user
+    #   "user_{user_id}=false"          → record was not decided by this user
+    # Multiple "true" user filters are combined with OR (a record has a single
+    # decider), while each "false" user filter excludes that user's records.
+    user_filters = {
+        k[len("user_") :]: v
+        for k, v in parsed_filters.items()
+        if k.startswith("user_")
+    }
+    if user_filters:
+        include_users = {int(uid) for uid, want in user_filters.items() if want}
+        exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
+        if include_users:
+            state_data = state_data[state_data["user_id"].isin(include_users)]
+        if exclude_users:
+            state_data = state_data[~state_data["user_id"].isin(exclude_users)]
+
+    # Full text (Zotero attachment) filter. Supported format:
+    #   "pdf" or "pdf=true"  → a Zotero full text PDF is available
+    #   "pdf=false"          → no full text available
+    filter_pdf = parsed_filters.get("pdf")
+    if filter_pdf is not None:
+        attachments = project.db.input[["record_id", "attachment"]]
+        available_ids = set(
+            attachments.loc[
+                attachments["attachment"].apply(
+                    lambda v: is_attachment_key(v) if isinstance(v, str) else False
+                ),
+                "record_id",
+            ]
+        )
+        if filter_pdf:
+            state_data = state_data[state_data["record_id"].isin(available_ids)]
+        else:
+            state_data = state_data[~state_data["record_id"].isin(available_ids)]
 
     if latest_first == 1:
         state_data = state_data.sort_values(
