@@ -297,6 +297,12 @@ class Database:
             )
             self._conn.commit()
 
+        if "attachment" not in columns:
+            cur.execute(
+                f"ALTER TABLE {self.record_table_name} ADD COLUMN attachment TEXT"
+            )
+            self._conn.commit()
+
     def _fix_decision_changes_schema(self, cur):
         """Fix decision_changes schema for projects migrated from old v2 format.
 

@@ -26,6 +26,8 @@ import threading
 import time
 import zipfile
 from dataclasses import asdict
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -75,6 +77,11 @@ from asreview.webapp import DB
 from asreview.webapp._api.utils import add_id_to_tags
 from asreview.webapp._api.utils import get_all_model_components
 from asreview.webapp._api.utils import read_tags_data
+from asreview.webapp._api.zotero import ZoteroLookupError
+from asreview.webapp._api.zotero import build_reader_url
+from asreview.webapp._api.zotero import fetch_pdf_attachment_key
+from asreview.webapp._api.zotero import get_zotero_config
+from asreview.webapp._api.zotero import is_attachment_key
 from asreview.webapp._authentication.decorators import current_user_projects
 from asreview.webapp._authentication.decorators import login_required
 from asreview.webapp._authentication.decorators import project_authorization
@@ -1607,6 +1614,79 @@ def api_update_note(project, record_id):  # noqa: F401
         db.update_note(record_id, note)
 
     return jsonify({"success": True})
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/attachment", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_record_attachment(project, record_id):  # noqa: F401
+    """Resolve the Zotero full text link for a record.
+
+    The record's ``original_id`` is treated as a Zotero item key. We look up the PDF
+    attachment of that item through the Zotero API and cache the result in the record's
+    ``attachment`` field: either the attachment key (full text available) or an ISO 8601
+    timestamp of when the lookup last failed. The lookup is re-run when the record was
+    never checked or when a previous failed check has gone stale.
+    """
+    record_id = int(record_id)
+
+    config = get_zotero_config()
+
+    def payload(available, url=None, checked_at=None):
+        return jsonify(
+            {
+                "configured": config.enabled,
+                "available": available,
+                "url": url,
+                "checked_at": checked_at,
+            }
+        )
+
+    with project.db as db:
+        record = db.input.get_records(record_id)
+
+        if record is None:
+            return abort(404)
+
+        original_id = record.original_id
+        cached = record.attachment
+
+        # If the record was already resolved to an attachment key, return it directly.
+        if is_attachment_key(cached):
+            return payload(True, url=build_reader_url(config, original_id, cached))
+
+        if not config.enabled or not original_id:
+            return payload(False, checked_at=cached)
+
+        # `cached` is either None (never checked) or a timestamp of the last failed
+        # check. Only re-query Zotero when there is no recent failed check.
+        if cached is not None:
+            try:
+                last_checked = datetime.fromisoformat(cached)
+            except ValueError:
+                last_checked = None
+
+            if last_checked is not None:
+                age = (datetime.now(timezone.utc) - last_checked).total_seconds()
+                if age < config.recheck_interval:
+                    return payload(False, checked_at=cached)
+
+        try:
+            attachment_key = fetch_pdf_attachment_key(config, original_id)
+        except ZoteroLookupError:
+            # Transient failure (network error, rate limit, ...). Do not cache a
+            # negative result so the lookup is retried on the next request.
+            return payload(False, checked_at=cached)
+
+        if attachment_key:
+            db.input.set_attachment(record_id, attachment_key)
+            return payload(
+                True, url=build_reader_url(config, original_id, attachment_key)
+            )
+
+        checked_at = datetime.now(timezone.utc).isoformat()
+        db.input.set_attachment(record_id, checked_at)
+        return payload(False, checked_at=checked_at)
 
 
 @bp.route("/projects/<project_id>/get_record", methods=["GET"])

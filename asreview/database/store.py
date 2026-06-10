@@ -305,6 +305,34 @@ class DataStore:
                 )
             session.delete(record)
 
+    @unwrap_operational_errors
+    def set_attachment(self, record_id, value):
+        """Set the cached Zotero attachment value of a record.
+
+        Parameters
+        ----------
+        record_id : int
+            Record identifier.
+        value : str | None
+            The Zotero attachment key (when a full text is available) or an ISO 8601
+            timestamp of when the lookup last failed. Use `None` to reset the cache.
+
+        Raises
+        ------
+        ValueError
+            If the store does not contain a record with the given `record_id`.
+        """
+        if isinstance(record_id, np.integer):
+            record_id = record_id.item()
+
+        with self.Session() as session, session.begin():
+            record = session.get(self.record_cls, record_id)
+            if record is None:
+                raise ValueError(
+                    f"DataStore does not contain a record with record_id {record_id}"
+                )
+            record.attachment = value
+
     def __len__(self):
         with self.Session() as session:
             return session.query(self.record_cls).count()

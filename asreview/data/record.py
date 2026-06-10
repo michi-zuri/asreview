@@ -145,6 +145,10 @@ class Record(Base):
     url: Mapped[Optional[str]] = mapped_column(default=None)
     original_id: Mapped[Optional[str]] = mapped_column(default=None)
     included: Mapped[Optional[int]] = mapped_column(default=None)
+    # Cache of the Zotero full text lookup. Holds either the Zotero attachment key
+    # (when a full text PDF is available) or an ISO 8601 timestamp of when the lookup
+    # last failed to find an attachment. `None` means the record was never checked.
+    attachment: Mapped[Optional[str]] = mapped_column(default=None)
 
     @validates("authors", "keywords")
     def validate_list_of_string(self, key, value):

@@ -1,4 +1,5 @@
 import { Link as LinkIcon } from "@mui/icons-material";
+import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import {
@@ -16,6 +17,7 @@ import {
 } from "@mui/material";
 import React from "react";
 import { useQuery } from "react-query";
+import { useInView } from "react-intersection-observer";
 
 import { ProjectAPI } from "api";
 import { StyledIconButton } from "StyledComponents/StyledButton";
@@ -33,7 +35,85 @@ import {
 
 import { fontSizeOptions } from "globals.js";
 
+const ZoteroFullTextButton = ({ project_id, record }) => {
+  // Resolving the Zotero attachment requires a live API call per record. To avoid
+  // firing one blocking request for every card at once (which monopolizes the server
+  // threads and trips Zotero's rate limit), only check once the card scrolls into
+  // view. `triggerOnce` keeps it checked afterwards.
+  const { ref, inView } = useInView({ triggerOnce: true, rootMargin: "200px" });
+
+  const { data } = useQuery(
+    ["fetchRecordAttachment", { project_id, record_id: record?.record_id }],
+    ProjectAPI.fetchRecordAttachment,
+    {
+      enabled: !!(
+        inView &&
+        project_id &&
+        record?.record_id !== undefined &&
+        record?.record_id !== null &&
+        record?.original_id
+      ),
+      refetchOnWindowFocus: false,
+      staleTime: 5 * 60 * 1000,
+      retry: false,
+    },
+  );
+
+  // A diagonal line drawn across the PDF icon to mark "no full text available".
+  const strikethrough = (
+    <Box
+      sx={{
+        position: "absolute",
+        top: "50%",
+        left: "8%",
+        width: "84%",
+        height: "2px",
+        bgcolor: "currentColor",
+        borderRadius: 1,
+        transform: "translateY(-50%) rotate(-45deg)",
+      }}
+    />
+  );
+
+  if (data?.available && data?.url) {
+    return (
+      <Tooltip title="Open full text in Zotero">
+        <StyledIconButton
+          ref={ref}
+          className="record-card-icon"
+          href={data.url}
+          target="pdfreader"
+        >
+          <PictureAsPdfIcon />
+        </StyledIconButton>
+      </Tooltip>
+    );
+  }
+
+  // Zotero is configured and confirmed there is no full text for this record: show a
+  // struck-through PDF icon.
+  if (data?.configured && data?.available === false) {
+    return (
+      <Tooltip title="No full text available in Zotero">
+        <span ref={ref}>
+          <StyledIconButton className="record-card-icon" disabled>
+            <Box sx={{ position: "relative", display: "inline-flex" }}>
+              <PictureAsPdfIcon />
+              {strikethrough}
+            </Box>
+          </StyledIconButton>
+        </span>
+      </Tooltip>
+    );
+  }
+
+  // Not checked yet (or Zotero not configured). Keep the observer target mounted so
+  // the check still fires once the card scrolls into view.
+  return <span ref={ref} />;
+};
+
 const RecordCardContent = ({
+  project_id,
   record,
   fontSize,
   collapseAbstract,
@@ -103,6 +183,12 @@ const RecordCardContent = ({
                   <LinkIcon />
                 </StyledIconButton>
               </Tooltip>
+            )}
+
+            {!(
+              record.original_id === undefined || record.original_id === null
+            ) && (
+              <ZoteroFullTextButton project_id={project_id} record={record} />
             )}
 
             {!(
@@ -282,6 +368,7 @@ const RecordCard = ({
         >
           <Grid size={landscape ? 3 : 5}>
             <RecordCardContent
+              project_id={project_id}
               record={record}
               fontSize={fontSize}
               collapseAbstract={collapseAbstract}
