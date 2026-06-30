@@ -241,6 +241,26 @@ class Database:
         self._conn.commit()
 
         self._set_results_changes_triggers()
+        self._ensure_results_indexes()
+
+    def _ensure_results_indexes(self):
+        """Create indexes that speed up collection (labeled history) loading.
+
+        Idempotent (uses ``CREATE INDEX IF NOT EXISTS``), so it is safe to call
+        on every read-write open and acts as a lightweight migration for
+        existing projects. The index matches the ordering used by the
+        keyset-paginated :meth:`get_results_page` query
+        (``(time IS NULL), time DESC, record_id DESC``) restricted to labeled
+        records, allowing SQLite to serve a page without scanning and sorting
+        the whole table.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE INDEX IF NOT EXISTS idx_results_collection_desc
+            ON results ((time IS NULL), time DESC, record_id DESC)
+            WHERE label IS NOT NULL"""
+        )
+        self._conn.commit()
 
     def _is_valid(self):
         if self.user_version != CURRENT_DATABASE_VERSION:
@@ -281,6 +301,7 @@ class Database:
         if not self.read_only:
             self._fix_decision_changes_schema(cur)
             self._fix_record_schema(cur)
+            self._ensure_results_indexes()
 
     def _fix_record_schema(self, cur):
         """Add columns introduced after the initial schema to the record table."""
@@ -716,6 +737,143 @@ class Database:
 
         if columns is None or "tags" in columns:
             df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
+        return df_results
+
+    def get_results_page(
+        self,
+        *,
+        label=None,
+        priors=None,
+        has_note=None,
+        include_users=None,
+        exclude_users=None,
+        cursor=None,
+        limit=200,
+        latest_first=True,
+    ):
+        """Get an ordered page of labeled results using keyset pagination.
+
+        Instead of loading the whole results table and slicing in pandas, this
+        builds a SQL query that pushes the cheap filters into the WHERE clause,
+        orders by ``(time, record_id)`` and returns at most ``limit`` rows after
+        the given ``cursor``. Only the returned rows have their ``tags`` JSON
+        parsed.
+
+        Parameters
+        ----------
+        label : int | None
+            Keep only rows with this label (1 or 0). ``None`` keeps all labeled
+            rows.
+        priors : bool | None
+            ``True`` keeps only priors (``querier IS NULL``), ``False`` excludes
+            priors, ``None`` keeps both.
+        has_note : bool | None
+            ``True`` keeps only rows with a note, ``False`` only rows without a
+            note, ``None`` keeps both.
+        include_users : Iterable[int] | None
+            Keep only rows decided by one of these users.
+        exclude_users : Iterable[int] | None
+            Exclude rows decided by these users (rows without a user are kept).
+        cursor : tuple[float | None, int] | None
+            ``(time, record_id)`` of the last row of the previous page. ``None``
+            starts from the beginning.
+        limit : int
+            Maximum number of rows to return.
+        latest_first : bool
+            Order by descending time when ``True`` (most recent first).
+
+        Returns
+        -------
+        pd.DataFrame
+            Up to ``limit`` rows of the results table, ordered, with ``tags``
+            parsed.
+        """
+        where = ["label IS NOT NULL"]
+        params = {}
+
+        # Keep only the base record of each group. A base record is one whose
+        # ``duplicate_of`` is NULL, which is equivalent to
+        # ``record_id IN (SELECT group_id FROM record)`` but, as a correlated
+        # EXISTS, lets SQLite drive the query with the collection index
+        # (ordering + cursor range) instead of the group subquery.
+        where.append(
+            f"EXISTS (SELECT 1 FROM {self.record_table_name} AS rec "
+            "WHERE rec.record_id = results.record_id "
+            "AND rec.duplicate_of IS NULL)"
+        )
+
+        if label is not None:
+            where.append("label = :label")
+            params["label"] = int(label)
+
+        if priors is True:
+            where.append("querier IS NULL")
+        elif priors is False:
+            where.append("querier IS NOT NULL")
+
+        if has_note is True:
+            where.append("note IS NOT NULL")
+        elif has_note is False:
+            where.append("note IS NULL")
+
+        include_users = list(include_users) if include_users else []
+        if include_users:
+            keys = [f":iu{i}" for i in range(len(include_users))]
+            where.append(f"user_id IN ({', '.join(keys)})")
+            for k, v in zip(keys, include_users):
+                params[k[1:]] = int(v)
+
+        exclude_users = list(exclude_users) if exclude_users else []
+        if exclude_users:
+            keys = [f":eu{i}" for i in range(len(exclude_users))]
+            # Mirror pandas ``~isin`` which keeps rows with a NULL user_id.
+            where.append(
+                f"(user_id IS NULL OR user_id NOT IN ({', '.join(keys)}))"
+            )
+            for k, v in zip(keys, exclude_users):
+                params[k[1:]] = int(v)
+
+        if cursor is not None:
+            cursor_time, cursor_id = cursor
+            params["cid"] = int(cursor_id)
+            if latest_first:
+                if cursor_time is None:
+                    where.append("(time IS NULL AND record_id < :cid)")
+                else:
+                    params["ct"] = float(cursor_time)
+                    where.append(
+                        "(time IS NULL OR time < :ct "
+                        "OR (time = :ct AND record_id < :cid))"
+                    )
+            else:
+                if cursor_time is None:
+                    where.append("(time IS NULL AND record_id > :cid)")
+                else:
+                    params["ct"] = float(cursor_time)
+                    # Null-time rows sort last, so they remain "after" a
+                    # non-null cursor and must be included here too.
+                    where.append(
+                        "(time IS NULL OR time > :ct "
+                        "OR (time = :ct AND record_id > :cid))"
+                    )
+
+        if latest_first:
+            order_by = "(time IS NULL) ASC, time DESC, record_id DESC"
+        else:
+            order_by = "(time IS NULL) ASC, time ASC, record_id ASC"
+
+        params["limit"] = int(limit)
+
+        df_results = pd.read_sql_query(
+            f"""SELECT * FROM results
+            WHERE {" AND ".join(where)}
+            ORDER BY {order_by}
+            LIMIT :limit""",
+            self._conn,
+            params=params,
+            dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES,
+        )
+        df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
         return df_results
 
     def get_priors(self):

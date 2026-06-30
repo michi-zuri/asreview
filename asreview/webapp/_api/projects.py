@@ -17,7 +17,6 @@ import hashlib
 import hmac
 import json
 import logging
-import math
 import secrets
 import shutil
 import socket
@@ -554,23 +553,115 @@ def api_search_data(project):  # noqa: F401
     return jsonify({"result": result})
 
 
+def _labeled_filter_signature(subset, filters, latest_first):
+    """Stable short signature of the query parameters that define an ordering.
+
+    Embedded in the pagination cursor so a cursor cannot be accidentally reused
+    across a different filter/sort set (which could silently skip records).
+    """
+    payload = json.dumps(
+        [subset, sorted(filters), bool(latest_first)], sort_keys=True
+    )
+    return hashlib.sha1(payload.encode()).hexdigest()[:12]
+
+
+def _encode_cursor(time_val, record_id, filter_sig):
+    obj = {
+        "v": 1,
+        "t": time_val.hex() if isinstance(time_val, float) else None,
+        "rid": int(record_id),
+        "fh": filter_sig,
+    }
+    return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
+
+
+def _decode_cursor(cursor_param, filter_sig):
+    """Decode an opaque cursor. Returns ``(time, record_id)`` or ``None``.
+
+    Raises ``ValueError`` if the cursor is malformed or was created for a
+    different filter/sort set.
+    """
+    if not cursor_param:
+        return None
+    try:
+        obj = json.loads(base64.urlsafe_b64decode(cursor_param.encode()))
+        if obj.get("v") != 1 or obj.get("fh") != filter_sig:
+            raise ValueError("cursor does not match the current query")
+        t = obj.get("t")
+        return (None if t is None else float.fromhex(t), int(obj["rid"]))
+    except (ValueError, KeyError, TypeError) as err:
+        raise ValueError(f"invalid cursor: {err}")
+
+
+def _tag_is_checked(saved_tags, group_export, tag_export):
+    """Whether a record has a specific tag value checked."""
+    if not isinstance(saved_tags, list):
+        return False
+    for group in saved_tags:
+        if not isinstance(group, dict) or group.get("export") != group_export:
+            continue
+        for tag in group.get("values", []):
+            if isinstance(tag, dict) and tag.get("export") == tag_export:
+                return bool(tag.get("checked", False))
+    return False
+
+
+def _record_tags_invalid(saved_tags, tags_form):
+    """Whether a record violates its tag group rules.
+
+    Mirrors the frontend warnings:
+    - a ``single_select`` group with more than one checked value (too many), and
+    - a ``required`` group with no checked value (missing selection).
+    """
+    if not tags_form:
+        return False
+    if not isinstance(saved_tags, list):
+        saved_tags = []
+    saved_by_id = {g.get("id"): g for g in saved_tags if isinstance(g, dict)}
+    for group in tags_form:
+        single_select = bool(group.get("single_select"))
+        required = bool(group.get("required"))
+        if not single_select and not required:
+            continue
+        saved_group = saved_by_id.get(group.get("id"))
+        if isinstance(saved_group, dict):
+            checked = sum(
+                1
+                for v in saved_group.get("values", [])
+                if isinstance(v, dict) and v.get("checked")
+            )
+        else:
+            checked = 0
+        if single_select and checked > 1:
+            return True
+        if required and checked == 0:
+            return True
+    return False
+
+
 @bp.route("/projects/<project_id>/labeled", methods=["GET"])
 @login_required
 @project_authorization
 def api_get_labeled(project):  # noqa: F401
-    """Get all records classified as labeled documents"""
+    """Get a page of labeled records using keyset (cursor) pagination.
 
-    page = request.args.get("page", default=None, type=int)
+    Cheap filters (subset, prior, note, user) are pushed into SQL and the page
+    is read with ``ORDER BY ... LIMIT n+1`` (the extra row signals whether more
+    pages exist). Filters that require parsing the tags JSON (``tag_*``,
+    ``invalid_tags``) and the Zotero ``pdf`` filter are applied as a bounded
+    Python scan over the ordered candidates, so the whole table is never loaded
+    or parsed at once.
+    """
     per_page = request.args.get("per_page", default=200, type=int)
     subset = request.args.get("subset", default="all", type=str)
     filters = request.args.getlist("filter", type=str)
-    latest_first = request.args.get("latest_first", default=1, type=int)
+    latest_first = request.args.get("latest_first", default=1, type=int) == 1
+    cursor_param = request.args.get("cursor", default=None, type=str)
 
     # Parse boolean filters. Supported formats:
-    #   "is_prior" or "is_prior=true"  → only priors
-    #   "is_prior=false"               → exclude priors
-    #   "has_note" or "has_note=true"  → only records with notes
-    #   "has_note=false"               → only records without notes
+    #   "is_prior" / "is_prior=true"   → only priors;   "is_prior=false" → exclude
+    #   "has_note" / "has_note=true"   → only notes;     "has_note=false" → without
+    #   "user_<id>", "pdf", "tag_<g>_<v>", "invalid_tags" (each "=false" variant)
     parsed_filters = {}
     for f in filters:
         if "=" in f:
@@ -579,121 +670,57 @@ def api_get_labeled(project):  # noqa: F401
         else:
             parsed_filters[f] = True
 
-    with project.db as db:
-        filter_is_prior = parsed_filters.get("is_prior")
-        if filter_is_prior is True:
-            state_data = db.get_priors()
-        elif filter_is_prior is False:
-            # All labeled records that are NOT priors
-            state_data = db.get_results_table(priors=False)
-        else:
-            state_data = db.get_results_table()
-
+    # ---- Cheap filters pushed into SQL ----
     if subset == "relevant":
-        state_data = state_data[state_data["label"] == 1]
+        label = 1
     elif subset == "irrelevant":
-        state_data = state_data[state_data["label"] == 0]
+        label = 0
     else:
-        state_data = state_data[~state_data["label"].isnull()]
+        label = None
 
-    filter_has_note = parsed_filters.get("has_note")
-    if filter_has_note is True:
-        state_data = state_data[~state_data["note"].isnull()]
-    elif filter_has_note is False:
-        state_data = state_data[state_data["note"].isnull()]
+    priors = parsed_filters.get("is_prior")
+    has_note = parsed_filters.get("has_note")
 
-    # Tag filters. Supported format:
-    #   "tag_{group_export}_{value_export}" or "...=true"  → tag is set
-    #   "tag_{group_export}_{value_export}=false"           → tag is not set
-    tag_filters = {
-        k: v for k, v in parsed_filters.items() if k.startswith("tag_")
-    }
-    if tag_filters:
-        tags_config = read_tags_data(project)
-        if tags_config is not None:
-            # Filter on a flattened copy so the original `tags` column (needed by the
-            # frontend to render the tag checkboxes) stays intact on `state_data`.
-            flattened = _flatten_tags(state_data.copy(), tags_config)
-            for tag_col, want_set in tag_filters.items():
-                if tag_col in flattened.columns:
-                    if want_set:
-                        flattened = flattened[flattened[tag_col] == 1]
-                    else:
-                        flattened = flattened[flattened[tag_col] != 1]
-            state_data = state_data.loc[flattened.index]
-
-    # User filters. Supported format:
-    #   "user_{user_id}" or "...=true"  → record was decided by this user
-    #   "user_{user_id}=false"          → record was not decided by this user
-    # Multiple "true" user filters are combined with OR (a record has a single
-    # decider), while each "false" user filter excludes that user's records.
     user_filters = {
         k[len("user_") :]: v
         for k, v in parsed_filters.items()
         if k.startswith("user_")
     }
-    if user_filters:
-        include_users = {int(uid) for uid, want in user_filters.items() if want}
-        exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
-        if include_users:
-            state_data = state_data[state_data["user_id"].isin(include_users)]
-        if exclude_users:
-            state_data = state_data[~state_data["user_id"].isin(exclude_users)]
+    include_users = {int(uid) for uid, want in user_filters.items() if want}
+    exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
 
-    # Full text (Zotero attachment) filter. Supported format:
-    #   "pdf" or "pdf=true"  → a Zotero full text PDF is available
-    #   "pdf=false"          → no full text available
+    # ---- Filters applied as a Python post-scan ----
+    tags_form = read_tags_data(project)
+
+    tag_col_map = {}
+    for group in tags_form or []:
+        for value in group.get("values", []):
+            tag_col_map[f"tag_{group['export']}_{value['export']}"] = (
+                group["export"],
+                value["export"],
+            )
+    tag_filters = [
+        (*tag_col_map[k], want)
+        for k, want in parsed_filters.items()
+        if k.startswith("tag_") and k in tag_col_map
+    ]
+
+    invalid_filter = parsed_filters.get("invalid_tags")
     filter_pdf = parsed_filters.get("pdf")
-    if filter_pdf is not None:
-        attachments = project.db.input[["record_id", "attachment"]]
-        available_ids = set(
-            attachments.loc[
-                attachments["attachment"].apply(
-                    lambda v: is_attachment_key(v) if isinstance(v, str) else False
-                ),
-                "record_id",
-            ]
-        )
-        if filter_pdf:
-            state_data = state_data[state_data["record_id"].isin(available_ids)]
-        else:
-            state_data = state_data[~state_data["record_id"].isin(available_ids)]
 
-    if latest_first == 1:
-        state_data = state_data.sort_values(
-            by="time", ascending=False, na_position="last"
-        )
-    else:
-        state_data = state_data.sort_values(
-            by="time", ascending=True, na_position="last"
-        )
+    post_scan = (
+        filter_pdf is not None or bool(tag_filters) or invalid_filter is not None
+    )
 
-    # count labeled records and max pages
-    if len(state_data) == 0:
-        payload = {
-            "count": 0,
-            "next_page": None,
-            "previous_page": None,
-            "result": [],
-        }
-        return jsonify(payload)
+    # ---- Decode / validate cursor ----
+    filter_sig = _labeled_filter_signature(subset, filters, latest_first)
+    try:
+        cursor = _decode_cursor(cursor_param, filter_sig)
+    except ValueError as err:
+        return jsonify(message=str(err)), 400
 
-    max_page = math.ceil(len(state_data) / per_page)
-
-    if page is not None:
-        if page > max_page:
-            return abort(404)
-
-        idx_start = (page - 1) * per_page
-        idx_end = page * per_page
-        state_data = state_data.iloc[idx_start:idx_end].copy()
-
-        next_page = page + 1 if page < max_page else None
-        previous_page = page - 1 if page > 1 else None
-    else:
-        next_page = None
-        previous_page = None
-
+    # Users for output (authenticated mode only).
+    users = {}
     if current_app.config.get("AUTHENTICATION", True):
         project_entry = Project.query.filter(
             Project.project_id == project.project_id
@@ -710,26 +737,102 @@ def api_get_labeled(project):  # noqa: F401
             for i, u in users.items()
         }
 
-    records = project.db.input.get_records(state_data["record_id"].to_list())
-    result = []
-    for (_, state), record in zip(state_data.iterrows(), records):
-        record_d = asdict(record)
-        record_d["state"] = state.to_dict()
-        record_d["tags_form"] = read_tags_data(project)
+    with project.db as db:
+        # PDF (Zotero attachment) availability set, computed once.
+        pdf_ids = None
+        if filter_pdf is not None:
+            attachments = db.input[["record_id", "attachment"]]
+            pdf_ids = set(
+                attachments.loc[
+                    attachments["attachment"].apply(
+                        lambda v: is_attachment_key(v) if isinstance(v, str) else False
+                    ),
+                    "record_id",
+                ]
+            )
 
-        if current_app.config.get("AUTHENTICATION", True):
-            record_d["state"]["user"] = users.get(record_d["state"]["user_id"], None)
-        else:
-            record_d["state"]["user"] = None
+        def passes(saved_tags, record_id):
+            if pdf_ids is not None:
+                in_pdf = record_id in pdf_ids
+                if filter_pdf != in_pdf:
+                    return False
+            for group_export, tag_export, want in tag_filters:
+                if _tag_is_checked(saved_tags, group_export, tag_export) != want:
+                    return False
+            if invalid_filter is not None:
+                if _record_tags_invalid(saved_tags, tags_form) != invalid_filter:
+                    return False
+            return True
 
-        del record_d["state"]["user_id"]
-        result.append(record_d)
+        batch_size = (per_page + 1) if not post_scan else max(per_page + 1, 500)
+        matched = []
+        scan_cursor = cursor
+        has_next = False
+
+        while True:
+            page_df = db.get_results_page(
+                label=label,
+                priors=priors,
+                has_note=has_note,
+                include_users=include_users or None,
+                exclude_users=exclude_users or None,
+                cursor=scan_cursor,
+                limit=batch_size,
+                latest_first=latest_first,
+            )
+            if page_df.empty:
+                break
+
+            for _, state in page_df.iterrows():
+                t = state["time"]
+                scan_cursor = (
+                    None if pd.isna(t) else float(t),
+                    int(state["record_id"]),
+                )
+                if passes(state["tags"], int(state["record_id"])):
+                    matched.append(state)
+                    if len(matched) > per_page:
+                        has_next = True
+                        break
+
+            if has_next or len(page_df) < batch_size:
+                break
+
+        if has_next:
+            matched = matched[:per_page]
+
+        next_cursor = None
+        if has_next and matched:
+            last = matched[-1]
+            t = last["time"]
+            next_cursor = _encode_cursor(
+                None if pd.isna(t) else float(t),
+                int(last["record_id"]),
+                filter_sig,
+            )
+
+        records = db.input.get_records([int(s["record_id"]) for s in matched])
+
+        result = []
+        for state, record in zip(matched, records):
+            record_d = asdict(record)
+            record_d["state"] = state.to_dict()
+            record_d["tags_form"] = tags_form
+
+            if current_app.config.get("AUTHENTICATION", True):
+                record_d["state"]["user"] = users.get(
+                    record_d["state"]["user_id"], None
+                )
+            else:
+                record_d["state"]["user"] = None
+
+            del record_d["state"]["user_id"]
+            result.append(record_d)
 
     return jsonify(
         {
-            "count": len(state_data),
-            "next_page": next_page,
-            "previous_page": previous_page,
+            "count": len(result),
+            "next_cursor": next_cursor,
             "result": result,
         }
     )
@@ -1277,11 +1380,14 @@ def _flatten_tags(results, tags_config):
         for group in row:
             for tag in group.get("values", []):
                 col = f"tag_{group['export']}_{tag['export']}"
-                tags[col] = int(tag.get("checked", False))
+                checked = bool(tag.get("checked", False))
+                tags[col] = int(checked)
                 # Optional free-text addition stored alongside the selection.
-                # Only emitted when present so older projects are unaffected.
+                # Only emitted when present and the tag is checked, so a note
+                # left behind after deselecting is not exported. Older projects
+                # without free text are unaffected.
                 text = tag.get("text")
-                if text:
+                if checked and text:
                     tags[f"{col}_text"] = text
 
         df_tags.append(tags)

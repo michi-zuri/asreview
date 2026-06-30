@@ -146,6 +146,11 @@ const TagGroupInput = ({
             More than one option is selected in this single-choice group.
           </Alert>
         )}
+        {missing && (
+          <Alert severity="warning">
+            A selection is required in this group, but none is made.
+          </Alert>
+        )}
         {selected.length > 0 ? (
           <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
             {selected.map(({ tag, value }) => (

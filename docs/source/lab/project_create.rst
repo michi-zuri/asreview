@@ -73,9 +73,40 @@ your review by clicking on the *Add tags* button. You can add multiple tags to a
 tag group, and you can add multiple tags to a dataset. In the current version,
 you can't delete tags, so be careful with the tags you add.
 
-Tags are presented to you in the *Reviewer* interface. Tags are presented as
-checkboxes, and you can select multiple tags for a record. You can find the
-selected tags in the collection and during the export of the dataset.
+Each tag group can be configured in the *Customize* tab:
+
+- **Single select**: when enabled, only one tag in the group can be selected and
+  the tags are shown as radio buttons in the *Reviewer* interface. When
+  disabled, the tags are shown as checkboxes and any number of them can be
+  selected.
+- **Required**: when enabled, a selection must be made in the group before the
+  record can be saved. Required groups are marked with an asterisk
+  (``*``), explained by the legend *"\* a selection must be made in this
+  group"*.
+- **Free text**: each individual tag can opt in to an additional free-text input
+  field, letting reviewers attach a short note to that specific tag.
+
+Single-select groups that are not required allow the selected radio button to be
+deselected by clicking it again.
+
+Tags are presented to you in the *Reviewer* interface as checkboxes or radio
+buttons depending on the group configuration. The selected tags (and any
+free-text additions) can be found in the **Collection** and during the export of
+the dataset, where each tag is exported as ``tag_<group>_<value>`` and, if
+provided, ``tag_<group>_<value>_text``. The collection only displays the tags
+that were actually selected; empty optional groups show a placeholder. If an
+invalid combination is encountered (for example more than one option selected in
+a single-select group, which can happen when a project is edited across
+versions, or no selection in a required group), the record is still shown but
+with a warning, and the **Collection** filter offers an *invalid tags* option to
+find these records.
+
+.. note::
+
+   The on-disk tag format is backwards compatible. Older ASReview versions can
+   still read and display tags created with these options; they simply ignore
+   the single-select, required and free-text metadata and the per-tag free-text
+   note.
 
 Change AI Model
 ~~~~~~~~~~~~~~~

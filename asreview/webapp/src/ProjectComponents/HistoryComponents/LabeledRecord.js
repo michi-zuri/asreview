@@ -41,7 +41,7 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
     ],
     ProjectAPI.fetchLabeledRecord,
     {
-      getNextPageParam: (lastPage) => lastPage.next_page ?? false,
+      getNextPageParam: (lastPage) => lastPage.next_cursor ?? false,
     },
   );
 

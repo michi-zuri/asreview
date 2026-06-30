@@ -678,3 +678,74 @@ def test_fix_old_v2_decision_changes_triggers_work(tmpdir):
         assert len(changes) == 2
         assert changes.iloc[1]["record_id"] == 0
         assert changes.iloc[1]["label"] == 1  # old label preserved by trigger
+
+
+def _index_names(db_path):
+    """Return the set of index names on the results table."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.cursor()
+        rows = cur.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='results'"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {row[0] for row in rows}
+
+
+def _drop_results_collection_index(db_path):
+    """Simulate an existing project created before the collection index."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.cursor()
+        cur.execute("DROP INDEX IF EXISTS idx_results_collection_desc")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_create_tables_adds_collection_index(tmpdir):
+    """A freshly created database has the collection (history) index."""
+    db_path = Path(tmpdir, "test.db")
+    with asr.Database(db_path) as db:
+        db.create_tables()
+
+    assert "idx_results_collection_desc" in _index_names(db_path)
+
+
+def test_existing_db_gets_collection_index_on_open(tmpdir):
+    """Opening an old project read-write adds the index as a migration."""
+    db_path = Path(tmpdir, "test.db")
+    with asr.Database(db_path) as db:
+        db.create_tables()
+
+    _drop_results_collection_index(db_path)
+    assert "idx_results_collection_desc" not in _index_names(db_path)
+
+    with asr.Database(db_path) as db:
+        db._is_valid()
+
+    assert "idx_results_collection_desc" in _index_names(db_path)
+
+
+def test_read_only_open_does_not_add_index(tmpdir):
+    """Opening read-only must not attempt to create the index."""
+    db_path = Path(tmpdir, "test.db")
+    with asr.Database(db_path) as db:
+        db.create_tables()
+
+    _drop_results_collection_index(db_path)
+
+    with asr.Database(db_path, read_only=True) as db:
+        # Should not raise even though the index is absent.
+        db._is_valid()
+
+    assert "idx_results_collection_desc" not in _index_names(db_path)
+
+
+def test_ensure_results_indexes_is_idempotent(db):
+    """Calling the migration twice is a no-op and does not raise."""
+    db._ensure_results_indexes()
+    db._ensure_results_indexes()
+    assert "idx_results_collection_desc" in _index_names(db.fp)

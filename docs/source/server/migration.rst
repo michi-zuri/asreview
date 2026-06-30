@@ -111,3 +111,19 @@ run the following command inside the container:
 .. code-block:: bash
 
     docker exec -it asreview-server-stack-asreview-1 asreview migrate --projects
+
+Automatic Lightweight Schema Upkeep
+-----------------------------------
+
+In addition to the explicit ``asreview migrate`` command, every time a project
+database is opened for writing ASReview applies small, idempotent schema fixes.
+These run automatically, require no user action, and are skipped when a project
+is opened read-only.
+
+One of these fixes creates a database index
+(``idx_results_collection_desc``) on the ``results`` table that speeds up
+loading of the **Collection** page. The page uses cursor (keyset) pagination and
+relies on this index to return a page of labeled records without scanning and
+sorting the whole table. Existing projects gain the index automatically the
+first time they are opened read-write; newly created projects include it from the
+start.
