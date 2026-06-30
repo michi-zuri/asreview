@@ -1276,16 +1276,27 @@ def _flatten_tags(results, tags_config):
         tags = {}
         for group in row:
             for tag in group.get("values", []):
-                tags[f"tag_{group['export']}_{tag['export']}"] = int(
-                    tag.get("checked", False)
-                )
+                col = f"tag_{group['export']}_{tag['export']}"
+                tags[col] = int(tag.get("checked", False))
+                # Optional free-text addition stored alongside the selection.
+                # Only emitted when present so older projects are unaffected.
+                text = tag.get("text")
+                if text:
+                    tags[f"{col}_text"] = text
 
         df_tags.append(tags)
+
+    df_tags = pd.DataFrame(df_tags, index=results.index)
+    # The binary selection columns are integers; the free-text columns are
+    # strings, so cast only the non-text tag columns to the nullable Int64 type.
+    int_cols = [c for c in df_tags.columns if not c.endswith("_text")]
+    if int_cols:
+        df_tags[int_cols] = df_tags[int_cols].astype("Int64")
 
     return pd.concat(
         [
             results.drop("tags", axis=1),
-            pd.DataFrame(df_tags, index=results.index, dtype="Int64"),
+            df_tags,
         ],
         axis=1,
     )

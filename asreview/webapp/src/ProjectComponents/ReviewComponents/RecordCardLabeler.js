@@ -4,6 +4,7 @@ import {
   CardActions,
   CardContent,
   Checkbox,
+  Chip,
   Dialog,
   DialogActions,
   DialogContent,
@@ -18,6 +19,7 @@ import {
   Menu,
   MenuItem,
   Paper,
+  Radio,
   Stack,
   TextField,
   Tooltip,
@@ -61,10 +63,174 @@ const mergeTagValues = (tagsForm, tagValues) => {
       ...group,
       values: group.values.map((tag) => {
         const savedTag = savedGroup?.values?.find((t) => t.id === tag.id);
-        return { ...tag, checked: savedTag?.checked || false };
+        return {
+          ...tag,
+          checked: savedTag?.checked || false,
+          text: savedTag?.text || "",
+        };
       }),
     };
   });
+};
+
+/**
+ * Returns true when every required group has at least one value selected. Used
+ * to gate labeling/saving when a selection is obligatory.
+ */
+const tagRequirementsMet = (tagValues) =>
+  (tagValues || []).every(
+    (group) => !group.required || (group.values || []).some((t) => t.checked),
+  );
+
+/**
+ * Explains the "*" marker shown next to required tag groups. Renders nothing
+ * when no group in the form is required.
+ */
+const TagRequiredLegend = ({ tagsForm }) => {
+  if (!Array.isArray(tagsForm) || !tagsForm.some((g) => g.required)) {
+    return null;
+  }
+  return (
+    <Typography
+      variant="caption"
+      color="text.secondary"
+      sx={{ display: "block", mt: 1 }}
+    >
+      * a selection must be made in this group
+    </Typography>
+  );
+};
+
+/**
+ * Renders the input controls for a single tag group.
+ *
+ * In `readOnly` mode the group is shown compactly: only the selected values are
+ * rendered as chips, and a placeholder is shown when nothing is selected.
+ *
+ * Otherwise, regular groups are rendered as checkboxes (multiple selectable) and
+ * groups with `single_select` as radio buttons (only one selectable). When a
+ * single-select group is not `required`, clicking the selected radio button
+ * deselects it. If a single-select group already has more than one value
+ * selected (invalid data, e.g. created by an older version or another client),
+ * all selected values are still shown and a warning is displayed.
+ */
+const TagGroupInput = ({
+  group,
+  groupValues,
+  onToggle,
+  onSelectExclusive,
+  onTextChange,
+  disabled = false,
+  readOnly = false,
+}) => {
+  const checkedCount = (groupValues?.values || []).filter(
+    (t) => t.checked,
+  ).length;
+  const singleSelect = Boolean(group.single_select);
+  const required = Boolean(group.required);
+  const invalid = singleSelect && checkedCount > 1;
+  const missing = required && checkedCount === 0;
+
+  if (readOnly) {
+    const selected = group.values
+      .map((tag, j) => ({ tag, value: groupValues?.values[j] }))
+      .filter(({ value }) => value?.checked);
+    return (
+      <Stack direction="column" spacing={1}>
+        <Typography variant="h6">
+          {group.label}
+          {required && " *"}
+        </Typography>
+        {invalid && (
+          <Alert severity="warning">
+            More than one option is selected in this single-choice group.
+          </Alert>
+        )}
+        {selected.length > 0 ? (
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            {selected.map(({ tag, value }) => (
+              <Chip
+                key={`${group.id}:${tag.id}`}
+                label={value?.text ? `${tag.label}: ${value.text}` : tag.label}
+              />
+            ))}
+          </Stack>
+        ) : (
+          <Typography variant="body2" color="text.secondary">
+            None selected
+          </Typography>
+        )}
+      </Stack>
+    );
+  }
+
+  return (
+    <Stack direction="column" spacing={1}>
+      <Typography variant="h6">
+        {group.label}
+        {required && " *"}
+      </Typography>
+      {invalid && (
+        <Alert severity="warning">
+          More than one option is selected in this single-choice group.
+        </Alert>
+      )}
+      {missing && (
+        <Typography variant="caption" color="error">
+          {singleSelect ? "Select one option" : "Select at least one option"}
+        </Typography>
+      )}
+      <FormGroup row={false}>
+        {group.values.map((tag, j) => {
+          const checked = groupValues?.values[j]?.checked || false;
+          const text = groupValues?.values[j]?.text || "";
+          return (
+            <Box key={`${group.id}:${tag.id}`}>
+              <FormControlLabel
+                control={
+                  singleSelect ? (
+                    <Radio
+                      checked={checked}
+                      onChange={() => onSelectExclusive(group.id, tag.id)}
+                      onClick={() => {
+                        if (checked && !required) {
+                          onToggle(false, group.id, tag.id);
+                        }
+                      }}
+                      disabled={disabled}
+                    />
+                  ) : (
+                    <Checkbox
+                      checked={checked}
+                      onChange={(e) =>
+                        onToggle(e.target.checked, group.id, tag.id)
+                      }
+                      disabled={disabled}
+                    />
+                  )
+                }
+                label={tag.label}
+              />
+              {tag.free_text && checked && (
+                <TextField
+                  size="small"
+                  fullWidth
+                  variant="standard"
+                  placeholder="Add free text…"
+                  value={text}
+                  onChange={(e) =>
+                    onTextChange?.(group.id, tag.id, e.target.value)
+                  }
+                  disabled={disabled}
+                  sx={{ ml: 4, mb: 1, maxWidth: "calc(100% - 32px)" }}
+                />
+              )}
+            </Box>
+          );
+        })}
+      </FormGroup>
+    </Stack>
+  );
 };
 
 const NoteDialog = ({ project_id, record_id, open, onClose, note = null }) => {
@@ -182,6 +348,29 @@ const TagsDialog = ({
     setLocalTagValues(copy);
   };
 
+  const handleSingleSelect = (groupId, tagId) => {
+    let groupI = localTagValues.findIndex((group) => group.id === groupId);
+    if (groupI === -1) return;
+    let copy = structuredClone(localTagValues);
+    copy[groupI].values = copy[groupI].values.map((tag) => ({
+      ...tag,
+      checked: tag.id === tagId,
+    }));
+    setLocalTagValues(copy);
+  };
+
+  const handleTagTextChange = (groupId, tagId, text) => {
+    let groupI = localTagValues.findIndex((group) => group.id === groupId);
+    if (groupI === -1) return;
+    let tagI = localTagValues[groupI].values.findIndex(
+      (tag) => tag.id === tagId,
+    );
+    if (tagI === -1) return;
+    let copy = structuredClone(localTagValues);
+    copy[groupI].values[tagI]["text"] = text;
+    setLocalTagValues(copy);
+  };
+
   const { isError, isLoading, mutate } = useMutation(
     ProjectAPI.mutateClassification,
     {
@@ -201,35 +390,18 @@ const TagsDialog = ({
           {tagsForm &&
             tagsForm.map((group, i) => (
               <Grid size={2} key={group.id}>
-                <Stack direction="column" spacing={1}>
-                  <Typography variant="h6">{group.label}</Typography>
-                  <FormGroup row={false}>
-                    {group.values.map((tag, j) => (
-                      <FormControlLabel
-                        key={`${group.id}:${tag.id}`}
-                        control={
-                          <Checkbox
-                            checked={
-                              localTagValues[i]?.values[j]?.checked || false
-                            }
-                            onChange={(e) =>
-                              handleTagValueChange(
-                                e.target.checked,
-                                group.id,
-                                tag.id,
-                              )
-                            }
-                            disabled={isLoading}
-                          />
-                        }
-                        label={tag.label}
-                      />
-                    ))}
-                  </FormGroup>
-                </Stack>
+                <TagGroupInput
+                  group={group}
+                  groupValues={localTagValues[i]}
+                  onToggle={handleTagValueChange}
+                  onSelectExclusive={handleSingleSelect}
+                  onTextChange={handleTagTextChange}
+                  disabled={isLoading}
+                />
               </Grid>
             ))}
         </Grid>
+        <TagRequiredLegend tagsForm={tagsForm} />
         {isError && (
           <Alert severity="error" sx={{ mt: 2 }}>
             Failed to update tags.
@@ -252,7 +424,7 @@ const TagsDialog = ({
             })
           }
           color="primary"
-          disabled={isLoading}
+          disabled={isLoading || !tagRequirementsMet(localTagValues)}
         >
           Save
         </Button>
@@ -313,7 +485,37 @@ const RecordCardLabeler = ({
     setTagValuesState(tagValuesCopy);
   };
 
+  const handleSingleSelect = (groupId, tagId) => {
+    let groupI = tagValuesState.findIndex((group) => group.id === groupId);
+    if (groupI === -1) return;
+
+    let tagValuesCopy = structuredClone(tagValuesState);
+    tagValuesCopy[groupI].values = tagValuesCopy[groupI].values.map((tag) => ({
+      ...tag,
+      checked: tag.id === tagId,
+    }));
+
+    setTagValuesState(tagValuesCopy);
+  };
+
+  const handleTagTextChange = (groupId, tagId, text) => {
+    let groupI = tagValuesState.findIndex((group) => group.id === groupId);
+    if (groupI === -1) return;
+    let tagI = tagValuesState[groupI].values.findIndex(
+      (tag) => tag.id === tagId,
+    );
+    if (tagI === -1) return;
+
+    let tagValuesCopy = structuredClone(tagValuesState);
+    tagValuesCopy[groupI].values[tagI]["text"] = text;
+
+    setTagValuesState(tagValuesCopy);
+  };
+
+  const requirementsMet = tagRequirementsMet(tagValuesState);
+
   const makeDecision = (label) => {
+    if (!requirementsMet) return;
     mutate({
       project_id: project_id,
       record_id: record_id,
@@ -368,40 +570,21 @@ const RecordCardLabeler = ({
                     }
                     key={group.id}
                   >
-                    <Stack direction="column" spacing={1}>
-                      <Typography variant="h6">{group.label}</Typography>
-                      <FormGroup row={false}>
-                        {group.values.map((tag, j) => (
-                          <FormControlLabel
-                            key={`${group.id}:${tag.id}`}
-                            control={
-                              <Checkbox
-                                checked={
-                                  tagValuesState[i]?.values[j]?.checked || false
-                                }
-                                onChange={(e) => {
-                                  handleTagValueChange(
-                                    e.target.checked,
-                                    group.id,
-                                    tag.id,
-                                  );
-                                }}
-                                disabled={
-                                  !editState ||
-                                  !changeDecision ||
-                                  isLoading ||
-                                  isSuccess
-                                }
-                              />
-                            }
-                            label={tag.label}
-                          />
-                        ))}
-                      </FormGroup>
-                    </Stack>
+                    <TagGroupInput
+                      group={group}
+                      groupValues={tagValuesState[i]}
+                      onToggle={handleTagValueChange}
+                      onSelectExclusive={handleSingleSelect}
+                      onTextChange={handleTagTextChange}
+                      readOnly={!editState}
+                      disabled={
+                        !editState || !changeDecision || isLoading || isSuccess
+                      }
+                    />
                   </Grid>
                 ))}
             </Grid>
+            <TagRequiredLegend tagsForm={tagsForm} />
           </CardContent>
         )}
       </Box>
@@ -496,7 +679,7 @@ const RecordCardLabeler = ({
                   onClick={() => makeDecision(1)}
                   variant="contained"
                   startIcon={<LibraryAddOutlinedIcon />}
-                  disabled={isLoading || isSuccess}
+                  disabled={isLoading || isSuccess || !requirementsMet}
                   sx={(theme) => ({
                     color: theme.palette.getContrastText(
                       theme.palette.tertiary.main,
@@ -517,7 +700,7 @@ const RecordCardLabeler = ({
                   id="irrelevant"
                   onClick={() => makeDecision(0)}
                   startIcon={<NotInterestedOutlinedIcon />}
-                  disabled={isLoading || isSuccess}
+                  disabled={isLoading || isSuccess || !requirementsMet}
                   variant="contained"
                   color="grey.600"
                 >

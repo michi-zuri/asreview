@@ -17,9 +17,11 @@ import {
   Popover,
   Skeleton,
   Stack,
+  Switch,
   TextField,
   Tooltip,
   Typography,
+  FormControlLabel,
 } from "@mui/material";
 import { ProjectContext } from "context/ProjectContext";
 import { useContext } from "react";
@@ -224,6 +226,8 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
     group || {
       label: "",
       export: "",
+      single_select: false,
+      required: false,
       values: [
         {
           label: "",
@@ -284,6 +288,20 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
     }));
   };
 
+  const handleSingleSelectChange = (e) => {
+    setState((prev) => ({
+      ...prev,
+      single_select: e.target.checked,
+    }));
+  };
+
+  const handleRequiredChange = (e) => {
+    setState((prev) => ({
+      ...prev,
+      required: e.target.checked,
+    }));
+  };
+
   const handleTagLabelChange = (index, e) => {
     setState((prev) => ({
       ...prev,
@@ -308,6 +326,15 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
     }));
   };
 
+  const handleTagFreeTextChange = (index, e) => {
+    setState((prev) => ({
+      ...prev,
+      values: prev.values.map((tag, i) =>
+        i === index ? { ...tag, free_text: e.target.checked } : tag,
+      ),
+    }));
+  };
+
   const addTag = () => {
     setState((prev) => ({
       ...prev,
@@ -326,6 +353,8 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
       setState({
         label: "",
         export: "",
+        single_select: false,
+        required: false,
         values: [
           {
             label: "",
@@ -396,11 +425,29 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
               onChange={handleGroupExportChange}
             />
           </Stack>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={Boolean(state.single_select)}
+                onChange={handleSingleSelectChange}
+              />
+            }
+            label="Allow only one tag to be selected (radio buttons)"
+          />
+          <FormControlLabel
+            control={
+              <Switch
+                checked={Boolean(state.required)}
+                onChange={handleRequiredChange}
+              />
+            }
+            label="Require a selection before labeling"
+          />
         </Stack>
         <Stack spacing={3}>
           <TypographySubtitle1Medium>Tags</TypographySubtitle1Medium>
           {state.values.map((tag, index) => (
-            <Stack direction="row" spacing={3} key={index}>
+            <Stack direction="row" spacing={3} alignItems="center" key={index}>
               <TextField
                 fullWidth
                 id={`tag-label-${index}`}
@@ -415,6 +462,18 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
                 value={tag.export}
                 onChange={(e) => handleTagExportChange(index, e)}
               />
+              <Tooltip title="Allow free text input when this tag is selected">
+                <FormControlLabel
+                  sx={{ flexShrink: 0, whiteSpace: "nowrap" }}
+                  control={
+                    <Switch
+                      checked={Boolean(tag.free_text)}
+                      onChange={(e) => handleTagFreeTextChange(index, e)}
+                    />
+                  }
+                  label="Free text"
+                />
+              </Tooltip>
             </Stack>
           ))}
         </Stack>
@@ -466,6 +525,14 @@ const Group = ({ project_id, group }) => {
     <Card sx={{ mb: 2, bgcolor: "background.default" }}>
       <CardHeader
         title={group.label}
+        subheader={
+          [
+            group.single_select ? "Single choice" : null,
+            group.required ? "required" : null,
+          ]
+            .filter(Boolean)
+            .join(" · ") || undefined
+        }
         action={
           <Tooltip title="Edit Group">
             <IconButton onClick={toggleDialogOpen}>
@@ -476,7 +543,11 @@ const Group = ({ project_id, group }) => {
       />
       <CardContent>
         {group.values.map((t, index) => (
-          <Chip key={index} label={`${t.label} (${t.export})`} sx={{ m: 1 }} />
+          <Chip
+            key={index}
+            label={`${t.label} (${t.export})${t.free_text ? " + text" : ""}`}
+            sx={{ m: 1 }}
+          />
         ))}
       </CardContent>
       <MutateGroupDialog
