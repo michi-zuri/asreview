@@ -606,12 +606,32 @@ def _tag_is_checked(saved_tags, group_export, tag_export):
     return False
 
 
-def _record_tags_invalid(saved_tags, tags_form):
+def _group_required_for_label(group, label):
+    """Whether a tag group requires a selection for the given decision.
+
+    Groups can be required for relevant decisions (``required_relevant``),
+    irrelevant decisions (``required_irrelevant``), or both. When ``label`` is
+    ``None`` the group counts as required if it is required for either decision.
+    """
+    rel = bool(group.get("required_relevant"))
+    irr = bool(group.get("required_irrelevant"))
+    if label is None:
+        return rel or irr
+    if int(label) == 1:
+        return rel
+    if int(label) == 0:
+        return irr
+    return rel or irr
+
+
+def _record_tags_invalid(saved_tags, tags_form, label=None):
     """Whether a record violates its tag group rules.
 
     Mirrors the frontend warnings:
-    - a ``single_select`` group with more than one checked value (too many), and
-    - a ``required`` group with no checked value (missing selection).
+    - a ``single_select`` group with more than one checked value (too many),
+    - a required group (for this ``label``) with no checked value (missing), and
+    - a ``require_all`` (checklist) group, required for this ``label``, that does
+      not have every option checked.
     """
     if not tags_form:
         return False
@@ -620,22 +640,34 @@ def _record_tags_invalid(saved_tags, tags_form):
     saved_by_id = {g.get("id"): g for g in saved_tags if isinstance(g, dict)}
     for group in tags_form:
         single_select = bool(group.get("single_select"))
-        required = bool(group.get("required"))
+        require_all = bool(group.get("require_all")) and not single_select
+        required = _group_required_for_label(group, label)
         if not single_select and not required:
             continue
+
         saved_group = saved_by_id.get(group.get("id"))
+        saved_values = {}
         if isinstance(saved_group, dict):
-            checked = sum(
-                1
+            saved_values = {
+                v.get("id"): v
                 for v in saved_group.get("values", [])
-                if isinstance(v, dict) and v.get("checked")
-            )
-        else:
-            checked = 0
+                if isinstance(v, dict)
+            }
+        checked = sum(1 for v in saved_values.values() if v.get("checked"))
+
         if single_select and checked > 1:
             return True
-        if required and checked == 0:
-            return True
+        if required:
+            if require_all:
+                form_values = group.get("values", [])
+                all_checked = bool(form_values) and all(
+                    saved_values.get(v.get("id"), {}).get("checked")
+                    for v in form_values
+                )
+                if not all_checked:
+                    return True
+            elif checked == 0:
+                return True
     return False
 
 
@@ -652,7 +684,7 @@ def api_get_labeled(project):  # noqa: F401
     Python scan over the ordered candidates, so the whole table is never loaded
     or parsed at once.
     """
-    per_page = request.args.get("per_page", default=200, type=int)
+    per_page = request.args.get("per_page", default=50, type=int)
     subset = request.args.get("subset", default="all", type=str)
     filters = request.args.getlist("filter", type=str)
     latest_first = request.args.get("latest_first", default=1, type=int) == 1
@@ -751,7 +783,7 @@ def api_get_labeled(project):  # noqa: F401
                 ]
             )
 
-        def passes(saved_tags, record_id):
+        def passes(saved_tags, record_id, label):
             if pdf_ids is not None:
                 in_pdf = record_id in pdf_ids
                 if filter_pdf != in_pdf:
@@ -760,7 +792,10 @@ def api_get_labeled(project):  # noqa: F401
                 if _tag_is_checked(saved_tags, group_export, tag_export) != want:
                     return False
             if invalid_filter is not None:
-                if _record_tags_invalid(saved_tags, tags_form) != invalid_filter:
+                if (
+                    _record_tags_invalid(saved_tags, tags_form, label)
+                    != invalid_filter
+                ):
                     return False
             return True
 
@@ -789,7 +824,9 @@ def api_get_labeled(project):  # noqa: F401
                     None if pd.isna(t) else float(t),
                     int(state["record_id"]),
                 )
-                if passes(state["tags"], int(state["record_id"])):
+                row_label = state["label"]
+                row_label = None if pd.isna(row_label) else int(row_label)
+                if passes(state["tags"], int(state["record_id"]), row_label):
                     matched.append(state)
                     if len(matched) > per_page:
                         has_next = True

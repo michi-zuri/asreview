@@ -70,8 +70,9 @@ while more records are available; when everything has been loaded it shows a
 *nothing more to load* message instead. You can filter the collection (for
 example by label, prior knowledge, notes, or tags). One of the available filters
 is *invalid tags*, which surfaces records whose tags are inconsistent: more than
-one option selected in a single-select group, or no option selected in a
-required group. The filter appears whenever the project has at least one
+one option selected in a single-select group, a required selection missing for
+the record's decision (relevant or not relevant), or a checklist group that is
+not fully checked. The filter appears whenever the project has at least one
 single-select or required tag group.
 
 Full Text

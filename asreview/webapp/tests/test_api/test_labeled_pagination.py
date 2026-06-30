@@ -129,7 +129,13 @@ def test_tag_helpers():
     # A required group with no checked value is invalid (missing selection),
     # even when no group is single_select.
     required_form = [
-        {"id": 0, "export": "grp", "required": True, "values": []},
+        {
+            "id": 0,
+            "export": "grp",
+            "required_relevant": True,
+            "required_irrelevant": True,
+            "values": [],
+        },
     ]
     saved_missing = [
         {
@@ -156,6 +162,71 @@ def test_tag_helpers():
         }
     ]
     assert _record_tags_invalid(saved_required_ok, required_form) is False
+
+
+def test_record_tags_invalid_per_label_required():
+    # Group required only for relevant decisions.
+    rel_form = [
+        {"id": 0, "export": "grp", "required_relevant": True, "values": []},
+    ]
+    empty = [
+        {
+            "id": 0,
+            "export": "grp",
+            "values": [{"id": 0, "export": "a", "checked": False}],
+        }
+    ]
+    # Relevant record with no selection -> invalid.
+    assert _record_tags_invalid(empty, rel_form, label=1) is True
+    # Same record labeled irrelevant -> the requirement does not apply.
+    assert _record_tags_invalid(empty, rel_form, label=0) is False
+    # Without a label, "required for either decision" makes it invalid.
+    assert _record_tags_invalid(empty, rel_form) is True
+
+    # Group required only for irrelevant decisions (mirror image).
+    irr_form = [
+        {"id": 0, "export": "grp", "required_irrelevant": True, "values": []},
+    ]
+    assert _record_tags_invalid(empty, irr_form, label=0) is True
+    assert _record_tags_invalid(empty, irr_form, label=1) is False
+
+
+def test_record_tags_invalid_require_all_checklist():
+    form = [
+        {
+            "id": 0,
+            "export": "chk",
+            "required_relevant": True,
+            "require_all": True,
+            "values": [{"id": 0, "export": "a"}, {"id": 1, "export": "b"}],
+        }
+    ]
+    # Only one of two options checked -> checklist not satisfied.
+    partial = [
+        {
+            "id": 0,
+            "export": "chk",
+            "values": [
+                {"id": 0, "export": "a", "checked": True},
+                {"id": 1, "export": "b", "checked": False},
+            ],
+        }
+    ]
+    assert _record_tags_invalid(partial, form, label=1) is True
+    # The requirement only applies to relevant decisions here.
+    assert _record_tags_invalid(partial, form, label=0) is False
+    # All options checked -> valid.
+    full = [
+        {
+            "id": 0,
+            "export": "chk",
+            "values": [
+                {"id": 0, "export": "a", "checked": True},
+                {"id": 1, "export": "b", "checked": True},
+            ],
+        }
+    ]
+    assert _record_tags_invalid(full, form, label=1) is False
 
 
 def test_flatten_tags_free_text_only_when_checked():

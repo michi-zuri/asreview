@@ -53,7 +53,9 @@ const TagsTable = ({
       {tagsForm &&
         tagsForm.map((group, i) => {
           const singleSelect = Boolean(group.single_select);
-          const required = Boolean(group.required);
+          const required = Boolean(
+            group.required_relevant || group.required_irrelevant,
+          );
           const checkedCount = (tagValues[i]?.values || []).filter(
             (t) => t.checked,
           ).length;
@@ -92,7 +94,8 @@ const TagsTable = ({
                                 handleSingleSelect(group.id, tag.id)
                               }
                               onClick={() => {
-                                if (checked && !required) {
+                                // Radio buttons can always be deselected.
+                                if (checked) {
                                   handleTagValueChange(false, group.id, tag.id);
                                 }
                               }}

@@ -79,15 +79,24 @@ Each tag group can be configured in the *Customize* tab:
   the tags are shown as radio buttons in the *Reviewer* interface. When
   disabled, the tags are shown as checkboxes and any number of them can be
   selected.
-- **Required**: when enabled, a selection must be made in the group before the
-  record can be saved. Required groups are marked with an asterisk
+- **Required per decision**: a selection in the group can be required for
+  *relevant* decisions, for *not relevant* decisions, or for both, using two
+  independent toggles. This gives four combinations: never required, required
+  only when marking a record relevant, required only when marking it not
+  relevant, or always required. The matching decision button stays disabled
+  until the requirement is met. Required groups are marked with an asterisk
   (``*``), explained by the legend *"\* a selection must be made in this
   group"*.
+- **Checklist (require all options)**: for a multi-select group that is required
+  for at least one decision, you can additionally require that *every* option is
+  selected, turning the group into a checklist. This toggle is only available
+  when single-select is off and at least one of the required toggles is on.
 - **Free text**: each individual tag can opt in to an additional free-text input
   field, letting reviewers attach a short note to that specific tag.
 
-Single-select groups that are not required allow the selected radio button to be
-deselected by clicking it again.
+In a single-select group the selected radio button can always be deselected by
+clicking it again. Deselecting a required group leaves it empty, so the matching
+decision button stays disabled until a selection is made again.
 
 Tags are presented to you in the *Reviewer* interface as checkboxes or radio
 buttons depending on the group configuration. The selected tags (and any
@@ -97,9 +106,10 @@ provided, ``tag_<group>_<value>_text``. The collection only displays the tags
 that were actually selected; empty optional groups show a placeholder. If an
 invalid combination is encountered (for example more than one option selected in
 a single-select group, which can happen when a project is edited across
-versions, or no selection in a required group), the record is still shown but
-with a warning, and the **Collection** filter offers an *invalid tags* option to
-find these records.
+versions; a required selection missing for the record's decision; or a checklist
+group that is not fully checked), the record is still shown but with a warning,
+and the **Collection** filter offers an *invalid tags* option to find these
+records.
 
 .. note::
 

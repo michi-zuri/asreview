@@ -748,7 +748,7 @@ class Database:
         include_users=None,
         exclude_users=None,
         cursor=None,
-        limit=200,
+        limit=50,
         latest_first=True,
     ):
         """Get an ordered page of labeled results using keyset pagination.

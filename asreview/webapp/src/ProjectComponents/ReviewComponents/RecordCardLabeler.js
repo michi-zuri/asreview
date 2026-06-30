@@ -74,20 +74,51 @@ const mergeTagValues = (tagsForm, tagValues) => {
 };
 
 /**
- * Returns true when every required group has at least one value selected. Used
- * to gate labeling/saving when a selection is obligatory.
+ * Whether a group requires a selection for a given decision. Groups can be
+ * required for relevant decisions, irrelevant decisions, or both. When ``label``
+ * is null/undefined (no decision yet) the group counts as required if it is
+ * required for either decision.
  */
-const tagRequirementsMet = (tagValues) =>
-  (tagValues || []).every(
-    (group) => !group.required || (group.values || []).some((t) => t.checked),
-  );
+const groupRequiredForLabel = (group, label) => {
+  const rel = Boolean(group.required_relevant);
+  const irr = Boolean(group.required_irrelevant);
+  if (label === 1) return rel;
+  if (label === 0) return irr;
+  return rel || irr;
+};
+
+/** Whether a group is configured as a "select all options" checklist. */
+const groupRequiresAll = (group) =>
+  !group.single_select && Boolean(group.require_all);
+
+/**
+ * Whether the requirement of a single group is satisfied for the given decision.
+ */
+const groupRequirementMet = (group, label) => {
+  if (!groupRequiredForLabel(group, label)) return true;
+  const values = group.values || [];
+  if (groupRequiresAll(group)) {
+    return values.length > 0 && values.every((t) => t.checked);
+  }
+  return values.some((t) => t.checked);
+};
+
+/**
+ * Returns true when every group's requirement is met for the given decision.
+ * Used to gate labeling/saving when a selection is obligatory.
+ */
+const tagRequirementsMetForLabel = (tagValues, label) =>
+  (tagValues || []).every((group) => groupRequirementMet(group, label));
 
 /**
  * Explains the "*" marker shown next to required tag groups. Renders nothing
- * when no group in the form is required.
+ * when no group in the form is required for any decision.
  */
 const TagRequiredLegend = ({ tagsForm }) => {
-  if (!Array.isArray(tagsForm) || !tagsForm.some((g) => g.required)) {
+  if (
+    !Array.isArray(tagsForm) ||
+    !tagsForm.some((g) => groupRequiredForLabel(g, null))
+  ) {
     return null;
   }
   return (
@@ -122,14 +153,29 @@ const TagGroupInput = ({
   onTextChange,
   disabled = false,
   readOnly = false,
+  label = null,
 }) => {
+  const totalCount = (groupValues?.values || []).length;
   const checkedCount = (groupValues?.values || []).filter(
     (t) => t.checked,
   ).length;
   const singleSelect = Boolean(group.single_select);
-  const required = Boolean(group.required);
+  const requireAll = groupRequiresAll(group);
+  const requiredAny = groupRequiredForLabel(group, null);
+  // In read-only mode the decision is known, so only enforce its requirement;
+  // while deciding (label null) flag what is required for either decision.
+  const requiredForThis = groupRequiredForLabel(group, label);
+  const allChecked = totalCount > 0 && checkedCount === totalCount;
   const invalid = singleSelect && checkedCount > 1;
-  const missing = required && checkedCount === 0;
+  const missing =
+    requiredForThis && (requireAll ? !allChecked : checkedCount === 0);
+  // Explains which decision(s) the selection is required for.
+  const requirementReason = [
+    group.required_relevant && "for allowing relevant decision",
+    group.required_irrelevant && "for allowing irrelevant decision",
+  ]
+    .filter(Boolean)
+    .join(" and ");
 
   if (readOnly) {
     const selected = group.values
@@ -139,7 +185,7 @@ const TagGroupInput = ({
       <Stack direction="column" spacing={1}>
         <Typography variant="h6">
           {group.label}
-          {required && " *"}
+          {requiredAny && " *"}
         </Typography>
         {invalid && (
           <Alert severity="warning">
@@ -148,7 +194,9 @@ const TagGroupInput = ({
         )}
         {missing && (
           <Alert severity="warning">
-            A selection is required in this group, but none is made.
+            {requireAll
+              ? "All options must be selected in this group, but some are missing."
+              : "A selection is required in this group, but none is made."}
           </Alert>
         )}
         {selected.length > 0 ? (
@@ -173,7 +221,7 @@ const TagGroupInput = ({
     <Stack direction="column" spacing={1}>
       <Typography variant="h6">
         {group.label}
-        {required && " *"}
+        {requiredAny && " *"}
       </Typography>
       {invalid && (
         <Alert severity="warning">
@@ -181,8 +229,13 @@ const TagGroupInput = ({
         </Alert>
       )}
       {missing && (
-        <Typography variant="caption" color="error">
-          {singleSelect ? "Select one option" : "Select at least one option"}
+        <Typography variant="caption" color="warning">
+          {(requireAll
+            ? "Select all options"
+            : singleSelect
+              ? "Select one option"
+              : "Select at least one option") +
+            (requirementReason ? ` ${requirementReason}` : "")}
         </Typography>
       )}
       <FormGroup row={false}>
@@ -198,7 +251,9 @@ const TagGroupInput = ({
                       checked={checked}
                       onChange={() => onSelectExclusive(group.id, tag.id)}
                       onClick={() => {
-                        if (checked && !required) {
+                        // A radio button can always be deselected by clicking
+                        // the already-selected option again.
+                        if (checked) {
                           onToggle(false, group.id, tag.id);
                         }
                       }}
@@ -402,6 +457,7 @@ const TagsDialog = ({
                   onSelectExclusive={handleSingleSelect}
                   onTextChange={handleTagTextChange}
                   disabled={isLoading}
+                  label={label === 1 || label === 0 ? label : null}
                 />
               </Grid>
             ))}
@@ -429,7 +485,13 @@ const TagsDialog = ({
             })
           }
           color="primary"
-          disabled={isLoading || !tagRequirementsMet(localTagValues)}
+          disabled={
+            isLoading ||
+            !tagRequirementsMetForLabel(
+              localTagValues,
+              label === 1 || label === 0 ? label : null,
+            )
+          }
         >
           Save
         </Button>
@@ -517,10 +579,16 @@ const RecordCardLabeler = ({
     setTagValuesState(tagValuesCopy);
   };
 
-  const requirementsMet = tagRequirementsMet(tagValuesState);
+  // Requirements can differ per decision, so check relevant and irrelevant
+  // independently to gate each button.
+  const relevantRequirementsMet = tagRequirementsMetForLabel(tagValuesState, 1);
+  const irrelevantRequirementsMet = tagRequirementsMetForLabel(
+    tagValuesState,
+    0,
+  );
 
   const makeDecision = (label) => {
-    if (!requirementsMet) return;
+    if (!tagRequirementsMetForLabel(tagValuesState, label)) return;
     mutate({
       project_id: project_id,
       record_id: record_id,
@@ -582,6 +650,7 @@ const RecordCardLabeler = ({
                       onSelectExclusive={handleSingleSelect}
                       onTextChange={handleTagTextChange}
                       readOnly={!editState}
+                      label={label === 1 || label === 0 ? label : null}
                       disabled={
                         !editState || !changeDecision || isLoading || isSuccess
                       }
@@ -684,7 +753,7 @@ const RecordCardLabeler = ({
                   onClick={() => makeDecision(1)}
                   variant="contained"
                   startIcon={<LibraryAddOutlinedIcon />}
-                  disabled={isLoading || isSuccess || !requirementsMet}
+                  disabled={isLoading || isSuccess || !relevantRequirementsMet}
                   sx={(theme) => ({
                     color: theme.palette.getContrastText(
                       theme.palette.tertiary.main,
@@ -705,7 +774,9 @@ const RecordCardLabeler = ({
                   id="irrelevant"
                   onClick={() => makeDecision(0)}
                   startIcon={<NotInterestedOutlinedIcon />}
-                  disabled={isLoading || isSuccess || !requirementsMet}
+                  disabled={
+                    isLoading || isSuccess || !irrelevantRequirementsMet
+                  }
                   variant="contained"
                   color="grey.600"
                 >
