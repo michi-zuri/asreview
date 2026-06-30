@@ -367,6 +367,113 @@ def test_label_item(client, project, label):
     assert r.json["success"]
 
 
+# Test list configuration CRUD (create, read, update)
+def test_lists_crud(client, project):
+    project_id = au.get_project_id(project)
+
+    # initially empty
+    r = client.get(f"/api/projects/{project_id}/lists")
+    assert r.status_code == 200
+    assert r.json == []
+
+    # create
+    r = client.post(
+        f"/api/projects/{project_id}/lists",
+        data={"list": json.dumps({"name": "Outcomes", "required_for_relevant": True})},
+    )
+    assert r.status_code == 200
+    assert r.json[0]["name"] == "Outcomes"
+    assert r.json[0]["required_for_relevant"] is True
+    # The list id is a uuid string, not an integer.
+    list_id = r.json[0]["id"]
+    assert isinstance(list_id, str)
+    assert len(list_id) == 36
+
+    # read
+    r = client.get(f"/api/projects/{project_id}/lists")
+    assert len(r.json) == 1
+    assert r.json[0]["name"] == "Outcomes"
+
+    # update
+    r = client.put(
+        f"/api/projects/{project_id}/lists/{list_id}",
+        data={
+            "list": json.dumps({"name": "Populations", "required_for_relevant": False})
+        },
+    )
+    assert r.status_code == 200
+    assert r.json["name"] == "Populations"
+    assert r.json["id"] == list_id
+    assert r.json["required_for_relevant"] is False
+
+    r = client.get(f"/api/projects/{project_id}/lists")
+    assert r.json[0]["name"] == "Populations"
+
+
+# Test labeling a record with list items and reading them back
+def test_label_with_lists(client, project):
+    project_id = au.get_project_id(project)
+
+    search = au.search_project_data(client, project, query="The&n_max=10")
+    record_id = search.json["result"][0]["record_id"]
+
+    items = [
+        {"list_id": "L1", "item_id": "i1", "name": "alpha", "created": 1.0},
+        {"list_id": "L1", "item_id": "i2", "name": "beta", "created": 2.0},
+    ]
+    r = client.post(
+        f"/api/projects/{project_id}/record/{record_id}",
+        data={"record_id": record_id, "label": 1, "lists": json.dumps(items)},
+    )
+    assert r.status_code == 200
+
+    labeled = au.get_labeled_project_data(client, project)
+    record = next(
+        rec for rec in labeled.json["result"] if rec["record_id"] == record_id
+    )
+    # Ordered by created timestamp.
+    names = [item["name"] for item in record["state"]["lists"]]
+    assert names == ["alpha", "beta"]
+    # No lists.json configured for this project, so lists_form is None.
+    assert record["lists_form"] is None
+
+
+# Test that illegal list item names are rejected
+def test_label_with_invalid_list_name(client, project):
+    project_id = au.get_project_id(project)
+
+    search = au.search_project_data(client, project, query="The&n_max=10")
+    record_id = search.json["result"][0]["record_id"]
+
+    items = [
+        {"list_id": "L1", "item_id": "i1", "name": "a,b", "created": 1.0},
+    ]
+    r = client.post(
+        f"/api/projects/{project_id}/record/{record_id}",
+        data={"record_id": record_id, "label": 1, "lists": json.dumps(items)},
+    )
+    assert r.status_code == 400
+
+
+# Test that duplicate item names within a list are rejected with a clear message
+def test_label_with_duplicate_list_name(client, project):
+    project_id = au.get_project_id(project)
+
+    search = au.search_project_data(client, project, query="The&n_max=10")
+    record_id = search.json["result"][0]["record_id"]
+
+    items = [
+        {"list_id": "L1", "item_id": "i1", "name": "same", "created": 1.0},
+        {"list_id": "L1", "item_id": "i2", "name": "same", "created": 2.0},
+    ]
+    r = client.post(
+        f"/api/projects/{project_id}/record/{record_id}",
+        data={"record_id": record_id, "label": 1, "lists": json.dumps(items)},
+    )
+    assert r.status_code == 400
+    assert r.json["message"] == "List entries must be unique."
+
+
 # Test getting labeled records
 def test_get_labeled_project_data(client, project):
     # label a random record

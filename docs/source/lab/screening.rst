@@ -19,8 +19,9 @@ relevant records are prioritized for review.
 
    The review screen of ASReview LAB with the title and abstract of a record to
    review. Click on the relevant or irrelevant button to label the record and
-   continue to the next record. You can also add a note to the record or check
-   self-defined tags.
+   continue to the next record. You can also add a note to the record, check
+   self-defined tags, or add free-text items to self-defined lists (shown
+   between the tags and the note).
 
 
 Each labeling decision by the user starts the training of a new model, provided
@@ -64,6 +65,16 @@ You can change decisions on this page.
 4. To change the label of a record, click on the three dots on the right of the
    record.
 5. Click on *Change label to*.
+
+The **Collection** page loads records in pages and shows a *Load more* button
+while more records are available; when everything has been loaded it shows a
+*nothing more to load* message instead. You can filter the collection (for
+example by label, prior knowledge, notes, or tags). One of the available filters
+is *invalid tags*, which surfaces records whose tags are inconsistent: more than
+one option selected in a single-select group, a required selection missing for
+the record's decision (relevant or not relevant), or a checklist group that is
+not fully checked. The filter appears whenever the project has at least one
+single-select or required tag group.
 
 Full Text
 ---------

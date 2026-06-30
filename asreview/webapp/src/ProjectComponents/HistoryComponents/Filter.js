@@ -62,6 +62,15 @@ function buildUserFilterDefs(users) {
  * Each tag group becomes a filter row, and each tag value within it
  * becomes a True/False toggle.
  */
+const INVALID_TAGS_FILTER_DEF = {
+  key: "invalid_tags",
+  label: "Invalid tags",
+  options: [
+    { value: "invalid_tags", label: "True", symbol: "✓" },
+    { value: "invalid_tags=false", label: "False", symbol: "\u20E0" },
+  ],
+};
+
 function buildTagFilterDefs(tagsConfig) {
   if (!tagsConfig || !Array.isArray(tagsConfig)) return [];
   return tagsConfig.flatMap((group) =>
@@ -144,7 +153,16 @@ export default function Filter(props) {
         withCredentials: true,
       })
       .then((res) => {
-        setTagDefs(buildTagFilterDefs(res.data));
+        const defs = buildTagFilterDefs(res.data);
+        // The "invalid tags" filter is only meaningful when a group can be
+        // invalid: a single-select group (too many selected) or a required
+        // group (no selection).
+        const hasInvalidableGroup =
+          Array.isArray(res.data) &&
+          res.data.some((g) => g.single_select || g.required);
+        setTagDefs(
+          hasInvalidableGroup ? [INVALID_TAGS_FILTER_DEF, ...defs] : defs,
+        );
       })
       .catch(() => {
         setTagDefs([]);

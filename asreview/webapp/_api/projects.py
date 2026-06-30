@@ -17,10 +17,10 @@ import hashlib
 import hmac
 import json
 import logging
-import math
 import secrets
 import shutil
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -76,6 +76,7 @@ from asreview.utils import _get_filename_from_url
 from asreview.webapp import DB
 from asreview.webapp._api.utils import add_id_to_tags
 from asreview.webapp._api.utils import get_all_model_components
+from asreview.webapp._api.utils import read_lists_data
 from asreview.webapp._api.utils import read_tags_data
 from asreview.webapp._api.zotero import ZoteroLookupError
 from asreview.webapp._api.zotero import build_reader_url
@@ -549,28 +550,151 @@ def api_search_data(project):  # noqa: F401
         record_d = asdict(record)
         record_d["state"] = None
         record_d["tags_form"] = read_tags_data(project)
+        record_d["lists_form"] = read_lists_data(project)
         result.append(record_d)
 
     return jsonify({"result": result})
+
+
+def _labeled_filter_signature(subset, filters, latest_first):
+    """Stable short signature of the query parameters that define an ordering.
+
+    Embedded in the pagination cursor so a cursor cannot be accidentally reused
+    across a different filter/sort set (which could silently skip records).
+    """
+    payload = json.dumps([subset, sorted(filters), bool(latest_first)], sort_keys=True)
+    return hashlib.sha1(payload.encode()).hexdigest()[:12]
+
+
+def _encode_cursor(time_val, record_id, filter_sig):
+    obj = {
+        "v": 1,
+        "t": time_val.hex() if isinstance(time_val, float) else None,
+        "rid": int(record_id),
+        "fh": filter_sig,
+    }
+    return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
+
+
+def _decode_cursor(cursor_param, filter_sig):
+    """Decode an opaque cursor. Returns ``(time, record_id)`` or ``None``.
+
+    Raises ``ValueError`` if the cursor is malformed or was created for a
+    different filter/sort set.
+    """
+    if not cursor_param:
+        return None
+    try:
+        obj = json.loads(base64.urlsafe_b64decode(cursor_param.encode()))
+        if obj.get("v") != 1 or obj.get("fh") != filter_sig:
+            raise ValueError("cursor does not match the current query")
+        t = obj.get("t")
+        return (None if t is None else float.fromhex(t), int(obj["rid"]))
+    except (ValueError, KeyError, TypeError) as err:
+        raise ValueError(f"invalid cursor: {err}")
+
+
+def _tag_is_checked(saved_tags, group_export, tag_export):
+    """Whether a record has a specific tag value checked."""
+    if not isinstance(saved_tags, list):
+        return False
+    for group in saved_tags:
+        if not isinstance(group, dict) or group.get("export") != group_export:
+            continue
+        for tag in group.get("values", []):
+            if isinstance(tag, dict) and tag.get("export") == tag_export:
+                return bool(tag.get("checked", False))
+    return False
+
+
+def _group_required_for_label(group, label):
+    """Whether a tag group requires a selection for the given decision.
+
+    Groups can be required for relevant decisions (``required_relevant``),
+    irrelevant decisions (``required_irrelevant``), or both. When ``label`` is
+    ``None`` the group counts as required if it is required for either decision.
+    """
+    rel = bool(group.get("required_relevant"))
+    irr = bool(group.get("required_irrelevant"))
+    if label is None:
+        return rel or irr
+    if int(label) == 1:
+        return rel
+    if int(label) == 0:
+        return irr
+    return rel or irr
+
+
+def _record_tags_invalid(saved_tags, tags_form, label=None):
+    """Whether a record violates its tag group rules.
+
+    Mirrors the frontend warnings:
+    - a ``single_select`` group with more than one checked value (too many),
+    - a required group (for this ``label``) with no checked value (missing), and
+    - a ``require_all`` (checklist) group, required for this ``label``, that does
+      not have every option checked.
+    """
+    if not tags_form:
+        return False
+    if not isinstance(saved_tags, list):
+        saved_tags = []
+    saved_by_id = {g.get("id"): g for g in saved_tags if isinstance(g, dict)}
+    for group in tags_form:
+        single_select = bool(group.get("single_select"))
+        require_all = bool(group.get("require_all")) and not single_select
+        required = _group_required_for_label(group, label)
+        if not single_select and not required:
+            continue
+
+        saved_group = saved_by_id.get(group.get("id"))
+        saved_values = {}
+        if isinstance(saved_group, dict):
+            saved_values = {
+                v.get("id"): v
+                for v in saved_group.get("values", [])
+                if isinstance(v, dict)
+            }
+        checked = sum(1 for v in saved_values.values() if v.get("checked"))
+
+        if single_select and checked > 1:
+            return True
+        if required:
+            if require_all:
+                form_values = group.get("values", [])
+                all_checked = bool(form_values) and all(
+                    saved_values.get(v.get("id"), {}).get("checked")
+                    for v in form_values
+                )
+                if not all_checked:
+                    return True
+            elif checked == 0:
+                return True
+    return False
 
 
 @bp.route("/projects/<project_id>/labeled", methods=["GET"])
 @login_required
 @project_authorization
 def api_get_labeled(project):  # noqa: F401
-    """Get all records classified as labeled documents"""
+    """Get a page of labeled records using keyset (cursor) pagination.
 
-    page = request.args.get("page", default=None, type=int)
-    per_page = request.args.get("per_page", default=200, type=int)
+    Cheap filters (subset, prior, note, user) are pushed into SQL and the page
+    is read with ``ORDER BY ... LIMIT n+1`` (the extra row signals whether more
+    pages exist). Filters that require parsing the tags JSON (``tag_*``,
+    ``invalid_tags``) and the Zotero ``pdf`` filter are applied as a bounded
+    Python scan over the ordered candidates, so the whole table is never loaded
+    or parsed at once.
+    """
+    per_page = request.args.get("per_page", default=50, type=int)
     subset = request.args.get("subset", default="all", type=str)
     filters = request.args.getlist("filter", type=str)
-    latest_first = request.args.get("latest_first", default=1, type=int)
+    latest_first = request.args.get("latest_first", default=1, type=int) == 1
+    cursor_param = request.args.get("cursor", default=None, type=str)
 
     # Parse boolean filters. Supported formats:
-    #   "is_prior" or "is_prior=true"  → only priors
-    #   "is_prior=false"               → exclude priors
-    #   "has_note" or "has_note=true"  → only records with notes
-    #   "has_note=false"               → only records without notes
+    #   "is_prior" / "is_prior=true"   → only priors;   "is_prior=false" → exclude
+    #   "has_note" / "has_note=true"   → only notes;     "has_note=false" → without
+    #   "user_<id>", "pdf", "tag_<g>_<v>", "invalid_tags" (each "=false" variant)
     parsed_filters = {}
     for f in filters:
         if "=" in f:
@@ -579,121 +703,55 @@ def api_get_labeled(project):  # noqa: F401
         else:
             parsed_filters[f] = True
 
-    with project.db as db:
-        filter_is_prior = parsed_filters.get("is_prior")
-        if filter_is_prior is True:
-            state_data = db.get_priors()
-        elif filter_is_prior is False:
-            # All labeled records that are NOT priors
-            state_data = db.get_results_table(priors=False)
-        else:
-            state_data = db.get_results_table()
-
+    # ---- Cheap filters pushed into SQL ----
     if subset == "relevant":
-        state_data = state_data[state_data["label"] == 1]
+        label = 1
     elif subset == "irrelevant":
-        state_data = state_data[state_data["label"] == 0]
+        label = 0
     else:
-        state_data = state_data[~state_data["label"].isnull()]
+        label = None
 
-    filter_has_note = parsed_filters.get("has_note")
-    if filter_has_note is True:
-        state_data = state_data[~state_data["note"].isnull()]
-    elif filter_has_note is False:
-        state_data = state_data[state_data["note"].isnull()]
+    priors = parsed_filters.get("is_prior")
+    has_note = parsed_filters.get("has_note")
 
-    # Tag filters. Supported format:
-    #   "tag_{group_export}_{value_export}" or "...=true"  → tag is set
-    #   "tag_{group_export}_{value_export}=false"           → tag is not set
-    tag_filters = {
-        k: v for k, v in parsed_filters.items() if k.startswith("tag_")
-    }
-    if tag_filters:
-        tags_config = read_tags_data(project)
-        if tags_config is not None:
-            # Filter on a flattened copy so the original `tags` column (needed by the
-            # frontend to render the tag checkboxes) stays intact on `state_data`.
-            flattened = _flatten_tags(state_data.copy(), tags_config)
-            for tag_col, want_set in tag_filters.items():
-                if tag_col in flattened.columns:
-                    if want_set:
-                        flattened = flattened[flattened[tag_col] == 1]
-                    else:
-                        flattened = flattened[flattened[tag_col] != 1]
-            state_data = state_data.loc[flattened.index]
-
-    # User filters. Supported format:
-    #   "user_{user_id}" or "...=true"  → record was decided by this user
-    #   "user_{user_id}=false"          → record was not decided by this user
-    # Multiple "true" user filters are combined with OR (a record has a single
-    # decider), while each "false" user filter excludes that user's records.
     user_filters = {
-        k[len("user_") :]: v
-        for k, v in parsed_filters.items()
-        if k.startswith("user_")
+        k[len("user_") :]: v for k, v in parsed_filters.items() if k.startswith("user_")
     }
-    if user_filters:
-        include_users = {int(uid) for uid, want in user_filters.items() if want}
-        exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
-        if include_users:
-            state_data = state_data[state_data["user_id"].isin(include_users)]
-        if exclude_users:
-            state_data = state_data[~state_data["user_id"].isin(exclude_users)]
+    include_users = {int(uid) for uid, want in user_filters.items() if want}
+    exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
 
-    # Full text (Zotero attachment) filter. Supported format:
-    #   "pdf" or "pdf=true"  → a Zotero full text PDF is available
-    #   "pdf=false"          → no full text available
+    # ---- Filters applied as a Python post-scan ----
+    tags_form = read_tags_data(project)
+
+    tag_col_map = {}
+    for group in tags_form or []:
+        for value in group.get("values", []):
+            tag_col_map[f"tag_{group['export']}_{value['export']}"] = (
+                group["export"],
+                value["export"],
+            )
+    tag_filters = [
+        (*tag_col_map[k], want)
+        for k, want in parsed_filters.items()
+        if k.startswith("tag_") and k in tag_col_map
+    ]
+
+    invalid_filter = parsed_filters.get("invalid_tags")
     filter_pdf = parsed_filters.get("pdf")
-    if filter_pdf is not None:
-        attachments = project.db.input[["record_id", "attachment"]]
-        available_ids = set(
-            attachments.loc[
-                attachments["attachment"].apply(
-                    lambda v: is_attachment_key(v) if isinstance(v, str) else False
-                ),
-                "record_id",
-            ]
-        )
-        if filter_pdf:
-            state_data = state_data[state_data["record_id"].isin(available_ids)]
-        else:
-            state_data = state_data[~state_data["record_id"].isin(available_ids)]
 
-    if latest_first == 1:
-        state_data = state_data.sort_values(
-            by="time", ascending=False, na_position="last"
-        )
-    else:
-        state_data = state_data.sort_values(
-            by="time", ascending=True, na_position="last"
-        )
+    post_scan = (
+        filter_pdf is not None or bool(tag_filters) or invalid_filter is not None
+    )
 
-    # count labeled records and max pages
-    if len(state_data) == 0:
-        payload = {
-            "count": 0,
-            "next_page": None,
-            "previous_page": None,
-            "result": [],
-        }
-        return jsonify(payload)
+    # ---- Decode / validate cursor ----
+    filter_sig = _labeled_filter_signature(subset, filters, latest_first)
+    try:
+        cursor = _decode_cursor(cursor_param, filter_sig)
+    except ValueError as err:
+        return jsonify(message=str(err)), 400
 
-    max_page = math.ceil(len(state_data) / per_page)
-
-    if page is not None:
-        if page > max_page:
-            return abort(404)
-
-        idx_start = (page - 1) * per_page
-        idx_end = page * per_page
-        state_data = state_data.iloc[idx_start:idx_end].copy()
-
-        next_page = page + 1 if page < max_page else None
-        previous_page = page - 1 if page > 1 else None
-    else:
-        next_page = None
-        previous_page = None
-
+    # Users for output (authenticated mode only).
+    users = {}
     if current_app.config.get("AUTHENTICATION", True):
         project_entry = Project.query.filter(
             Project.project_id == project.project_id
@@ -710,26 +768,111 @@ def api_get_labeled(project):  # noqa: F401
             for i, u in users.items()
         }
 
-    records = project.db.input.get_records(state_data["record_id"].to_list())
-    result = []
-    for (_, state), record in zip(state_data.iterrows(), records):
-        record_d = asdict(record)
-        record_d["state"] = state.to_dict()
-        record_d["tags_form"] = read_tags_data(project)
+    with project.db as db:
+        # PDF (Zotero attachment) availability set, computed once.
+        pdf_ids = None
+        if filter_pdf is not None:
+            attachments = db.input[["record_id", "attachment"]]
+            pdf_ids = set(
+                attachments.loc[
+                    attachments["attachment"].apply(
+                        lambda v: is_attachment_key(v) if isinstance(v, str) else False
+                    ),
+                    "record_id",
+                ]
+            )
 
-        if current_app.config.get("AUTHENTICATION", True):
-            record_d["state"]["user"] = users.get(record_d["state"]["user_id"], None)
-        else:
-            record_d["state"]["user"] = None
+        def passes(saved_tags, record_id, label):
+            if pdf_ids is not None:
+                in_pdf = record_id in pdf_ids
+                if filter_pdf != in_pdf:
+                    return False
+            for group_export, tag_export, want in tag_filters:
+                if _tag_is_checked(saved_tags, group_export, tag_export) != want:
+                    return False
+            if invalid_filter is not None:
+                if _record_tags_invalid(saved_tags, tags_form, label) != invalid_filter:
+                    return False
+            return True
 
-        del record_d["state"]["user_id"]
-        result.append(record_d)
+        batch_size = (per_page + 1) if not post_scan else max(per_page + 1, 500)
+        matched = []
+        scan_cursor = cursor
+        has_next = False
+
+        while True:
+            page_df = db.get_results_page(
+                label=label,
+                priors=priors,
+                has_note=has_note,
+                include_users=include_users or None,
+                exclude_users=exclude_users or None,
+                cursor=scan_cursor,
+                limit=batch_size,
+                latest_first=latest_first,
+            )
+            if page_df.empty:
+                break
+
+            for _, state in page_df.iterrows():
+                t = state["time"]
+                scan_cursor = (
+                    None if pd.isna(t) else float(t),
+                    int(state["record_id"]),
+                )
+                row_label = state["label"]
+                row_label = None if pd.isna(row_label) else int(row_label)
+                if passes(state["tags"], int(state["record_id"]), row_label):
+                    matched.append(state)
+                    if len(matched) > per_page:
+                        has_next = True
+                        break
+
+            if has_next or len(page_df) < batch_size:
+                break
+
+        if has_next:
+            matched = matched[:per_page]
+
+        next_cursor = None
+        if has_next and matched:
+            last = matched[-1]
+            t = last["time"]
+            next_cursor = _encode_cursor(
+                None if pd.isna(t) else float(t),
+                int(last["record_id"]),
+                filter_sig,
+            )
+
+        matched_ids = [int(s["record_id"]) for s in matched]
+        records = db.input.get_records(matched_ids)
+        lists_by_record = db.get_lists_for_records(matched_ids)
+        lists_form = read_lists_data(project)
+
+        result = []
+        for state, record in zip(matched, records):
+            record_d = asdict(record)
+            record_d["state"] = state.to_dict()
+            record_d["state"]["lists"] = lists_by_record.get(
+                int(state["record_id"]), []
+            )
+            record_d["tags_form"] = tags_form
+            record_d["lists_form"] = lists_form
+
+            if current_app.config.get("AUTHENTICATION", True):
+                record_d["state"]["user"] = users.get(
+                    record_d["state"]["user_id"], None
+                )
+            else:
+                record_d["state"]["user"] = None
+
+            del record_d["state"]["user_id"]
+            result.append(record_d)
 
     return jsonify(
         {
-            "count": len(state_data),
-            "next_page": next_page,
-            "previous_page": previous_page,
+            "count": len(result),
+            "next_cursor": next_cursor,
             "result": result,
         }
     )
@@ -1194,6 +1337,104 @@ def update_tag_group(project, group_id):
         return jsonify(message="Failed to update tag group."), 500
 
 
+@bp.route("/projects/<project_id>/lists", methods=["GET"])
+@login_required
+@project_authorization
+def get_lists(project):
+    """Get the list configuration (id -> name) for a project."""
+    lists_path = Path(project.project_path, "lists.json")
+
+    try:
+        with open(lists_path, "r") as f:
+            return jsonify(json.load(f))
+    except FileNotFoundError:
+        return jsonify([])
+    except Exception as err:
+        logging.exception(err)
+        return jsonify([]), 500
+
+
+@bp.route("/projects/<project_id>/lists", methods=["POST"])
+@login_required
+@project_authorization
+def create_list(project):
+    """Create a new list. A list has a name and a required flag.
+
+    The list id is a ``uuid4`` so that ids are stable and never collide.
+    """
+    lists_path = Path(project.project_path, "lists.json")
+
+    new_list = json.loads(request.form.get("list", "{}"))
+
+    if not new_list or not new_list.get("name"):
+        return jsonify(message="No list name found."), 400
+
+    new_list = {
+        "id": str(uuid4()),
+        "name": new_list["name"],
+        "required_for_relevant": bool(new_list.get("required_for_relevant", False)),
+    }
+
+    try:
+        with open(lists_path, "r") as f:
+            lists = json.load(f)
+
+        lists.append(new_list)
+
+        with open(lists_path, "w") as f:
+            json.dump(lists, f)
+
+        return jsonify(lists)
+    except FileNotFoundError:
+        with open(lists_path, "w") as f:
+            json.dump([new_list], f)
+
+        return jsonify([new_list])
+    except Exception as err:
+        logging.exception(err)
+        return jsonify(message="Failed to create list."), 500
+
+
+@bp.route("/projects/<project_id>/lists/<list_id>", methods=["PUT"])
+@login_required
+@project_authorization
+def update_list(project, list_id):
+    """Update a single list by its ID."""
+    lists_path = Path(project.project_path, "lists.json")
+
+    updated_list = json.loads(request.form.get("list", "{}"))
+
+    if not updated_list or not updated_list.get("name"):
+        return jsonify(message="No list name found."), 400
+
+    updated_list = {
+        "id": list_id,
+        "name": updated_list["name"],
+        "required_for_relevant": bool(updated_list.get("required_for_relevant", False)),
+    }
+
+    try:
+        with open(lists_path, "r") as f:
+            lists = json.load(f)
+
+        index = next((i for i, lst in enumerate(lists) if lst["id"] == list_id), None)
+
+        if index is None:
+            return jsonify(message=f"List '{list_id}' not found."), 404
+
+        lists[index] = updated_list
+
+        with open(lists_path, "w") as f:
+            json.dump(lists, f)
+
+        return jsonify(updated_list)
+    except FileNotFoundError:
+        return jsonify(message=f"List '{list_id}' not found."), 404
+    except Exception as err:
+        logging.exception(err)
+        return jsonify(message="Failed to update list."), 500
+
+
 @bp.route("/projects/<project_id>/highlights", methods=["GET"])
 @login_required
 @project_authorization
@@ -1276,16 +1517,30 @@ def _flatten_tags(results, tags_config):
         tags = {}
         for group in row:
             for tag in group.get("values", []):
-                tags[f"tag_{group['export']}_{tag['export']}"] = int(
-                    tag.get("checked", False)
-                )
+                col = f"tag_{group['export']}_{tag['export']}"
+                checked = bool(tag.get("checked", False))
+                tags[col] = int(checked)
+                # Optional free-text addition stored alongside the selection.
+                # Only emitted when present and the tag is checked, so a note
+                # left behind after deselecting is not exported. Older projects
+                # without free text are unaffected.
+                text = tag.get("text")
+                if checked and text:
+                    tags[f"{col}_text"] = text
 
         df_tags.append(tags)
+
+    df_tags = pd.DataFrame(df_tags, index=results.index)
+    # The binary selection columns are integers; the free-text columns are
+    # strings, so cast only the non-text tag columns to the nullable Int64 type.
+    int_cols = [c for c in df_tags.columns if not c.endswith("_text")]
+    if int_cols:
+        df_tags[int_cols] = df_tags[int_cols].astype("Int64")
 
     return pd.concat(
         [
             results.drop("tags", axis=1),
-            pd.DataFrame(df_tags, index=results.index, dtype="Int64"),
+            df_tags,
         ],
         axis=1,
     )
@@ -1605,6 +1860,7 @@ def api_label_record(project, record_id):  # noqa: F401
     record_id = int(request.form.get("record_id"))
     label = int(request.form.get("label"))
     tags = json.loads(request.form.get("tags", "[]"))
+    lists = json.loads(request.form.get("lists", "null"))
 
     if label not in [0, 1]:
         return jsonify(message="Invalid label"), 400
@@ -1626,6 +1882,14 @@ def api_label_record(project, record_id):  # noqa: F401
                 user_id=user_id,
             )
 
+        if lists is not None:
+            try:
+                db.replace_lists(record_id, lists)
+            except ValueError as err:
+                return jsonify(message=str(err)), 400
+            except sqlite3.IntegrityError:
+                return jsonify(message="List entries must be unique."), 400
+
     if retrain_model:
         _run_model(project)
 
@@ -1635,8 +1899,10 @@ def api_label_record(project, record_id):  # noqa: F401
         with project.db as db:
             record = db.get_results_record(record_id)
             item = asdict(db.input.get_records(record_id))
-        item["state"] = record.iloc[0].to_dict()
+            item["state"] = record.iloc[0].to_dict()
+            item["state"]["lists"] = db.get_lists(record_id)
         item["tags_form"] = read_tags_data(project)
+        item["lists_form"] = read_lists_data(project)
         item["state"]["user"] = None
         del item["state"]["user_id"]
 
@@ -1757,10 +2023,14 @@ def api_get_record(project):  # noqa: F401
                 else:
                     return jsonify({"result": None, "status": "setup"})
 
-        item = asdict(db.input.get_records(pending["record_id"].iloc[0]))
+        record_id = int(pending["record_id"].iloc[0])
+        item = asdict(db.input.get_records(record_id))
+        record_lists = db.get_lists(record_id)
 
     item["state"] = pending.iloc[0].to_dict()
+    item["state"]["lists"] = record_lists
     item["tags_form"] = read_tags_data(project)
+    item["lists_form"] = read_lists_data(project)
     item["state"]["user"] = None
     del item["state"]["user_id"]
 

@@ -55,6 +55,18 @@ The key features of **ASReview LAB** are:
   export your data.
 - **Editable Tags in Collection**: Manage and edit tags directly from the
   Collection screen, giving you more control over your data extraction and classification.
+- **Flexible Tag Groups**: Configure tag groups as single-select (radio buttons)
+  or multi-select (checkboxes), mark a group as required, and add an optional
+  free-text note to individual tags. The Collection only shows selected tags and
+  can filter on records with invalid tag combinations. The on-disk format stays
+  backwards compatible with older ASReview versions.
+- **Faster Collection Loading**: The Collection page uses cursor-based
+  pagination backed by a database index, so large projects load a page at a time
+  instead of reading the whole history.
+- **Per-record Lists**: Besides tags, you can configure named *lists* in the
+  *Customize* tab. While reviewing, each record can collect several free-text
+  items per list (for example extracted outcomes or populations). Items are
+  shown and edited between the tags and the note of a record.
 
 ---
 

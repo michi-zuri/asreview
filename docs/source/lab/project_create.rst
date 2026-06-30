@@ -73,9 +73,86 @@ your review by clicking on the *Add tags* button. You can add multiple tags to a
 tag group, and you can add multiple tags to a dataset. In the current version,
 you can't delete tags, so be careful with the tags you add.
 
-Tags are presented to you in the *Reviewer* interface. Tags are presented as
-checkboxes, and you can select multiple tags for a record. You can find the
-selected tags in the collection and during the export of the dataset.
+Each tag group can be configured in the *Customize* tab:
+
+- **Single select**: when enabled, only one tag in the group can be selected and
+  the tags are shown as radio buttons in the *Reviewer* interface. When
+  disabled, the tags are shown as checkboxes and any number of them can be
+  selected.
+- **Required per decision**: a selection in the group can be required for
+  *relevant* decisions, for *not relevant* decisions, or for both, using two
+  independent toggles. This gives four combinations: never required, required
+  only when marking a record relevant, required only when marking it not
+  relevant, or always required. The matching decision button stays disabled
+  until the requirement is met. Required groups are marked with an asterisk
+  (``*``), explained by the legend *"\* a selection must be made in this
+  group"*.
+- **Checklist (require all options)**: for a multi-select group that is required
+  for at least one decision, you can additionally require that *every* option is
+  selected, turning the group into a checklist. This toggle is only available
+  when single-select is off and at least one of the required toggles is on.
+- **Free text**: each individual tag can opt in to an additional free-text input
+  field, letting reviewers attach a short note to that specific tag.
+
+In a single-select group the selected radio button can always be deselected by
+clicking it again. Deselecting a required group leaves it empty, so the matching
+decision button stays disabled until a selection is made again.
+
+Tags are presented to you in the *Reviewer* interface as checkboxes or radio
+buttons depending on the group configuration. The selected tags (and any
+free-text additions) can be found in the **Collection** and during the export of
+the dataset, where each tag is exported as ``tag_<group>_<value>`` and, if
+provided, ``tag_<group>_<value>_text``. The collection only displays the tags
+that were actually selected; empty optional groups show a placeholder. If an
+invalid combination is encountered (for example more than one option selected in
+a single-select group, which can happen when a project is edited across
+versions; a required selection missing for the record's decision; or a checklist
+group that is not fully checked), the record is still shown but with a warning,
+and the **Collection** filter offers an *invalid tags* option to find these
+records.
+
+.. note::
+
+   The on-disk tag format is backwards compatible. Older ASReview versions can
+   still read and display tags created with these options; they simply ignore
+   the single-select, required and free-text metadata and the per-tag free-text
+   note.
+
+Add Lists
+~~~~~~~~~
+
+Next to tags, you can configure *lists* in the *Customize* tab. A list is a
+named container that lets a reviewer add an arbitrary number of free-text items
+to a record. Typical uses are extracting outcomes, populations, or any other
+open-ended set of values that varies per record.
+
+Each list has a **name** and a **required for relevant** toggle. When the toggle
+is on, at least one item must be added to the list before the record can be
+marked *relevant*; required lists are marked with an asterisk (``*``), explained
+by the legend *"\* at least one item must be added for allowing relevant
+decision"*.
+
+You can add several lists, and each record can collect multiple items per list.
+Lists are shown and edited in the *Reviewer* interface between the tags and the
+note of a record. Each item is a short free-text label and may not contain a
+comma (``,``) or a semicolon (``;``). Every item is assigned a stable ``uuid``
+identifier when it is created. Instead of a separate *add item* button there is
+always an empty input row to type into; empty rows keep their position while you
+edit and are dropped automatically when the list is saved.
+
+Items are ordered by the moment they were created (oldest first). When editing
+an item you can use the down-arrow button to reset its timestamp to now, which
+moves it to the end of the list. No drag-and-drop reordering is needed.
+
+Because a record can have many items per list, the items are stored in a
+dedicated ``lists`` table in the project database. ``item_id`` is the primary
+key (so items can later be referenced by foreign keys), and there is a unique
+constraint on ``(record_id, list_id, name)`` so the same item cannot be added
+twice to one list on a record. The columns are ``record_id``,
+``list_id``, ``item_id``, ``name`` and ``created``. Both ``list_id`` and
+``item_id`` are ``uuid4`` strings. The mapping from each ``list_id`` to its
+display name (and required flag) is stored in a ``lists.json`` file in the
+project folder, analogous to ``tags.json``.
 
 Change AI Model
 ~~~~~~~~~~~~~~~

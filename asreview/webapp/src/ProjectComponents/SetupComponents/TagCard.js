@@ -17,9 +17,11 @@ import {
   Popover,
   Skeleton,
   Stack,
+  Switch,
   TextField,
   Tooltip,
   Typography,
+  FormControlLabel,
 } from "@mui/material";
 import { ProjectContext } from "context/ProjectContext";
 import { useContext } from "react";
@@ -215,30 +217,49 @@ function labelToExport(label) {
     .replaceAll(/[^a-z0-9_]/g, "");
 }
 
+const EMPTY_GROUP = {
+  label: "",
+  export: "",
+  single_select: false,
+  required_relevant: false,
+  required_irrelevant: false,
+  require_all: false,
+  values: [
+    { label: "", export: "" },
+    { label: "", export: "" },
+    { label: "", export: "" },
+  ],
+};
+
+/** Normalize a tag group's flags to booleans. */
+function normalizeGroup(group) {
+  return {
+    ...group,
+    single_select: Boolean(group.single_select),
+    required_relevant: Boolean(group.required_relevant),
+    required_irrelevant: Boolean(group.required_irrelevant),
+    require_all: Boolean(group.require_all),
+  };
+}
+
+/**
+ * The checklist ("require all options") mode is only meaningful for a
+ * multi-select group that is required for at least one decision.
+ */
+function requireAllAvailable(state) {
+  return (
+    !state.single_select &&
+    (state.required_relevant || state.required_irrelevant)
+  );
+}
+
 const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
   const theme = useTheme();
   const queryClient = useQueryClient();
   const smallScreen = useMediaQuery(theme.breakpoints.down("sm"));
 
   const [state, setState] = React.useState(
-    group || {
-      label: "",
-      export: "",
-      values: [
-        {
-          label: "",
-          export: "",
-        },
-        {
-          label: "",
-          export: "",
-        },
-        {
-          label: "",
-          export: "",
-        },
-      ],
-    },
+    group ? normalizeGroup(group) : structuredClone(EMPTY_GROUP),
   );
 
   const { mutate: createTagGroup, error: createError } = useMutation(
@@ -284,6 +305,44 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
     }));
   };
 
+  const handleSingleSelectChange = (e) => {
+    setState((prev) => {
+      const next = { ...prev, single_select: e.target.checked };
+      // Checklist mode only applies to multi-select groups.
+      if (!requireAllAvailable(next)) {
+        next.require_all = false;
+      }
+      return next;
+    });
+  };
+
+  const handleRequiredRelevantChange = (e) => {
+    setState((prev) => {
+      const next = { ...prev, required_relevant: e.target.checked };
+      if (!requireAllAvailable(next)) {
+        next.require_all = false;
+      }
+      return next;
+    });
+  };
+
+  const handleRequiredIrrelevantChange = (e) => {
+    setState((prev) => {
+      const next = { ...prev, required_irrelevant: e.target.checked };
+      if (!requireAllAvailable(next)) {
+        next.require_all = false;
+      }
+      return next;
+    });
+  };
+
+  const handleRequireAllChange = (e) => {
+    setState((prev) => ({
+      ...prev,
+      require_all: e.target.checked,
+    }));
+  };
+
   const handleTagLabelChange = (index, e) => {
     setState((prev) => ({
       ...prev,
@@ -308,6 +367,15 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
     }));
   };
 
+  const handleTagFreeTextChange = (index, e) => {
+    setState((prev) => ({
+      ...prev,
+      values: prev.values.map((tag, i) =>
+        i === index ? { ...tag, free_text: e.target.checked } : tag,
+      ),
+    }));
+  };
+
   const addTag = () => {
     setState((prev) => ({
       ...prev,
@@ -323,45 +391,20 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
 
   const closeDialog = () => {
     if (group == null) {
-      setState({
-        label: "",
-        export: "",
-        values: [
-          {
-            label: "",
-            export: "",
-          },
-          {
-            label: "",
-            export: "",
-          },
-          {
-            label: "",
-            export: "",
-          },
-        ],
-      });
+      setState(structuredClone(EMPTY_GROUP));
     }
     onClose();
   };
 
   const onSave = () => {
+    const payload = {
+      ...state,
+      values: state.values.filter((tag) => tag.label && tag.export),
+    };
     if (group !== null) {
-      mutateTagGroup({
-        project_id,
-        group: {
-          ...state,
-          values: state.values.filter((tag) => tag.label && tag.export),
-        },
-      });
+      mutateTagGroup({ project_id, group: payload });
     } else {
-      createTagGroup({
-        project_id,
-        group: {
-          ...state,
-          values: state.values.filter((tag) => tag.label && tag.export),
-        },
-      });
+      createTagGroup({ project_id, group: payload });
     }
   };
 
@@ -396,11 +439,56 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
               onChange={handleGroupExportChange}
             />
           </Stack>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={Boolean(state.single_select)}
+                onChange={handleSingleSelectChange}
+              />
+            }
+            label="Allow only one tag to be selected (radio buttons)"
+          />
+          <FormControlLabel
+            control={
+              <Switch
+                checked={Boolean(state.required_relevant)}
+                onChange={handleRequiredRelevantChange}
+              />
+            }
+            label="Require a selection to mark a record as relevant"
+          />
+          <FormControlLabel
+            control={
+              <Switch
+                checked={Boolean(state.required_irrelevant)}
+                onChange={handleRequiredIrrelevantChange}
+              />
+            }
+            label="Require a selection to mark a record as not relevant"
+          />
+          <Tooltip
+            title={
+              requireAllAvailable(state)
+                ? "Require every option in this group to be selected (checklist)"
+                : "Available for multi-select groups that are required for at least one decision"
+            }
+          >
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={Boolean(state.require_all)}
+                  onChange={handleRequireAllChange}
+                  disabled={!requireAllAvailable(state)}
+                />
+              }
+              label="Require all options to be selected (checklist)"
+            />
+          </Tooltip>
         </Stack>
         <Stack spacing={3}>
           <TypographySubtitle1Medium>Tags</TypographySubtitle1Medium>
           {state.values.map((tag, index) => (
-            <Stack direction="row" spacing={3} key={index}>
+            <Stack direction="row" spacing={3} alignItems="center" key={index}>
               <TextField
                 fullWidth
                 id={`tag-label-${index}`}
@@ -415,6 +503,18 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
                 value={tag.export}
                 onChange={(e) => handleTagExportChange(index, e)}
               />
+              <Tooltip title="Allow free text input when this tag is selected">
+                <FormControlLabel
+                  sx={{ flexShrink: 0, whiteSpace: "nowrap" }}
+                  control={
+                    <Switch
+                      checked={Boolean(tag.free_text)}
+                      onChange={(e) => handleTagFreeTextChange(index, e)}
+                    />
+                  }
+                  label="Free text"
+                />
+              </Tooltip>
             </Stack>
           ))}
         </Stack>
@@ -459,6 +559,24 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
   );
 };
 
+const groupRequirementSummary = (group) => {
+  const norm = normalizeGroup(group);
+  if (norm.required_relevant && norm.required_irrelevant) {
+    return norm.require_all ? "all required" : "required";
+  }
+  if (norm.required_relevant) {
+    return norm.require_all
+      ? "all required for relevant"
+      : "required for relevant";
+  }
+  if (norm.required_irrelevant) {
+    return norm.require_all
+      ? "all required for not relevant"
+      : "required for not relevant";
+  }
+  return null;
+};
+
 const Group = ({ project_id, group }) => {
   const [dialogOpen, toggleDialogOpen] = useToggle();
 
@@ -466,6 +584,14 @@ const Group = ({ project_id, group }) => {
     <Card sx={{ mb: 2, bgcolor: "background.default" }}>
       <CardHeader
         title={group.label}
+        subheader={
+          [
+            group.single_select ? "Single choice" : null,
+            groupRequirementSummary(group),
+          ]
+            .filter(Boolean)
+            .join(" · ") || undefined
+        }
         action={
           <Tooltip title="Edit Group">
             <IconButton onClick={toggleDialogOpen}>
@@ -476,7 +602,11 @@ const Group = ({ project_id, group }) => {
       />
       <CardContent>
         {group.values.map((t, index) => (
-          <Chip key={index} label={`${t.label} (${t.export})`} sx={{ m: 1 }} />
+          <Chip
+            key={index}
+            label={`${t.label} (${t.export})${t.free_text ? " + text" : ""}`}
+            sx={{ m: 1 }}
+          />
         ))}
       </CardContent>
       <MutateGroupDialog

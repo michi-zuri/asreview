@@ -241,6 +241,55 @@ class Database:
         self._conn.commit()
 
         self._set_results_changes_triggers()
+        self._ensure_results_indexes()
+        self._ensure_lists_table()
+
+    def _ensure_lists_table(self):
+        """Create the ``lists`` table that stores per-record list items.
+
+        A record can have several user-defined lists (configured in
+        ``lists.json``), and each list can contain multiple free-text items.
+        Because of this clear many-to-one relationship the items live in their
+        own table instead of a JSON column on ``results``. Both ``list_id`` and
+        ``item_id`` are ``uuid4`` strings; ``created`` is a unix timestamp used
+        to order the items within a list. ``item_id`` is the primary key so the
+        items can later be referenced by foreign keys.
+
+        Idempotent (``CREATE TABLE IF NOT EXISTS``), so it is safe to call on
+        every read-write open. The table is only ever created, never migrated:
+        the schema is applied when the table does not exist yet and skipped
+        otherwise.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS lists
+                (record_id INTEGER NOT NULL,
+                list_id TEXT NOT NULL,
+                item_id TEXT NOT NULL PRIMARY KEY,
+                name TEXT NOT NULL,
+                created FLOAT NOT NULL,
+                UNIQUE (record_id, list_id, name))"""
+        )
+        self._conn.commit()
+
+    def _ensure_results_indexes(self):
+        """Create indexes that speed up collection (labeled history) loading.
+
+        Idempotent (uses ``CREATE INDEX IF NOT EXISTS``), so it is safe to call
+        on every read-write open and acts as a lightweight migration for
+        existing projects. The index matches the ordering used by the
+        keyset-paginated :meth:`get_results_page` query
+        (``(time IS NULL), time DESC, record_id DESC``) restricted to labeled
+        records, allowing SQLite to serve a page without scanning and sorting
+        the whole table.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE INDEX IF NOT EXISTS idx_results_collection_desc
+            ON results ((time IS NULL), time DESC, record_id DESC)
+            WHERE label IS NOT NULL"""
+        )
+        self._conn.commit()
 
     def _is_valid(self):
         if self.user_version != CURRENT_DATABASE_VERSION:
@@ -281,14 +330,14 @@ class Database:
         if not self.read_only:
             self._fix_decision_changes_schema(cur)
             self._fix_record_schema(cur)
+            self._ensure_results_indexes()
+            self._ensure_lists_table()
 
     def _fix_record_schema(self, cur):
         """Add columns introduced after the initial schema to the record table."""
         columns = [
             row[1]
-            for row in cur.execute(
-                f"PRAGMA table_info({self.record_table_name})"
-            )
+            for row in cur.execute(f"PRAGMA table_info({self.record_table_name})")
         ]
 
         if "original_id" not in columns:
@@ -611,6 +660,120 @@ class Database:
 
         self._conn.commit()
 
+    def get_lists(self, record_id):
+        """Get the list items stored for a record, ordered within each list.
+
+        Returns
+        -------
+        list[dict]
+            One dict per item with keys ``list_id``, ``item_id``, ``name`` and
+            ``created``, ordered by ``created`` (oldest first). Empty list when
+            the record has no items (or the ``lists`` table does not exist yet
+            in a read-only legacy project).
+        """
+        cur = self._conn.cursor()
+        try:
+            rows = cur.execute(
+                """SELECT list_id, item_id, name, created
+                FROM lists WHERE record_id = ? ORDER BY list_id, created, rowid""",
+                (record_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Legacy project opened read-only before the lists table existed.
+            return []
+        return [
+            {
+                "list_id": row[0],
+                "item_id": row[1],
+                "name": row[2],
+                "created": row[3],
+            }
+            for row in rows
+        ]
+
+    def get_lists_for_records(self, record_ids):
+        """Get list items for many records at once.
+
+        Returns
+        -------
+        dict[int, list[dict]]
+            Mapping of ``record_id`` to its list items (see :meth:`get_lists`),
+            ordered by ``created`` within each list. Records without items are
+            absent from the mapping.
+        """
+        record_ids = [int(r) for r in record_ids]
+        if not record_ids:
+            return {}
+        cur = self._conn.cursor()
+        placeholders = ",".join("?" * len(record_ids))
+        try:
+            rows = cur.execute(
+                f"""SELECT record_id, list_id, item_id, name, created
+                FROM lists WHERE record_id IN ({placeholders})
+                ORDER BY record_id, list_id, created, rowid""",
+                record_ids,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        result = {}
+        for row in rows:
+            result.setdefault(int(row[0]), []).append(
+                {
+                    "list_id": row[1],
+                    "item_id": row[2],
+                    "name": row[3],
+                    "created": row[4],
+                }
+            )
+        return result
+
+    def replace_lists(self, record_id, items):
+        """Replace all list items for a record.
+
+        Each item belongs to exactly one record. Items are keyed by
+        ``item_id`` (the table's primary key) so they can later be referenced by
+        foreign keys.
+
+        Parameters
+        ----------
+        record_id : int
+            Record whose list items should be replaced.
+        items : list[dict]
+            Items with keys ``list_id``, ``item_id``, ``name`` and optionally
+            ``created``. An empty list clears the record's items.
+        """
+        self._ensure_lists_table()
+        con = self._conn
+        cur = con.cursor()
+
+        cur.execute("DELETE FROM lists WHERE record_id = ?", (int(record_id),))
+
+        rows = []
+        for item in items or []:
+            name = item["name"]
+            if "," in name or ";" in name:
+                raise ValueError("List item names may not contain ',' or ';'.")
+            created = item.get("created")
+            if created is None:
+                created = time.time()
+            rows.append(
+                (
+                    int(record_id),
+                    str(item["list_id"]),
+                    str(item["item_id"]),
+                    name,
+                    float(created),
+                )
+            )
+        if rows:
+            cur.executemany(
+                """INSERT INTO lists
+                (record_id, list_id, item_id, name, created)
+                VALUES (?, ?, ?, ?, ?)""",
+                rows,
+            )
+        con.commit()
+
     def delete_result(self, record_id):
         con = self._conn
         cur = con.cursor()
@@ -716,6 +879,141 @@ class Database:
 
         if columns is None or "tags" in columns:
             df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
+        return df_results
+
+    def get_results_page(
+        self,
+        *,
+        label=None,
+        priors=None,
+        has_note=None,
+        include_users=None,
+        exclude_users=None,
+        cursor=None,
+        limit=50,
+        latest_first=True,
+    ):
+        """Get an ordered page of labeled results using keyset pagination.
+
+        Instead of loading the whole results table and slicing in pandas, this
+        builds a SQL query that pushes the cheap filters into the WHERE clause,
+        orders by ``(time, record_id)`` and returns at most ``limit`` rows after
+        the given ``cursor``. Only the returned rows have their ``tags`` JSON
+        parsed.
+
+        Parameters
+        ----------
+        label : int | None
+            Keep only rows with this label (1 or 0). ``None`` keeps all labeled
+            rows.
+        priors : bool | None
+            ``True`` keeps only priors (``querier IS NULL``), ``False`` excludes
+            priors, ``None`` keeps both.
+        has_note : bool | None
+            ``True`` keeps only rows with a note, ``False`` only rows without a
+            note, ``None`` keeps both.
+        include_users : Iterable[int] | None
+            Keep only rows decided by one of these users.
+        exclude_users : Iterable[int] | None
+            Exclude rows decided by these users (rows without a user are kept).
+        cursor : tuple[float | None, int] | None
+            ``(time, record_id)`` of the last row of the previous page. ``None``
+            starts from the beginning.
+        limit : int
+            Maximum number of rows to return.
+        latest_first : bool
+            Order by descending time when ``True`` (most recent first).
+
+        Returns
+        -------
+        pd.DataFrame
+            Up to ``limit`` rows of the results table, ordered, with ``tags``
+            parsed.
+        """
+        where = ["label IS NOT NULL"]
+        params = {}
+
+        # Keep only the base record of each group. A base record is one whose
+        # ``duplicate_of`` is NULL, which is equivalent to
+        # ``record_id IN (SELECT group_id FROM record)`` but, as a correlated
+        # EXISTS, lets SQLite drive the query with the collection index
+        # (ordering + cursor range) instead of the group subquery.
+        where.append(
+            f"EXISTS (SELECT 1 FROM {self.record_table_name} AS rec "
+            "WHERE rec.record_id = results.record_id "
+            "AND rec.duplicate_of IS NULL)"
+        )
+
+        if label is not None:
+            where.append("label = :label")
+            params["label"] = int(label)
+
+        if priors is True:
+            where.append("querier IS NULL")
+        elif priors is False:
+            where.append("querier IS NOT NULL")
+
+        if has_note is True:
+            where.append("note IS NOT NULL")
+        elif has_note is False:
+            where.append("note IS NULL")
+
+        include_users = list(include_users) if include_users else []
+        if include_users:
+            keys = [f":iu{i}" for i in range(len(include_users))]
+            where.append(f"user_id IN ({', '.join(keys)})")
+            for k, v in zip(keys, include_users):
+                params[k[1:]] = int(v)
+
+        exclude_users = list(exclude_users) if exclude_users else []
+        if exclude_users:
+            keys = [f":eu{i}" for i in range(len(exclude_users))]
+            # Mirror pandas ``~isin`` which keeps rows with a NULL user_id.
+            where.append(f"(user_id IS NULL OR user_id NOT IN ({', '.join(keys)}))")
+            for k, v in zip(keys, exclude_users):
+                params[k[1:]] = int(v)
+
+        if cursor is not None:
+            cursor_time, cursor_id = cursor
+            params["cid"] = int(cursor_id)
+            if latest_first:
+                if cursor_time is None:
+                    where.append("(time IS NULL AND record_id < :cid)")
+                else:
+                    params["ct"] = float(cursor_time)
+                    where.append(
+                        "(time IS NULL OR time < :ct "
+                        "OR (time = :ct AND record_id < :cid))"
+                    )
+            else:
+                if cursor_time is None:
+                    where.append("(time IS NULL AND record_id > :cid)")
+                else:
+                    params["ct"] = float(cursor_time)
+                    # Null-time rows sort last, so they remain "after" a
+                    # non-null cursor and must be included here too.
+                    where.append(
+                        "(time IS NULL OR time > :ct "
+                        "OR (time = :ct AND record_id > :cid))"
+                    )
+
+        if latest_first:
+            order_by = "(time IS NULL) ASC, time DESC, record_id DESC"
+        else:
+            order_by = "(time IS NULL) ASC, time ASC, record_id ASC"
+
+        params["limit"] = int(limit)
+
+        df_results = pd.read_sql_query(
+            f"""SELECT * FROM results
+            WHERE {" AND ".join(where)}
+            ORDER BY {order_by}
+            LIMIT :limit""",
+            self._conn,
+            params=params,
+            dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES,
+        )
+        df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
         return df_results
 
     def get_priors(self):

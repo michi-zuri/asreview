@@ -18,6 +18,18 @@ def read_tags_data(project):
         raise RuntimeError(f"Failed to read tags data: {err}")
 
 
+def read_lists_data(project):
+    """Read list configuration from the lists.json file."""
+    lists_path = Path(project.project_path, "lists.json")
+    try:
+        with open(lists_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as err:
+        raise RuntimeError(f"Failed to read lists data: {err}")
+
+
 def add_id_to_tags(group):
     if "values" not in group:
         return group
