@@ -20,6 +20,7 @@ import logging
 import secrets
 import shutil
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -75,6 +76,7 @@ from asreview.utils import _get_filename_from_url
 from asreview.webapp import DB
 from asreview.webapp._api.utils import add_id_to_tags
 from asreview.webapp._api.utils import get_all_model_components
+from asreview.webapp._api.utils import read_lists_data
 from asreview.webapp._api.utils import read_tags_data
 from asreview.webapp._api.zotero import ZoteroLookupError
 from asreview.webapp._api.zotero import build_reader_url
@@ -548,6 +550,7 @@ def api_search_data(project):  # noqa: F401
         record_d = asdict(record)
         record_d["state"] = None
         record_d["tags_form"] = read_tags_data(project)
+        record_d["lists_form"] = read_lists_data(project)
         result.append(record_d)
 
     return jsonify({"result": result})
@@ -559,9 +562,7 @@ def _labeled_filter_signature(subset, filters, latest_first):
     Embedded in the pagination cursor so a cursor cannot be accidentally reused
     across a different filter/sort set (which could silently skip records).
     """
-    payload = json.dumps(
-        [subset, sorted(filters), bool(latest_first)], sort_keys=True
-    )
+    payload = json.dumps([subset, sorted(filters), bool(latest_first)], sort_keys=True)
     return hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 
@@ -714,9 +715,7 @@ def api_get_labeled(project):  # noqa: F401
     has_note = parsed_filters.get("has_note")
 
     user_filters = {
-        k[len("user_") :]: v
-        for k, v in parsed_filters.items()
-        if k.startswith("user_")
+        k[len("user_") :]: v for k, v in parsed_filters.items() if k.startswith("user_")
     }
     include_users = {int(uid) for uid, want in user_filters.items() if want}
     exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
@@ -792,10 +791,7 @@ def api_get_labeled(project):  # noqa: F401
                 if _tag_is_checked(saved_tags, group_export, tag_export) != want:
                     return False
             if invalid_filter is not None:
-                if (
-                    _record_tags_invalid(saved_tags, tags_form, label)
-                    != invalid_filter
-                ):
+                if _record_tags_invalid(saved_tags, tags_form, label) != invalid_filter:
                     return False
             return True
 
@@ -848,13 +844,20 @@ def api_get_labeled(project):  # noqa: F401
                 filter_sig,
             )
 
-        records = db.input.get_records([int(s["record_id"]) for s in matched])
+        matched_ids = [int(s["record_id"]) for s in matched]
+        records = db.input.get_records(matched_ids)
+        lists_by_record = db.get_lists_for_records(matched_ids)
+        lists_form = read_lists_data(project)
 
         result = []
         for state, record in zip(matched, records):
             record_d = asdict(record)
             record_d["state"] = state.to_dict()
+            record_d["state"]["lists"] = lists_by_record.get(
+                int(state["record_id"]), []
+            )
             record_d["tags_form"] = tags_form
+            record_d["lists_form"] = lists_form
 
             if current_app.config.get("AUTHENTICATION", True):
                 record_d["state"]["user"] = users.get(
@@ -1334,6 +1337,104 @@ def update_tag_group(project, group_id):
         return jsonify(message="Failed to update tag group."), 500
 
 
+@bp.route("/projects/<project_id>/lists", methods=["GET"])
+@login_required
+@project_authorization
+def get_lists(project):
+    """Get the list configuration (id -> name) for a project."""
+    lists_path = Path(project.project_path, "lists.json")
+
+    try:
+        with open(lists_path, "r") as f:
+            return jsonify(json.load(f))
+    except FileNotFoundError:
+        return jsonify([])
+    except Exception as err:
+        logging.exception(err)
+        return jsonify([]), 500
+
+
+@bp.route("/projects/<project_id>/lists", methods=["POST"])
+@login_required
+@project_authorization
+def create_list(project):
+    """Create a new list. A list has a name and a required flag.
+
+    The list id is a ``uuid4`` so that ids are stable and never collide.
+    """
+    lists_path = Path(project.project_path, "lists.json")
+
+    new_list = json.loads(request.form.get("list", "{}"))
+
+    if not new_list or not new_list.get("name"):
+        return jsonify(message="No list name found."), 400
+
+    new_list = {
+        "id": str(uuid4()),
+        "name": new_list["name"],
+        "required_for_relevant": bool(new_list.get("required_for_relevant", False)),
+    }
+
+    try:
+        with open(lists_path, "r") as f:
+            lists = json.load(f)
+
+        lists.append(new_list)
+
+        with open(lists_path, "w") as f:
+            json.dump(lists, f)
+
+        return jsonify(lists)
+    except FileNotFoundError:
+        with open(lists_path, "w") as f:
+            json.dump([new_list], f)
+
+        return jsonify([new_list])
+    except Exception as err:
+        logging.exception(err)
+        return jsonify(message="Failed to create list."), 500
+
+
+@bp.route("/projects/<project_id>/lists/<list_id>", methods=["PUT"])
+@login_required
+@project_authorization
+def update_list(project, list_id):
+    """Update a single list by its ID."""
+    lists_path = Path(project.project_path, "lists.json")
+
+    updated_list = json.loads(request.form.get("list", "{}"))
+
+    if not updated_list or not updated_list.get("name"):
+        return jsonify(message="No list name found."), 400
+
+    updated_list = {
+        "id": list_id,
+        "name": updated_list["name"],
+        "required_for_relevant": bool(updated_list.get("required_for_relevant", False)),
+    }
+
+    try:
+        with open(lists_path, "r") as f:
+            lists = json.load(f)
+
+        index = next((i for i, lst in enumerate(lists) if lst["id"] == list_id), None)
+
+        if index is None:
+            return jsonify(message=f"List '{list_id}' not found."), 404
+
+        lists[index] = updated_list
+
+        with open(lists_path, "w") as f:
+            json.dump(lists, f)
+
+        return jsonify(updated_list)
+    except FileNotFoundError:
+        return jsonify(message=f"List '{list_id}' not found."), 404
+    except Exception as err:
+        logging.exception(err)
+        return jsonify(message="Failed to update list."), 500
+
+
 @bp.route("/projects/<project_id>/highlights", methods=["GET"])
 @login_required
 @project_authorization
@@ -1759,6 +1860,7 @@ def api_label_record(project, record_id):  # noqa: F401
     record_id = int(request.form.get("record_id"))
     label = int(request.form.get("label"))
     tags = json.loads(request.form.get("tags", "[]"))
+    lists = json.loads(request.form.get("lists", "null"))
 
     if label not in [0, 1]:
         return jsonify(message="Invalid label"), 400
@@ -1780,6 +1882,14 @@ def api_label_record(project, record_id):  # noqa: F401
                 user_id=user_id,
             )
 
+        if lists is not None:
+            try:
+                db.replace_lists(record_id, lists)
+            except ValueError as err:
+                return jsonify(message=str(err)), 400
+            except sqlite3.IntegrityError:
+                return jsonify(message="List entries must be unique."), 400
+
     if retrain_model:
         _run_model(project)
 
@@ -1789,8 +1899,10 @@ def api_label_record(project, record_id):  # noqa: F401
         with project.db as db:
             record = db.get_results_record(record_id)
             item = asdict(db.input.get_records(record_id))
-        item["state"] = record.iloc[0].to_dict()
+            item["state"] = record.iloc[0].to_dict()
+            item["state"]["lists"] = db.get_lists(record_id)
         item["tags_form"] = read_tags_data(project)
+        item["lists_form"] = read_lists_data(project)
         item["state"]["user"] = None
         del item["state"]["user_id"]
 
@@ -1911,10 +2023,14 @@ def api_get_record(project):  # noqa: F401
                 else:
                     return jsonify({"result": None, "status": "setup"})
 
-        item = asdict(db.input.get_records(pending["record_id"].iloc[0]))
+        record_id = int(pending["record_id"].iloc[0])
+        item = asdict(db.input.get_records(record_id))
+        record_lists = db.get_lists(record_id)
 
     item["state"] = pending.iloc[0].to_dict()
+    item["state"]["lists"] = record_lists
     item["tags_form"] = read_tags_data(project)
+    item["lists_form"] = read_lists_data(project)
     item["state"]["user"] = None
     del item["state"]["user_id"]
 

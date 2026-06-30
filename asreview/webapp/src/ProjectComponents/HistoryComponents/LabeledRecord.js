@@ -90,7 +90,11 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
                       "-" +
                       record?.state?.note +
                       "-" +
-                      JSON.stringify(record?.tags_form)
+                      JSON.stringify(record?.tags_form) +
+                      "-" +
+                      JSON.stringify(record?.lists_form) +
+                      "-" +
+                      JSON.stringify(record?.state?.lists)
                     }
                   />
                 )),

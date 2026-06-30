@@ -63,6 +63,10 @@ The key features of **ASReview LAB** are:
 - **Faster Collection Loading**: The Collection page uses cursor-based
   pagination backed by a database index, so large projects load a page at a time
   instead of reading the whole history.
+- **Per-record Lists**: Besides tags, you can configure named *lists* in the
+  *Customize* tab. While reviewing, each record can collect several free-text
+  items per list (for example extracted outcomes or populations). Items are
+  shown and edited between the tags and the note of a record.
 
 ---
 

@@ -118,6 +118,42 @@ records.
    the single-select, required and free-text metadata and the per-tag free-text
    note.
 
+Add Lists
+~~~~~~~~~
+
+Next to tags, you can configure *lists* in the *Customize* tab. A list is a
+named container that lets a reviewer add an arbitrary number of free-text items
+to a record. Typical uses are extracting outcomes, populations, or any other
+open-ended set of values that varies per record.
+
+Each list has a **name** and a **required for relevant** toggle. When the toggle
+is on, at least one item must be added to the list before the record can be
+marked *relevant*; required lists are marked with an asterisk (``*``), explained
+by the legend *"\* at least one item must be added for allowing relevant
+decision"*.
+
+You can add several lists, and each record can collect multiple items per list.
+Lists are shown and edited in the *Reviewer* interface between the tags and the
+note of a record. Each item is a short free-text label and may not contain a
+comma (``,``) or a semicolon (``;``). Every item is assigned a stable ``uuid``
+identifier when it is created. Instead of a separate *add item* button there is
+always an empty input row to type into; empty rows keep their position while you
+edit and are dropped automatically when the list is saved.
+
+Items are ordered by the moment they were created (oldest first). When editing
+an item you can use the down-arrow button to reset its timestamp to now, which
+moves it to the end of the list. No drag-and-drop reordering is needed.
+
+Because a record can have many items per list, the items are stored in a
+dedicated ``lists`` table in the project database. ``item_id`` is the primary
+key (so items can later be referenced by foreign keys), and there is a unique
+constraint on ``(record_id, list_id, name)`` so the same item cannot be added
+twice to one list on a record. The columns are ``record_id``,
+``list_id``, ``item_id``, ``name`` and ``created``. Both ``list_id`` and
+``item_id`` are ``uuid4`` strings. The mapping from each ``list_id`` to its
+display name (and required flag) is stored in a ``lists.json`` file in the
+project folder, analogous to ``tags.json``.
+
 Change AI Model
 ~~~~~~~~~~~~~~~
 

@@ -19,8 +19,9 @@ relevant records are prioritized for review.
 
    The review screen of ASReview LAB with the title and abstract of a record to
    review. Click on the relevant or irrelevant button to label the record and
-   continue to the next record. You can also add a note to the record or check
-   self-defined tags.
+   continue to the next record. You can also add a note to the record, check
+   self-defined tags, or add free-text items to self-defined lists (shown
+   between the tags and the note).
 
 
 Each labeling decision by the user starts the training of a new model, provided

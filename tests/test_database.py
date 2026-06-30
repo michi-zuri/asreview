@@ -686,8 +686,7 @@ def _index_names(db_path):
     try:
         cur = conn.cursor()
         rows = cur.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='index' AND tbl_name='results'"
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='results'"
         ).fetchall()
     finally:
         conn.close()
@@ -749,3 +748,115 @@ def test_ensure_results_indexes_is_idempotent(db):
     db._ensure_results_indexes()
     db._ensure_results_indexes()
     assert "idx_results_collection_desc" in _index_names(db.fp)
+
+
+def test_lists_table_created(db):
+    cur = db._conn.cursor()
+    tables = [
+        row[0]
+        for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    ]
+    assert "lists" in tables
+
+
+def test_replace_and_get_lists(db_with_data):
+    db = db_with_data
+    items = [
+        {"list_id": "L1", "item_id": "a", "name": "alpha", "created": 1.0},
+        {"list_id": "L1", "item_id": "b", "name": "beta", "created": 2.0},
+        {"list_id": "L2", "item_id": "c", "name": "gamma", "created": 1.0},
+    ]
+    db.replace_lists(2, items)
+    got = db.get_lists(2)
+    assert sorted(i["name"] for i in got) == ["alpha", "beta", "gamma"]
+    assert {i["list_id"] for i in got} == {"L1", "L2"}
+    assert all("created" in i for i in got)
+    # The duplicate column has been removed.
+    assert all("duplicate" not in i for i in got)
+
+
+def test_lists_schema_has_pk_and_unique(db):
+    cur = db._conn.cursor()
+    # item_id is the primary key.
+    pk_columns = [row[1] for row in cur.execute("PRAGMA table_info(lists)") if row[5]]
+    assert pk_columns == ["item_id"]
+    # No duplicate column; created column present.
+    columns = [row[1] for row in cur.execute("PRAGMA table_info(lists)")]
+    assert "duplicate" not in columns
+    assert "created" in columns
+
+
+def test_replace_lists_rejects_duplicate_item_id(db_with_data):
+    db = db_with_data
+    items = [
+        {"list_id": "L1", "item_id": "dup", "name": "alpha", "created": 1.0},
+        {"list_id": "L1", "item_id": "dup", "name": "beta", "created": 2.0},
+    ]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.replace_lists(2, items)
+
+
+def test_replace_lists_rejects_duplicate_name(db_with_data):
+    db = db_with_data
+    items = [
+        {"list_id": "L1", "item_id": "a", "name": "same", "created": 1.0},
+        {"list_id": "L1", "item_id": "b", "name": "same", "created": 2.0},
+    ]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.replace_lists(2, items)
+
+
+def test_get_lists_ordered_by_created(db_with_data):
+    db = db_with_data
+    items = [
+        {"list_id": "L1", "item_id": "a", "name": "third", "created": 30.0},
+        {"list_id": "L1", "item_id": "b", "name": "first", "created": 10.0},
+        {"list_id": "L1", "item_id": "c", "name": "second", "created": 20.0},
+    ]
+    db.replace_lists(2, items)
+    got = [i["name"] for i in db.get_lists(2) if i["list_id"] == "L1"]
+    assert got == ["first", "second", "third"]
+
+
+def test_replace_lists_not_replicated_across_group(db_with_data):
+    db = db_with_data
+    # Record 0 is grouped with record 1, but list items belong to a single
+    # record only (item_id is the primary key), so they are not replicated.
+    db.replace_lists(0, [{"list_id": "L1", "item_id": "x", "name": "only-0"}])
+    assert [i["name"] for i in db.get_lists(0)] == ["only-0"]
+    assert db.get_lists(1) == []
+
+
+def test_replace_lists_clears_previous(db_with_data):
+    db = db_with_data
+    db.replace_lists(2, [{"list_id": "L1", "item_id": "x", "name": "old"}])
+    db.replace_lists(2, [])
+    assert db.get_lists(2) == []
+
+
+def test_replace_lists_rejects_illegal_names(db_with_data):
+    db = db_with_data
+    for bad in ["with,comma", "with;semicolon"]:
+        with pytest.raises(ValueError):
+            db.replace_lists(2, [{"list_id": "L1", "item_id": "x", "name": bad}])
+
+
+def test_get_lists_for_records(db_with_data):
+    db = db_with_data
+    db.replace_lists(2, [{"list_id": "L1", "item_id": "a", "name": "alpha"}])
+    db.replace_lists(5, [{"list_id": "L1", "item_id": "b", "name": "beta"}])
+    mapping = db.get_lists_for_records([2, 5, 8])
+    assert set(mapping.keys()) == {2, 5}
+    assert mapping[2][0]["name"] == "alpha"
+    assert mapping[5][0]["name"] == "beta"
+
+
+def test_ensure_lists_table_is_idempotent(db):
+    db._ensure_lists_table()
+    db._ensure_lists_table()
+    cur = db._conn.cursor()
+    tables = [
+        row[0]
+        for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    ]
+    assert "lists" in tables

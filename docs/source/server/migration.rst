@@ -127,3 +127,10 @@ relies on this index to return a page of labeled records without scanning and
 sorting the whole table. Existing projects gain the index automatically the
 first time they are opened read-write; newly created projects include it from the
 start.
+
+Another fix creates the ``lists`` table that stores the per-record list items
+(see the *Add Lists* section in the project creation guide). The table is only
+ever created (never migrated): projects that do not yet have it gain it
+automatically the first time they are opened read-write, while projects that
+already have it are left untouched. It is created empty, so projects that do not
+use lists are unaffected.
