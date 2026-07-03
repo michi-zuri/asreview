@@ -67,6 +67,15 @@ const TagsTable = ({
                 {group.name}
                 {required && " *"}
               </Typography>
+              {group.input_helper_text && (
+                <Typography
+                  variant="body2"
+                  color="text.secondary"
+                  sx={{ fontStyle: "italic", mb: 0.5 }}
+                >
+                  {group.input_helper_text}
+                </Typography>
+              )}
               {invalid && (
                 <Alert severity="warning">
                   More than one option is selected in this single-choice group.
