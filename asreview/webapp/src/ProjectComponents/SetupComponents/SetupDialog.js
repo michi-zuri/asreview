@@ -200,6 +200,12 @@ const SetupDialog = ({ project_id, mode, open, onClose }) => {
                   </Box>
                   <Collapse in={showSettings} mountOnEnter>
                     <Box sx={{ mb: 3 }}>
+                      <ScreeningCard />
+                    </Box>
+                    <Box sx={{ mb: 3 }}>
+                      <HighlightCard project_id={data?.id} />
+                    </Box>
+                    <Box sx={{ mb: 3 }}>
                       <TagCard
                         project_id={data?.id}
                         mobileScreen={fullScreen}
@@ -207,12 +213,6 @@ const SetupDialog = ({ project_id, mode, open, onClose }) => {
                     </Box>
                     <Box sx={{ mb: 3 }}>
                       <ListCard project_id={data?.id} />
-                    </Box>
-                    <Box sx={{ mb: 3 }}>
-                      <HighlightCard project_id={data?.id} />
-                    </Box>
-                    <Box sx={{ my: 3 }}>
-                      <ScreeningCard />
                     </Box>
                     <Box sx={{ my: 3 }}>
                       <ModelCard mode={mode} />

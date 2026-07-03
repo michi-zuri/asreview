@@ -1504,6 +1504,56 @@ def update_highlights(project):
         return jsonify(message="Failed to save highlight config."), 500
 
 
+@bp.route("/projects/<project_id>/zotero", methods=["GET"])
+@login_required
+@project_authorization
+def get_zotero(project):
+    """Return the Zotero configuration for the project.
+
+    If the file is missing, an empty config is returned without creating the file.
+    """
+    zotero_path = Path(project.project_path, "zotero.json")
+
+    try:
+        with open(zotero_path, "r") as f:
+            return jsonify(json.load(f))
+    except FileNotFoundError:
+        return jsonify({"api_key": "", "group_id": "", "group_slug": ""})
+    except Exception as err:
+        logging.exception(err)
+        return jsonify({"api_key": "", "group_id": "", "group_slug": ""}), 500
+
+
+@bp.route("/projects/<project_id>/zotero", methods=["PUT"])
+@login_required
+@project_authorization
+def update_zotero(project):
+    """Save the Zotero configuration for the project."""
+    zotero_path = Path(project.project_path, "zotero.json")
+
+    try:
+        config = json.loads(request.form.get("config", "{}"))
+    except json.JSONDecodeError:
+        return jsonify(message="Invalid JSON for zotero config."), 400
+
+    if not isinstance(config, dict):
+        return jsonify(message="Zotero config must be an object."), 400
+
+    cleaned = {
+        "api_key": str(config.get("api_key", "")).strip(),
+        "group_id": str(config.get("group_id", "")).strip(),
+        "group_slug": str(config.get("group_slug", "")).strip(),
+    }
+
+    try:
+        with open(zotero_path, "w") as f:
+            json.dump(cleaned, f)
+        return jsonify(cleaned)
+    except Exception as err:
+        logging.exception(err)
+        return jsonify(message="Failed to save zotero config."), 500
+
+
 def _flatten_tags(results, tags_config):
     if tags_config is None:
         del results["tags"]
@@ -1938,7 +1988,7 @@ def api_get_record_attachment(project, record_id):  # noqa: F401
     """
     record_id = int(record_id)
 
-    config = get_zotero_config()
+    config = get_zotero_config(project.project_path)
 
     def payload(available, url=None, checked_at=None):
         return jsonify(

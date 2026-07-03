@@ -17,13 +17,17 @@
 Each record can have an ``original_id`` that corresponds to a Zotero item key. This
 module queries the Zotero web API for the PDF attachment of such an item and builds a
 link that opens the Zotero PDF reader.
+
+Zotero credentials are stored per project in a ``zotero.json`` file inside the
+project directory.
 """
 
+import json
 import logging
 import re
+from pathlib import Path
 
 import requests
-from flask import current_app
 
 __all__ = [
     "ZoteroConfig",
@@ -56,7 +60,7 @@ DEFAULT_RECHECK_INTERVAL = 300
 
 
 class ZoteroConfig:
-    """Resolved Zotero configuration read from the Flask app config."""
+    """Resolved Zotero configuration read from a project's ``zotero.json``."""
 
     def __init__(self, group_id, group_slug, api_key, recheck_interval):
         self.group_id = group_id
@@ -70,34 +74,35 @@ class ZoteroConfig:
         return bool(self.group_id and self.api_key)
 
 
-def get_zotero_config():
-    """Read the Zotero configuration from the current Flask app config.
+def get_zotero_config(project_path):
+    """Read the Zotero configuration from a project's ``zotero.json`` file.
 
-    The following config keys are used (settable via the ``ASREVIEW_LAB_`` prefixed
-    environment variables, e.g. ``ASREVIEW_LAB_ZOTERO_GROUP_ID``):
-
-    - ``ZOTERO_GROUP_ID``: numeric id of the Zotero group library.
-    - ``ZOTERO_GROUP_SLUG``: url slug of the group (used to build reader links).
-    - ``ZOTERO_API_KEY``: Zotero API key with read access to the group.
-    - ``ZOTERO_RECHECK_INTERVAL``: seconds before re-checking an item whose full text
-      was previously unavailable. Defaults to five minutes.
+    Parameters
+    ----------
+    project_path : str or Path
+        Path to the project directory.
 
     Returns
     -------
     ZoteroConfig
     """
-    group_id = current_app.config.get("ZOTERO_GROUP_ID")
-    group_slug = current_app.config.get("ZOTERO_GROUP_SLUG")
-    api_key = current_app.config.get("ZOTERO_API_KEY")
-    recheck_interval = current_app.config.get(
-        "ZOTERO_RECHECK_INTERVAL", DEFAULT_RECHECK_INTERVAL
-    )
+    config_path = Path(project_path, "zotero.json")
+
+    try:
+        with open(config_path, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+
+    group_id = data.get("group_id") or None
+    group_slug = data.get("group_slug") or None
+    api_key = data.get("api_key") or None
 
     return ZoteroConfig(
         group_id=str(group_id) if group_id is not None else None,
         group_slug=str(group_slug) if group_slug is not None else None,
         api_key=str(api_key) if api_key is not None else None,
-        recheck_interval=int(recheck_interval),
+        recheck_interval=DEFAULT_RECHECK_INTERVAL,
     )
 
 
