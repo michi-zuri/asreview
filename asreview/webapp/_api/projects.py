@@ -1373,6 +1373,7 @@ def create_list(project):
         "id": str(uuid4()),
         "name": new_list["name"],
         "required_for_relevant": bool(new_list.get("required_for_relevant", False)),
+        "input_helper_text": new_list.get("input_helper_text", ""),
     }
 
     try:
@@ -1411,6 +1412,7 @@ def update_list(project, list_id):
         "id": list_id,
         "name": updated_list["name"],
         "required_for_relevant": bool(updated_list.get("required_for_relevant", False)),
+        "input_helper_text": updated_list.get("input_helper_text", ""),
     }
 
     try:

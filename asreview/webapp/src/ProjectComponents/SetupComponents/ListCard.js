@@ -36,6 +36,9 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
   const smallScreen = useMediaQuery(theme.breakpoints.down("sm"));
 
   const [name, setName] = React.useState(list ? list.name : "");
+  const [inputHelperText, setInputHelperText] = React.useState(
+    list ? list.input_helper_text || "" : "",
+  );
   const [requiredForRelevant, setRequiredForRelevant] = React.useState(
     list ? Boolean(list.required_for_relevant) : false,
   );
@@ -43,6 +46,7 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
   React.useEffect(() => {
     if (open) {
       setName(list ? list.name : "");
+      setInputHelperText(list ? list.input_helper_text || "" : "");
       setRequiredForRelevant(
         list ? Boolean(list.required_for_relevant) : false,
       );
@@ -78,13 +82,18 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
         list: {
           id: list.id,
           name,
+          input_helper_text: inputHelperText,
           required_for_relevant: requiredForRelevant,
         },
       });
     } else {
       createList({
         project_id,
-        list: { name, required_for_relevant: requiredForRelevant },
+        list: {
+          name,
+          input_helper_text: inputHelperText,
+          required_for_relevant: requiredForRelevant,
+        },
       });
     }
   };
@@ -106,6 +115,14 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
             label="Name"
             value={name}
             onChange={(e) => setName(e.target.value)}
+          />
+          <TextField
+            fullWidth
+            id="list-input-helper-text"
+            label="Input helper text"
+            value={inputHelperText}
+            onChange={(e) => setInputHelperText(e.target.value)}
+            helperText="Optional help text shown below the list header during editing"
           />
           <Tooltip title="Require at least one item before a record can be marked relevant">
             <FormControlLabel

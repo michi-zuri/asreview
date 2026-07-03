@@ -220,6 +220,7 @@ function labelToExport(label) {
 const EMPTY_GROUP = {
   label: "",
   export: "",
+  input_helper_text: "",
   single_select: false,
   required_relevant: false,
   required_irrelevant: false,
@@ -302,6 +303,13 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
     setState((prev) => ({
       ...prev,
       export: e.target.value,
+    }));
+  };
+
+  const handleGroupInputHelperTextChange = (e) => {
+    setState((prev) => ({
+      ...prev,
+      input_helper_text: e.target.value,
     }));
   };
 
@@ -439,6 +447,14 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
               onChange={handleGroupExportChange}
             />
           </Stack>
+          <TextField
+            fullWidth
+            id="group-input-helper-text"
+            label="Input helper text"
+            value={state.input_helper_text || ""}
+            onChange={handleGroupInputHelperTextChange}
+            helperText="Optional help text shown below the group header during editing"
+          />
           <FormControlLabel
             control={
               <Switch
@@ -601,6 +617,15 @@ const Group = ({ project_id, group }) => {
         }
       />
       <CardContent>
+        {group.input_helper_text && (
+          <Typography
+            variant="body2"
+            color="text.secondary"
+            sx={{ mb: 1, fontStyle: "italic" }}
+          >
+            {group.input_helper_text}
+          </Typography>
+        )}
         {group.values.map((t, index) => (
           <Chip
             key={index}

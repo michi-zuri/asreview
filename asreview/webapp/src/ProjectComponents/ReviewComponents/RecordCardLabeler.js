@@ -224,6 +224,15 @@ const TagGroupInput = ({
         {group.label}
         {requiredAny && " *"}
       </Typography>
+      {group.input_helper_text && (
+        <Typography
+          variant="body2"
+          color="text.secondary"
+          sx={{ fontStyle: "italic" }}
+        >
+          {group.input_helper_text}
+        </Typography>
+      )}
       {invalid && (
         <Alert severity="warning">
           More than one option is selected in this single-choice group.
@@ -497,6 +506,15 @@ const ListGroupInput = ({
         {list.name}
         {required && " *"}
       </Typography>
+      {list.input_helper_text && (
+        <Typography
+          variant="body2"
+          color="text.secondary"
+          sx={{ fontStyle: "italic" }}
+        >
+          {list.input_helper_text}
+        </Typography>
+      )}
       {missing && (
         <Typography variant="caption" color="warning">
           Add at least one item for allowing relevant decision
