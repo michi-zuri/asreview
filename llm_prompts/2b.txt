@@ -1,0 +1,228 @@
+========================================================================
+TASK 2b — screen_record: one LLM screening attempt for a single record
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: tasks 0b (PdfResolver), 0c (build_system_prompt not needed here),
+            2a (worker DAO helpers). The Anthropic client is INJECTED, so no
+            real network here.
+
+GOAL
+  Add the core single-record screening function plus two small helpers to a new
+  module. Given an already-resolved prompt + an injected Anthropic-style
+  client, it: resolves the PDF, sends it as base64 to the model, parses the
+  JSON defensively (one repair retry), and records the outcome via the 2a DAO
+  methods. Transient API errors are NOT handled here — they propagate to the
+  caller (task 2c) for backoff/retry.
+
+BEFORE WRITING ANYTHING — read
+  - The proof-of-concept /Users/killi/Dev/asreview/pdf.py: copy its base64
+    `document` content-block shape (pdf_to_block) and its response-text
+    extraction + fence-stripping approach.
+  - asreview/webapp/_api/pdf_resolver.py: PdfResolver.resolve(record) returns a
+    Path or None, and may raise ZoteroLookupError (from
+    asreview.webapp._api.zotero) on a failed download.
+  - The 2a DAO methods on Database: store_llm_result, mark_dispatch_failed,
+    mark_dispatch_missing_pdf.
+
+WHAT TO IMPLEMENT
+  Create a NEW file: asreview/webapp/_api/llm_worker.py
+  (Apache header + numpy docstrings. Imports: base64, json, logging, plus
+   `from asreview.webapp._api.zotero import ZoteroLookupError`.)
+
+  1. Helper — build the base64 PDF document block:
+
+       def _pdf_document_block(pdf_bytes):
+           data = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+           return {
+               "type": "document",
+               "source": {
+                   "type": "base64",
+                   "media_type": "application/pdf",
+                   "data": data,
+               },
+               "cache_control": {"type": "ephemeral"},
+           }
+
+  2. Helper — extract + parse JSON from a client response, tolerant of fences:
+
+       def _extract_text(response):
+           return "".join(
+               b.text for b in response.content if getattr(b, "type", None) == "text"
+           ).strip()
+
+       def _parse_json(text):
+           """Parse a JSON object, tolerating ```-fences. Raises ValueError."""
+           t = text.strip()
+           if t.startswith("```"):
+               t = t.strip("`")
+               idx = t.find("{")
+               if idx != -1:
+                   t = t[idx:]
+           try:
+               return json.loads(t)
+           except json.JSONDecodeError as err:
+               raise ValueError(str(err)) from err
+
+  3. The main function:
+
+       def screen_record(db, resolver, client, record, prompt, prompt_hash,
+                         model, max_tokens=2048):
+           """Run ONE LLM screening attempt for a record and record the result.
+
+           Returns one of the status strings: "ready", "failed", "missing_pdf".
+           Raises on transient API errors (the caller handles retry/backoff).
+
+           Parameters
+           ----------
+           db : asreview.database.database.Database
+               Open database (used for the 2a DAO methods).
+           resolver : PdfResolver
+               Resolves the record to a local PDF path.
+           client : object
+               An Anthropic-style client exposing
+               client.messages.create(model=, max_tokens=, system=, messages=)
+               and returning an object with .content (list of blocks with .type
+               and .text) and .usage.input_tokens / .usage.output_tokens.
+           record : object
+               Record with .record_id and .attachment (passed to resolver).
+           prompt : str
+               The system prompt (from build_system_prompt).
+           prompt_hash : str
+               Hash to store the result under.
+           model : str
+               Model id, e.g. "claude-opus-4-8".
+           """
+           record_id = record.record_id
+
+           # 1. Resolve PDF. Missing key OR failed download -> missing_pdf, no retry.
+           try:
+               pdf_path = resolver.resolve(record)
+           except ZoteroLookupError as err:
+               logging.warning("record %s PDF download failed: %s", record_id, err)
+               db.mark_dispatch_missing_pdf(record_id)
+               return "missing_pdf"
+           if pdf_path is None:
+               db.mark_dispatch_missing_pdf(record_id)
+               return "missing_pdf"
+
+           pdf_bytes = pdf_path.read_bytes()
+           user_content = [
+               _pdf_document_block(pdf_bytes),
+               {"type": "text",
+                "text": "Screen this article. Respond with JSON only."},
+           ]
+
+           # 2. First call (transient errors propagate to the caller).
+           resp = client.messages.create(
+               model=model, max_tokens=max_tokens, system=prompt,
+               messages=[{"role": "user", "content": user_content}],
+           )
+           text = _extract_text(resp)
+           usage = getattr(resp, "usage", None)
+           in_tok = getattr(usage, "input_tokens", None)
+           out_tok = getattr(usage, "output_tokens", None)
+
+           # 3. Parse; on failure do ONE repair call (reformat only, no PDF).
+           try:
+               payload = _parse_json(text)
+           except ValueError:
+               logging.warning("record %s bad JSON; attempting repair.", record_id)
+               repair = client.messages.create(
+                   model=model, max_tokens=max_tokens,
+                   messages=[{"role": "user", "content": [{
+                       "type": "text",
+                       "text": (
+                           "The following was supposed to be a single JSON "
+                           "object but is malformed. Return ONLY the corrected "
+                           "JSON object, with no prose and no code fences:\n\n"
+                           + text
+                       ),
+                   }]}],
+               )
+               try:
+                   payload = _parse_json(_extract_text(repair))
+               except ValueError as err:
+                   logging.warning("record %s JSON unrepairable: %s", record_id, err)
+                   db.mark_dispatch_failed(record_id, f"invalid JSON: {err}")
+                   return "failed"
+
+           # 4. Success -> store and mark ready.
+           db.store_llm_result(
+               record_id, prompt_hash, model, json.dumps(payload),
+               input_tokens=in_tok, output_tokens=out_tok,
+           )
+           return "ready"
+
+  Change no other file. Do NOT import the real `anthropic` package here — the
+  client is always injected.
+
+TEST (write this, then run it)
+  Create a NEW file: tests/test_llm_worker.py
+  Build a real in-memory-ish Database with one dispatched record, a fake
+  resolver, and a fake client using unittest.mock. Suggested harness:
+
+      from pathlib import Path
+      import json, types
+      from unittest import mock
+      import pytest
+      import asreview as asr
+      from asreview.data.record import Record
+      from asreview.webapp._api.zotero import ZoteroLookupError
+      from asreview.webapp._api import llm_worker
+
+      @pytest.fixture
+      def db(tmp_path):
+          with asr.Database(Path(tmp_path, "t.db")) as db:
+              db.create_tables()
+              db.input.add_records([Record(0, "d")])
+              db.add_last_ranking([0], "nb", "max", "balanced", "tfidf", 0)
+              db.top_up_dispatch(1, "H")     # one queued dispatch row for record 0
+              yield db
+
+      def fake_record(attachment="ABCD1234"):
+          return types.SimpleNamespace(record_id=0, attachment=attachment)
+
+      def make_response(text, in_tok=11, out_tok=22):
+          block = types.SimpleNamespace(type="text", text=text)
+          usage = types.SimpleNamespace(input_tokens=in_tok, output_tokens=out_tok)
+          return types.SimpleNamespace(content=[block], usage=usage)
+
+      class FakeResolver:
+          def __init__(self, path):
+              self._path = path
+          def resolve(self, record):
+              return self._path
+
+  Cover:
+    1. Happy path: resolver returns a real tmp PDF file (write b"%PDF-1.7" to
+       tmp_path/"x.pdf"); client.messages.create returns make_response(
+       '{"labels":[],"lists":[]}'). screen_record(...) returns "ready"; an
+       llm_results row exists for (0,"H") with the payload and tokens 11/22;
+       dispatch status is 'ready'. client.messages.create called once.
+    2. Fenced JSON tolerated: response text is
+       '```json\n{"labels":[]}\n```' -> returns "ready".
+    3. Repair path: client.messages.create side_effect=[make_response("not
+       json"), make_response('{"labels":[]}')] -> returns "ready" and
+       create was called twice.
+    4. Unrepairable: side_effect=[make_response("nope"), make_response("still
+       bad")] -> returns "failed"; dispatch status 'failed', last_error set;
+       no llm_results row.
+    5. Missing PDF (no key): resolver returns None -> returns "missing_pdf";
+       dispatch status 'missing_pdf'; client.messages.create NOT called.
+    6. Download failure: resolver.resolve raises ZoteroLookupError -> returns
+       "missing_pdf"; status 'missing_pdf'; client not called.
+    7. Transient propagates: client.messages.create side_effect=RuntimeError
+       ("429") -> screen_record raises RuntimeError (NOT caught here) and the
+       dispatch row is NOT marked failed by screen_record.
+
+RUN
+  cd /Users/killi/Dev/asreview/asreview
+  devbox run -- python -m pytest tests/test_llm_worker.py -q
+  Paste the full pytest output. Do not report done until green.
+
+DONE WHEN
+  - asreview/webapp/_api/llm_worker.py has _pdf_document_block, _extract_text,
+    _parse_json, screen_record as specified; no real `anthropic` import; no
+    other file changed.
+  - All seven test cases pass.
+========================================================================
