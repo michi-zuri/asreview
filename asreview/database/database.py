@@ -1012,6 +1012,68 @@ class Database:
             return self.get_pending(user_id=user_id).iloc[0:0]
         return self.get_pending(user_id=user_id)
 
+    def reassign_stale(self, user_id, older_than):
+        """Reassign the oldest stale checkout to ``user_id``.
+
+        A checkout is stale when it is pending (label IS NULL), owned by a
+        DIFFERENT user, and its ``last_active`` is older than ``older_than``
+        seconds. The oldest such checkout (smallest last_active) has its whole
+        group transferred to ``user_id`` with assigned_at and last_active
+        reset to now.
+
+        Parameters
+        ----------
+        user_id : int
+            The requesting user who should receive the reassigned checkout.
+        older_than : float
+            Staleness threshold in seconds.
+
+        Returns
+        -------
+        pandas.DataFrame
+            The user's pending row(s) (same shape as get_pending). Empty when
+            nothing stale was available.
+        """
+        now = time.time()
+        cutoff = now - older_than
+
+        con = self._conn
+        cur = con.cursor()
+        result = cur.execute(
+            f"""
+            WITH stale AS (
+                SELECT record_id
+                FROM results
+                WHERE label IS NULL
+                  AND user_id IS NOT NULL
+                  AND user_id != :user_id
+                  AND last_active IS NOT NULL
+                  AND last_active < :cutoff
+                ORDER BY last_active ASC
+                LIMIT 1
+            ),
+            group_records AS (
+                SELECT record.record_id
+                FROM {self.record_table_name} AS record
+                WHERE group_id = (
+                    SELECT group_id
+                    FROM {self.record_table_name}
+                    WHERE record_id = (SELECT record_id FROM stale)
+                )
+            )
+            UPDATE results
+            SET user_id = :user_id, assigned_at = :now, last_active = :now
+            WHERE record_id IN (SELECT record_id FROM group_records)
+            RETURNING record_id
+            """,
+            {"user_id": user_id, "cutoff": cutoff, "now": now},
+        ).fetchone()
+        con.commit()
+
+        if result is None:
+            return self.get_pending(user_id=user_id).iloc[0:0]
+        return self.get_pending(user_id=user_id)
+
     def update_result(self, record_id, label=None, tags=None, user_id=None):
         if label is None and tags is None:
             raise ValueError("At least one of 'label' or 'tags' must be provided.")

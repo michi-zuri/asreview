@@ -1,3 +1,4 @@
+import time as time_module
 from pathlib import Path
 
 import pytest
@@ -254,3 +255,67 @@ def test_checkout_nothing_available(db_pool):
     """Empty queue → checkout returns empty DataFrame."""
     pending = db_pool.checkout_oldest_dispatched(user_id=1)
     assert pending.empty
+
+
+def _set_last_active(db, record_id, value):
+    cur = db._conn.cursor()
+    cur.execute(
+        "UPDATE results SET last_active = ? WHERE record_id = ?",
+        (value, record_id),
+    )
+    db._conn.commit()
+
+
+def test_reassign_stale(db_pool):
+    """Stale checkout gets reassigned to requesting user."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=2)
+    _set_last_active(db_pool, 0, time_module.time() - 100000)
+
+    pending = db_pool.reassign_stale(user_id=1, older_than=3600)
+    assert not pending.empty
+    row = _results_row(db_pool, 0)
+    assert row[0] == 1
+    assert row[3] > time_module.time() - 3600  # fresh last_active
+
+
+def test_reassign_fresh_not_reassigned(db_pool):
+    """Fresh checkout is not reassigned."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=2)
+    # last_active is ~now from checkout, don't backdate
+
+    pending = db_pool.reassign_stale(user_id=1, older_than=3600)
+    assert pending.empty
+    row = _results_row(db_pool, 0)
+    assert row[0] == 2  # still user 2
+
+
+def test_reassign_own_not_stolen(db_pool):
+    """A user is not reassigned their own stale checkout."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    _set_last_active(db_pool, 0, time_module.time() - 100000)
+
+    pending = db_pool.reassign_stale(user_id=1, older_than=3600)
+    assert pending.empty
+    row = _results_row(db_pool, 0)
+    assert row[0] == 1  # still user 1
+
+
+def test_reassign_oldest_first(db_pool):
+    """Oldest stale checkout is reassigned first."""
+    db_pool.top_up_dispatch(3, "H")
+    # user 2 gets record 0, user 3 gets record 1
+    db_pool.checkout_oldest_dispatched(user_id=2)
+    db_pool.checkout_oldest_dispatched(user_id=3)
+    # backdate both: record 0 is older than record 1
+    _set_last_active(db_pool, 0, time_module.time() - 100000)
+    _set_last_active(db_pool, 1, time_module.time() - 50000)
+
+    pending = db_pool.reassign_stale(user_id=1, older_than=3600)
+    assert not pending.empty
+    row0 = _results_row(db_pool, 0)
+    assert row0[0] == 1  # reassigned to user 1
+    row1 = _results_row(db_pool, 1)
+    assert row1[0] == 3  # still user 3
