@@ -1,0 +1,92 @@
+========================================================================
+TASK 0a — Add a Zotero attachment FILE download function
+========================================================================
+(The SHARED CONTEXT block was prepended above. Follow its HARD RULES.)
+
+GOAL
+  Add ONE new public function, download_attachment_file, to
+  asreview/webapp/_api/zotero.py that downloads the raw bytes of a Zotero
+  attachment (a PDF) given a resolved ZoteroConfig and an attachment key.
+  This is the missing piece: the existing fetch_pdf_attachment_key() returns
+  only the attachment KEY (a string); nothing yet fetches the actual file.
+
+BEFORE WRITING ANYTHING
+  1. Open and read asreview/webapp/_api/zotero.py IN FULL. Note in particular:
+       - the module docstring and Apache license header,
+       - ZOTERO_API_BASE, ZOTERO_API_VERSION,
+       - the ZoteroConfig class (group_id, group_slug, api_key),
+       - the ZoteroLookupError class and how fetch_pdf_attachment_key() uses
+         it: transient/network failures raise ZoteroLookupError, whereas a
+         clean "no such thing" returns None. Mirror that error convention.
+       - the exact headers dict fetch_pdf_attachment_key() builds
+         ("Zotero-API-Version" and "Zotero-API-Key"),
+       - the __all__ list.
+  If anything below contradicts the file, STOP and report it.
+
+WHAT TO IMPLEMENT
+  Signature:
+      def download_attachment_file(config, attachment_key, timeout=30):
+
+  Behavior:
+    - Build the URL for the Zotero group file endpoint:
+          {ZOTERO_API_BASE}/groups/{config.group_id}/items/{attachment_key}/file
+      (ZOTERO_API_BASE is "https://api.zotero.org"; this returns the file,
+       following Zotero's redirect to storage — requests follows redirects by
+       default, so do NOT disable that.)
+    - Use the SAME headers style as fetch_pdf_attachment_key:
+          "Zotero-API-Version": ZOTERO_API_VERSION,
+          "Zotero-API-Key": config.api_key,
+    - Call requests.get(url, headers=headers, timeout=timeout).
+    - Call response.raise_for_status().
+    - On success, RETURN the raw bytes: response.content  (type: bytes).
+    - On ANY requests.RequestException (network error, timeout, HTTP error
+      raised by raise_for_status), log a warning in the same style as the
+      existing code and raise ZoteroLookupError(str(err)) from err.
+      (This is a transient/failed-fetch signal, exactly like the existing
+      function. Do NOT swallow it and return None.)
+    - Add a numpy-style docstring consistent with the rest of the module
+      (Parameters / Returns / Raises sections).
+    - Add "download_attachment_file" to the module's __all__ list.
+
+  Do NOT:
+    - add caching, disk writes, or PDF validation here (a later task owns the
+      PdfResolver caching layer — this function is a thin transport call),
+    - change any existing function,
+    - add new imports beyond what the module already imports (requests,
+      logging are already imported).
+
+TEST (write this, then run it)
+  Create a NEW file: asreview/webapp/tests/test_api/test_zotero.py
+  This is a pure unit test — no Flask client, no database. Mock requests.get.
+  Use unittest.mock (monkeypatch is also fine); do NOT use `responses` or
+  `requests_mock` (not installed).
+
+  Cover exactly these cases:
+    1. Success: patch requests.get to return a fake response whose
+       .content is b"%PDF-1.7 fake bytes" and whose raise_for_status() is a
+       no-op. Build a ZoteroConfig(group_id="123", group_slug="slug",
+       api_key="KEY", recheck_interval=300). Assert:
+         - the returned value == b"%PDF-1.7 fake bytes",
+         - requests.get was called once with the URL
+           "https://api.zotero.org/groups/123/items/ABCD1234/file",
+         - the headers included "Zotero-API-Key": "KEY" and
+           "Zotero-API-Version": "3".
+    2. HTTP error: patch requests.get so response.raise_for_status() raises
+       requests.HTTPError("404"). Assert download_attachment_file raises
+       ZoteroLookupError.
+    3. Network error: patch requests.get to raise
+       requests.ConnectionError("boom"). Assert download_attachment_file
+       raises ZoteroLookupError.
+
+  Import the symbols under test from asreview.webapp._api.zotero.
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/webapp/tests/test_api/test_zotero.py -q
+  Paste the full pytest output. Do not report done until it is green.
+
+DONE WHEN
+  - download_attachment_file exists in zotero.py, is in __all__, follows the
+    module's error/docstring conventions, and changes no other function.
+  - The three test cases pass.
+========================================================================

@@ -35,6 +35,7 @@ __all__ = [
     "get_zotero_config",
     "is_attachment_key",
     "fetch_pdf_attachment_key",
+    "download_attachment_file",
     "build_reader_url",
 ]
 
@@ -174,6 +175,48 @@ def fetch_pdf_attachment_key(config, item_key, timeout=10):
             return data["key"]
 
     return None
+
+
+def download_attachment_file(config, attachment_key, timeout=30):
+    """Download the raw file bytes of a Zotero attachment.
+
+    Parameters
+    ----------
+    config : ZoteroConfig
+        Resolved Zotero configuration.
+    attachment_key : str
+        The Zotero attachment key (as returned by `fetch_pdf_attachment_key`).
+    timeout : float
+        Request timeout in seconds.
+
+    Returns
+    -------
+    bytes
+        The raw bytes of the attachment file.
+
+    Raises
+    ------
+    ZoteroLookupError
+        If the request to Zotero fails (network error, HTTP error, etc.).
+    """
+    url = (
+        f"{ZOTERO_API_BASE}/groups/{config.group_id}"
+        f"/items/{attachment_key}/file"
+    )
+    headers = {
+        "Zotero-API-Version": ZOTERO_API_VERSION,
+        "Zotero-API-Key": config.api_key,
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        return response.content
+    except requests.RequestException as err:
+        logging.warning(
+            f"Failed to download attachment {attachment_key}: {err}"
+        )
+        raise ZoteroLookupError(str(err)) from err
 
 
 def build_reader_url(config, item_key, attachment_key):
