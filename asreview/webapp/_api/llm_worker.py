@@ -30,6 +30,7 @@ from asreview.webapp._api.llm_prompt import build_system_prompt
 from asreview.webapp._api.pdf_resolver import PdfResolver
 from asreview.webapp._api.utils import read_tags_data, read_lists_data
 from asreview.webapp._api.zotero import ZoteroLookupError
+from asreview.webapp.utils import asreview_path
 
 
 def _pdf_document_block(pdf_bytes):
@@ -215,13 +216,17 @@ def process_with_retry(db, resolver, client, record, prompt, prompt_hash,
 
 def run_worker_once(project, client, model, criteria_text="",
                     max_concurrent=3, max_attempts=5,
-                    db_factory=None, resolver_factory=None):
+                    db_factory=None, resolver_factory=None,
+                    executor=None):
     """Claim and process all currently-queued dispatch rows once.
 
     Returns the number of records processed. Builds the current system
     prompt from the project's tags/lists + criteria_text. Each pooled
     job opens its own Database (db_factory) so sqlite is never shared
     across threads.
+
+    When *executor* is given it is used to schedule jobs (caller owns the
+    pool lifetime); otherwise a fresh ThreadPoolExecutor is created.
     """
     # criteria_text has no project-level storage yet (planned for Phase 5);
     # it defaults to "".
@@ -255,8 +260,11 @@ def run_worker_once(project, client, model, criteria_text="",
         finally:
             job_db.close()
 
-    with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
-        list(pool.map(_job, claimed))
+    if executor is None:
+        with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+            list(pool.map(_job, claimed))
+    else:
+        list(executor.map(_job, claimed))
     return len(claimed)
 
 
@@ -296,3 +304,68 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def discover_project_paths():
+    """Return sorted project directories under asreview_path().
+
+    A project directory is any subdirectory containing a project.json.
+    """
+    base = asreview_path()
+    paths = []
+    for p in sorted(base.glob("*")):
+        if p.is_dir() and (p / asr.Project.PATH_CONFIG).exists():
+            paths.append(p)
+    return paths
+
+
+def run_worker_all(client, model, executor=None, criteria_text="",
+                   max_concurrent=3, max_attempts=5):
+    """Drain the queued dispatch rows of every project once.
+
+    Returns the total number of records processed across all projects. A
+    failure opening/processing one project is logged and skipped so one
+    bad project cannot kill the service.
+    """
+    total = 0
+    for path in discover_project_paths():
+        try:
+            with asr.Project(path) as project:
+                total += run_worker_once(
+                    project, client, model,
+                    criteria_text=criteria_text,
+                    max_concurrent=max_concurrent,
+                    max_attempts=max_attempts,
+                    executor=executor,
+                )
+        except Exception as err:  # noqa: BLE001
+            logging.exception("LLM worker: project %s failed: %s", path, err)
+    return total
+
+
+def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0,
+                       criteria_text=""):
+    """Run the all-projects worker forever with a single global pool.
+
+    The one ThreadPoolExecutor(max_concurrent) shared across all projects
+    is what makes ``max_concurrent`` a GLOBAL cap. Only drains; never tops
+    up. criteria_text has no storage yet (Phase 5 setting); defaults "".
+    """
+    model = model or os.environ.get("ASREVIEW_LLM_MODEL", "claude-opus-4-8")
+    if max_concurrent is None:
+        max_concurrent = int(
+            os.environ.get("ASREVIEW_LLM_MAX_CONCURRENT", "3")
+        )
+    client = anthropic.Anthropic()
+    logging.info(
+        "ASReview LLM worker starting (model=%s, max_concurrent=%s)",
+        model, max_concurrent,
+    )
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        while True:
+            n = run_worker_all(
+                client, model, executor=executor,
+                criteria_text=criteria_text, max_concurrent=max_concurrent,
+            )
+            if n == 0:
+                time.sleep(poll_interval)

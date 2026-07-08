@@ -337,3 +337,83 @@ def test_run_worker_once(tmp_path):
         "SELECT COUNT(*) FROM llm_results"
     ).fetchone()[0]
     assert result_count == 3
+
+
+# --- 2d: discover_project_paths, run_worker_all, bad-project skip ---
+
+
+def _seed_project(base, name, n=2):
+    """Create a project with n records and n queued dispatch rows."""
+    proj = asr.Project.create(Path(base, name))
+    proj.db.input.add_records([Record(i, "d") for i in range(n)])
+    proj.db.add_last_ranking(list(range(n)), "nb", "max", "balanced", "tfidf", 0)
+    proj.db.top_up_dispatch(n, "seed")
+    proj.close()
+    return proj
+
+
+def _all_dispatch_statuses(project):
+    """Return list of (record_id, status) for every dispatch row in project."""
+    cur = project.db._conn.cursor()
+    return cur.execute(
+        "SELECT record_id, status FROM llm_dispatch ORDER BY record_id"
+    ).fetchall()
+
+
+def test_discover_project_paths(tmp_path, monkeypatch):
+    """discover_project_paths finds projects, ignores plain dirs and files."""
+    monkeypatch.setenv("ASREVIEW_PATH", str(tmp_path))
+    _seed_project(tmp_path, "p1", n=2)
+    _seed_project(tmp_path, "p2", n=2)
+    # Create a plain dir and a file — neither should be returned.
+    (tmp_path / "not_a_project").mkdir()
+    (tmp_path / "x.txt").write_text("hello")
+
+    paths = llm_worker.discover_project_paths()
+    names = [p.name for p in paths]
+    assert names == ["p1", "p2"]
+
+
+def test_run_worker_all_drains_all(tmp_path, monkeypatch):
+    """run_worker_all drains all projects; missing PDFs short-circuit."""
+    monkeypatch.setenv("ASREVIEW_PATH", str(tmp_path))
+    _seed_project(tmp_path, "p1", n=2)
+    _seed_project(tmp_path, "p2", n=2)
+
+    total = llm_worker.run_worker_all(
+        client=mock.Mock(), model="claude-opus-4-8",
+        executor=None, max_concurrent=1,
+    )
+
+    assert total == 4
+
+    # All 4 records should be 'missing_pdf' (no Zotero config → no PDF)
+    for name in ["p1", "p2"]:
+        with asr.Project(Path(tmp_path, name)) as proj:
+            for rid, status in _all_dispatch_statuses(proj):
+                assert status == "missing_pdf", (
+                    f"project {name} record {rid}: expected missing_pdf, got {status}"
+                )
+
+
+def test_run_worker_all_bad_project_skipped(tmp_path, monkeypatch):
+    """A broken project is skipped; good projects still drain."""
+    monkeypatch.setenv("ASREVIEW_PATH", str(tmp_path))
+    _seed_project(tmp_path, "p1", n=2)
+    _seed_project(tmp_path, "p2", n=2)
+    # Create a broken "project": directory with an empty project.json
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "project.json").write_text("")
+
+    total = llm_worker.run_worker_all(
+        client=mock.Mock(), model="claude-opus-4-8",
+        executor=None, max_concurrent=1,
+    )
+
+    assert total == 4
+
+    for name in ["p1", "p2"]:
+        with asr.Project(Path(tmp_path, name)) as proj:
+            for rid, status in _all_dispatch_statuses(proj):
+                assert status == "missing_pdf"

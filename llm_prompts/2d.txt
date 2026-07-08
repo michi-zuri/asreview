@@ -1,0 +1,212 @@
+========================================================================
+TASK 2d — All-projects scan loop + systemd/console entrypoint (global cap)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: tasks 2a, 2b, 2c already merged.
+
+DEPLOYMENT CONTEXT
+  The worker runs as ONE long-lived systemd service on NixOS. It must scan ALL
+  projects under asreview_path() and drain their LLM queues. It only DRAINS
+  (never tops up). The concurrency cap is GLOBAL across all projects: the
+  service owns a SINGLE ThreadPoolExecutor(max_concurrent) shared by every
+  project it processes. ANTHROPIC_API_KEY is provided via the process
+  environment (systemd EnvironmentFile), so anthropic.Anthropic() picks it up.
+
+BEFORE WRITING ANYTHING — read
+  - asreview/webapp/_api/llm_worker.py (from 2c): run_worker_once,
+    process_with_retry, run_worker, main.
+  - asreview/webapp/utils.py: asreview_path() returns the projects base dir
+    (honors ASREVIEW_PATH). Projects are its subdirectories that contain a
+    "project.json" file (asr.Project.PATH_CONFIG).
+  - asreview/webapp/_entry_points/task_manager.py: the pattern for a thin
+    entry-point module with a main() launched as a process.
+  - pyproject.toml: the [project.scripts] table.
+
+WHAT TO IMPLEMENT
+
+  PART 1 — make run_worker_once accept a shared executor
+  In asreview/webapp/_api/llm_worker.py, modify run_worker_once to accept a new
+  keyword arg ``executor=None`` (place it last, keep all existing behavior). At
+  the point where it currently does:
+      with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+          list(pool.map(_job, claimed))
+  replace with:
+      if executor is None:
+          with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+              list(pool.map(_job, claimed))
+      else:
+          list(executor.map(_job, claimed))
+  (When a shared executor is passed, do NOT create or close a pool here.)
+
+  PART 2 — add project discovery + all-projects drain + service loop
+  Append to asreview/webapp/_api/llm_worker.py:
+
+      from asreview.webapp.utils import asreview_path
+
+      def discover_project_paths():
+          """Return sorted project directories under asreview_path().
+
+          A project directory is any subdirectory containing a project.json.
+          """
+          base = asreview_path()
+          paths = []
+          for p in sorted(base.glob("*")):
+              if p.is_dir() and (p / asr.Project.PATH_CONFIG).exists():
+                  paths.append(p)
+          return paths
+
+      def run_worker_all(client, model, executor=None, criteria_text="",
+                         max_concurrent=3, max_attempts=5):
+          """Drain the queued dispatch rows of every project once.
+
+          Returns the total number of records processed across all projects. A
+          failure opening/processing one project is logged and skipped so one
+          bad project cannot kill the service.
+          """
+          total = 0
+          for path in discover_project_paths():
+              try:
+                  with asr.Project(path) as project:
+                      total += run_worker_once(
+                          project, client, model,
+                          criteria_text=criteria_text,
+                          max_concurrent=max_concurrent,
+                          max_attempts=max_attempts,
+                          executor=executor,
+                      )
+              except Exception as err:  # noqa: BLE001
+                  logging.exception("LLM worker: project %s failed: %s", path, err)
+          return total
+
+      def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0,
+                             criteria_text=""):
+          """Run the all-projects worker forever with a single global pool.
+
+          The one ThreadPoolExecutor(max_concurrent) shared across all projects
+          is what makes ``max_concurrent`` a GLOBAL cap. Only drains; never tops
+          up. criteria_text has no storage yet (Phase 5 setting); defaults "".
+          """
+          model = model or os.environ.get("ASREVIEW_LLM_MODEL", "claude-opus-4-8")
+          if max_concurrent is None:
+              max_concurrent = int(
+                  os.environ.get("ASREVIEW_LLM_MAX_CONCURRENT", "3")
+              )
+          client = anthropic.Anthropic()
+          logging.info(
+              "ASReview LLM worker starting (model=%s, max_concurrent=%s)",
+              model, max_concurrent,
+          )
+          with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+              while True:
+                  n = run_worker_all(
+                      client, model, executor=executor,
+                      criteria_text=criteria_text, max_concurrent=max_concurrent,
+                  )
+                  if n == 0:
+                      time.sleep(poll_interval)
+
+  PART 3 — thin entry-point module
+  Create a NEW file: asreview/webapp/_entry_points/llm_worker.py
+  (Apache header.) It mirrors task_manager.py's shape:
+
+      import argparse
+      import logging
+      import textwrap
+
+      from asreview.webapp._api.llm_worker import run_worker_service
+
+      description = """\
+      Launches the ASReview LLM screening worker: one long-lived process that
+      scans all projects under ASREVIEW_PATH and drains their LLM queues, with a
+      global concurrency cap. Requires ANTHROPIC_API_KEY in the environment.
+
+      Example NixOS systemd service:
+        systemd.services.asreview-llm-worker = {
+          description = "ASReview LLM screening worker";
+          after = [ "network-online.target" ];
+          wants = [ "network-online.target" ];
+          wantedBy = [ "multi-user.target" ];
+          environment = {
+            ASREVIEW_PATH = "/var/lib/asreview";
+            ASREVIEW_LLM_MAX_CONCURRENT = "3";
+          };
+          serviceConfig = {
+            ExecStart = "\${pkg}/bin/asreview-llm-worker";
+            EnvironmentFile = config.age.secrets.anthropic.path; # ANTHROPIC_API_KEY=...
+            Restart = "always";
+            User = "asreview";
+          };
+        };
+      """
+
+      def main():
+          parser = argparse.ArgumentParser(
+              description=textwrap.dedent(description).strip(),
+              formatter_class=argparse.RawDescriptionHelpFormatter,
+          )
+          parser.add_argument("-v", "--verbose", action="count", default=0,
+                              help="-v for DEBUG logging.")
+          parser.add_argument("--model", default=None)
+          parser.add_argument("--max-concurrent", type=int, default=None)
+          parser.add_argument("--poll-interval", type=float, default=5.0)
+          args = parser.parse_args()
+          logging.basicConfig(
+              level=logging.DEBUG if args.verbose else logging.INFO
+          )
+          run_worker_service(
+              model=args.model,
+              max_concurrent=args.max_concurrent,
+              poll_interval=args.poll_interval,
+          )
+
+  PART 4 — register the console script
+  In pyproject.toml, under [project.scripts], add one line next to the existing
+  "asreview = ..." entry:
+      asreview-llm-worker = "asreview.webapp._entry_points.llm_worker:main"
+
+  Change no other files. Leave 2c's existing single-project run_worker/main in
+  place (harmless debug CLI).
+
+TEST (append to tests/test_llm_worker.py)
+  Reuse the harness from 2b/2c (make_response, etc.). Use monkeypatch to point
+  asreview_path at a tmp dir.
+
+  Helper to build a seeded project:
+      def _seed_project(base, name, n=2):
+          proj = asr.Project.create(Path(base, name))
+          proj.db.input.add_records([Record(i, "d") for i in range(n)])
+          proj.db.add_last_ranking(list(range(n)), "nb","max","balanced","tfidf",0)
+          proj.db.top_up_dispatch(n, "seed")   # n queued rows
+          proj.close()
+          return proj
+
+  Cover:
+    1. discover_project_paths: set monkeypatch.setenv("ASREVIEW_PATH",
+       str(tmp_path)); create two projects "p1" and "p2" via _seed_project; also
+       create a plain dir tmp_path/"not_a_project" and a file tmp_path/"x.txt".
+       Assert discover_project_paths() returns exactly the two project dirs
+       (sorted), and neither the plain dir nor the file.
+    2. run_worker_all drains all projects: with the two seeded projects above
+       and NO Zotero config (so PdfResolver.resolve returns None), call
+       total = run_worker_all(client=mock.Mock(), model="claude-opus-4-8",
+                              executor=None, max_concurrent=1)
+       Assert total == 4 (2 records x 2 projects), the mock client was never
+       called (missing PDFs short-circuit before the model call), and every
+       dispatch row in BOTH projects has status 'missing_pdf'. (Re-open each
+       project with asr.Project(path) and read llm_dispatch via project.db._conn.)
+    3. Bad project skipped: create a directory tmp_path/"broken" containing an
+       empty "project.json" (invalid). Assert run_worker_all does not raise and
+       still processes the two good projects.
+
+RUN
+  cd /Users/killi/Dev/asreview/asreview
+  devbox run -- python -m pytest tests/test_llm_worker.py -q
+  Paste the full pytest output. Do not report done until green.
+
+DONE WHEN
+  - run_worker_once takes executor=None; discover_project_paths, run_worker_all,
+    run_worker_service exist; entry-point module + [project.scripts] line added.
+  - `asreview-llm-worker` is a valid console script (after reinstall it would
+    launch run_worker_service).
+  - The three new tests pass and all earlier llm_worker/llm_db tests still pass.
+========================================================================
