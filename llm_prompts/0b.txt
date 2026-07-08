@@ -1,0 +1,150 @@
+========================================================================
+TASK 0b — PdfResolver: record -> locally cached PDF path
+========================================================================
+(The SHARED CONTEXT block was prepended above. Follow its HARD RULES.)
+
+GOAL
+  Add a small, self-contained PdfResolver class that turns a record into a
+  local, on-disk cached PDF file path, using the Zotero attachment key that
+  is already stored on the record. It downloads the file exactly once and
+  caches it under the project directory, so reprocessing never re-downloads.
+
+  This is a pure library class. It does NOT touch Flask, routes, or the
+  database schema. It will be called later by the standalone LLM worker.
+
+BEFORE WRITING ANYTHING
+  Open and read these IN FULL:
+    - asreview/webapp/_api/zotero.py
+        Confirm the exact signatures of:
+          get_zotero_config(project_path) -> ZoteroConfig
+          is_attachment_key(value) -> bool
+          download_attachment_file(config, attachment_key, timeout=30) -> bytes  (added in task 0a)
+          ZoteroLookupError
+        Confirm ZoteroConfig.enabled tells you whether Zotero is usable.
+    - asreview/data/record.py
+        Confirm a Record has:
+          record.original_id   (the Zotero ITEM key)
+          record.attachment    (EITHER a Zotero attachment key OR an ISO-8601
+                                failure timestamp OR None)
+  If any name/signature differs from the above, STOP and report it.
+
+WHAT TO IMPLEMENT
+  Create a NEW file: asreview/webapp/_api/pdf_resolver.py
+  (Apache license header + numpy-style docstrings, matching zotero.py.)
+
+  Imports (only from the existing module — do NOT re-implement anything):
+      from pathlib import Path
+      from asreview.webapp._api.zotero import (
+          get_zotero_config,
+          is_attachment_key,
+          download_attachment_file,
+      )
+
+  Class:
+      class PdfResolver:
+          """Resolve records to locally cached Zotero PDF files.
+
+          The record's ``attachment`` field already holds a Zotero attachment
+          key (when a PDF is available) or a failure timestamp otherwise; see
+          the Zotero integration. This class only downloads and caches the
+          file for keys that are already resolved — it does NOT perform the
+          item->attachment lookup itself.
+          """
+
+          CACHE_DIRNAME = "llm_pdf_cache"
+
+          def __init__(self, project_path, config=None):
+              # project_path: str | Path to the project directory.
+              # config: optional ZoteroConfig; if None, read it with
+              #         get_zotero_config(project_path).
+              self.project_path = Path(project_path)
+              self.config = config if config is not None else get_zotero_config(project_path)
+              self.cache_dir = self.project_path / self.CACHE_DIRNAME
+
+          def resolve(self, record):
+              """Return a Path to the cached PDF for ``record``, or None.
+
+              Returns None (no PDF available; caller should treat as
+              ``missing_pdf``) when:
+                - Zotero is not configured (``self.config.enabled`` is False), or
+                - ``record.attachment`` is not a valid attachment key
+                  (i.e. is None or a failure timestamp).
+
+              On a cache hit returns the existing path without any network call.
+              On a cache miss downloads the file via download_attachment_file()
+              and writes it to the cache, then returns the path.
+
+              May raise ZoteroLookupError if the download fails — the caller
+              (worker) is responsible for mapping that to ``missing_pdf`` and
+              not retrying. Do NOT catch it here.
+              """
+              if not self.config.enabled:
+                  return None
+              key = getattr(record, "attachment", None)
+              if not is_attachment_key(key):
+                  return None
+              return self._cached_path(key)
+
+          def _cached_path(self, attachment_key):
+              dest = self.cache_dir / f"{attachment_key}.pdf"
+              if dest.exists():
+                  return dest
+              data = download_attachment_file(self.config, attachment_key)
+              self.cache_dir.mkdir(parents=True, exist_ok=True)
+              # Write atomically so a crashed/partial download never looks cached.
+              tmp = dest.with_name(dest.name + ".part")
+              tmp.write_bytes(data)
+              tmp.replace(dest)
+              return dest
+
+  Notes:
+    - Do NOT call fetch_pdf_attachment_key here (no item->attachment lookup).
+    - Do NOT validate PDF contents; just cache the bytes.
+    - Keep everything in this one file. No changes to any other file.
+
+TEST (write this, then run it)
+  Create a NEW file: asreview/webapp/tests/test_api/test_pdf_resolver.py
+  Pure unit test — no Flask client, no database. Use pytest's tmp_path for the
+  project directory. Patch the network by patching
+  asreview.webapp._api.pdf_resolver.download_attachment_file with
+  unittest.mock. Do NOT use `responses` / `requests_mock`.
+
+  Use a tiny fake record and a fake enabled config, e.g.:
+      import types
+      def fake_record(attachment):
+          return types.SimpleNamespace(attachment=attachment, original_id="ITEMKEY0")
+      # A config where .enabled is True. You can import ZoteroConfig from
+      # asreview.webapp._api.zotero and build one, OR use a SimpleNamespace
+      # with enabled=True, group_id="123", api_key="KEY". Prefer the real
+      # ZoteroConfig so .enabled reflects real logic.
+
+  Cover exactly these cases:
+    1. config disabled -> resolve returns None, download never called.
+       (Build a ZoteroConfig with group_id=None / api_key=None so .enabled is False.)
+    2. attachment is None -> resolve returns None, download never called.
+    3. attachment is a failure timestamp (e.g. "2026-01-01T00:00:00+00:00")
+       -> resolve returns None (is_attachment_key is False), download never called.
+    4. cache MISS with a valid key (e.g. "ABCD1234"):
+       - patch download_attachment_file to return b"%PDF-1.7 data",
+       - assert resolve returns the path
+         tmp_path / "llm_pdf_cache" / "ABCD1234.pdf",
+       - assert that file exists and its bytes == b"%PDF-1.7 data",
+       - assert download_attachment_file was called exactly once with
+         (config, "ABCD1234").
+    5. cache HIT: pre-create tmp_path/"llm_pdf_cache"/"ABCD1234.pdf" with some
+       bytes, then call resolve; assert it returns that path AND that
+       download_attachment_file was NOT called.
+    6. download failure: patch download_attachment_file to raise
+       ZoteroLookupError; assert resolve propagates ZoteroLookupError
+       (i.e. it is NOT swallowed).
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/webapp/tests/test_api/test_pdf_resolver.py -q
+  Paste the full pytest output. Do not report done until it is green.
+
+DONE WHEN
+  - asreview/webapp/_api/pdf_resolver.py exists with PdfResolver as specified,
+    imports the existing zotero helpers, and changes no other file.
+  - All six test cases pass.
+========================================================================

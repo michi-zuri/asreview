@@ -1,0 +1,202 @@
+========================================================================
+TASK 0c — Build the LLM system prompt + prompt_hash from the DB contract
+========================================================================
+(The SHARED CONTEXT block was prepended above. Follow its HARD RULES.)
+
+GOAL
+  Add ONE pure function, build_system_prompt, that assembles the system
+  prompt sent to Claude for full-text screening, and returns it together
+  with a stable prompt_hash. The prompt is built from the project's label
+  groups and lists (the BINDING CONTRACT) plus an optional human-facing
+  free-text block (non-binding context).
+
+  SCOPE: prompt building + hashing ONLY. Do NOT implement JSON parsing,
+  validation, or export->id mapping here — that is a separate later task
+  (0d). Do NOT call the network, the database, or Flask.
+
+BACKGROUND — the exact input shapes (do not re-derive; trust these)
+  This function receives ALREADY-READ data structures, not a db handle.
+
+  tags_form: list[dict] | None  (as produced by read_tags_data in
+             asreview/webapp/_api/utils.py). Each group dict looks like:
+      {
+        "id": 0,
+        "export": "exclusion_reasons",
+        "label": "Exclusion reasons",
+        "required_relevant": bool,
+        "required_irrelevant": bool,
+        "require_all": bool,
+        "single_select": bool,
+        "input_helper_text": str,
+        "sorted_at": ...,
+        "values": [
+          {"id": 0, "export": "no_pdf", "label": "no pdf",
+           "free_text": bool, "free_text_required": bool, "sorted_at": ...},
+          ...
+        ],
+      }
+    The list is ALREADY in display order; preserve that order.
+
+  lists_form: list[dict] | None  (as produced by read_lists_data). Each:
+      {"id": ..., "name": "case_identifiers",
+       "required_for_relevant": bool, "input_helper_text": str,
+       "sorted_at": ...}
+    Already in display order; preserve it.
+
+  criteria_text: str | None
+    A human-facing description of the screening goal/criteria. NON-BINDING
+    context. May be None or "".
+
+  You may read asreview/webapp/_api/utils.py to confirm these shapes, but do
+  NOT import from it or call it — the caller passes the data in.
+
+WHAT TO IMPLEMENT
+  Create a NEW file: asreview/webapp/_api/llm_prompt.py
+  (Apache license header + numpy-style docstring, matching the other files.)
+
+  Imports: only the Python stdlib (json, hashlib).
+
+  Signature:
+      def build_system_prompt(tags_form, lists_form, criteria_text=None):
+          """... returns (prompt, prompt_hash) ..."""
+
+  Behavior — build the prompt from this EXACT template (use it verbatim so
+  the output is deterministic and reviewable). Fill the three <...> slots:
+
+      PROMPT_TEMPLATE = '''You are assisting with full-text screening for a \
+systematic review.
+
+Read the attached PDF and PRE-FILL a screening form for a human reviewer. You \
+do NOT make the final decision; a human always confirms or corrects your \
+answers. Fill the form as accurately as a careful human reviewer would.
+
+Respond with ONLY a single JSON object. No prose, and no markdown code fences.
+
+## Response shape
+{{
+  "labels": [
+    {{"group": "<group_export>", "values": [
+      {{"checked": "<option_export>"}},
+      {{"checked": "<option_export>", "text": "<free text, only for options that allow it>"}}
+    ]}}
+  ],
+  "lists": [
+    {{"list": "<list_name>", "items": ["<string>"]}}
+  ]
+}}
+
+Rules:
+- Use ONLY the exact `group` export names, `checked` option export names, and
+  `list` names listed below. Do not invent new ones.
+- Use export identifiers only. Never output numeric ids or human labels.
+- Include only the options you are checking; omit unchecked options.
+- A `single_select` group may have at most one checked value.
+- A `require_all` group is a checklist: check its options only when the article
+  satisfies all of them; otherwise leave that group unsatisfied.
+- Add `text` only for options whose `free_text` is true.
+- For each list include only the items that apply; use an empty list when none.
+
+## Label groups (BINDING CONTRACT)
+{label_groups_json}
+
+## Lists (BINDING CONTRACT)
+{lists_json}
+
+## Additional context (non-binding)
+{criteria_block}
+'''
+
+  Assembly rules (deterministic — same inputs must always give the same
+  string and hash):
+    1. Normalize None -> [] for tags_form and lists_form.
+    2. label_groups_json: json.dumps(projected_groups, indent=2,
+       ensure_ascii=False) where projected_groups is, IN THE GIVEN ORDER,
+       one dict per group with EXACTLY these keys in this order:
+           "group": group["export"]
+           "label": group["label"]
+           "single_select": bool(group.get("single_select"))
+           "require_all": bool(group.get("require_all"))
+           "required_relevant": bool(group.get("required_relevant"))
+           "required_irrelevant": bool(group.get("required_irrelevant"))
+           "options": [ per value, in given order, with keys in this order:
+                          "export": v["export"],
+                          "label": v["label"],
+                          "free_text": bool(v.get("free_text")) ]
+    3. lists_json: json.dumps(projected_lists, indent=2, ensure_ascii=False)
+       where projected_lists is, IN THE GIVEN ORDER, one dict per list with
+       EXACTLY these keys in this order:
+           "list": lst["name"]
+           "description": lst.get("input_helper_text", "")
+           "required_for_relevant": bool(lst.get("required_for_relevant"))
+    4. criteria_block: criteria_text if it is a non-empty string (after
+       .strip()), else the literal string "None provided."
+    5. prompt = PROMPT_TEMPLATE.format(label_groups_json=..., lists_json=...,
+       criteria_block=...)
+    6. prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    7. return (prompt, prompt_hash)
+
+  Do NOT add extra fields, do NOT reorder keys, do NOT sort — determinism
+  comes from fixed key order + preserved input order.
+
+TEST (write this, then run it)
+  Create a NEW file: asreview/webapp/tests/test_api/test_llm_prompt.py
+  Pure unit test — no db, no Flask, no network.
+
+  Build small fixtures inline, e.g.:
+      TAGS = [
+        {"id": 0, "export": "exclusion_reasons", "label": "Exclusion reasons",
+         "required_relevant": False, "required_irrelevant": True,
+         "require_all": False, "single_select": False,
+         "input_helper_text": "", "sorted_at": 0,
+         "values": [
+           {"id": 0, "export": "no_pdf", "label": "no pdf", "free_text": False},
+           {"id": 1, "export": "other", "label": "other", "free_text": True},
+         ]},
+        {"id": 1, "export": "inclusion_criteria", "label": "Inclusion criteria",
+         "required_relevant": True, "required_irrelevant": False,
+         "require_all": True, "single_select": False,
+         "input_helper_text": "", "sorted_at": 1,
+         "values": [
+           {"id": 0, "export": "infectious_agent", "label": "mentions an agent",
+            "free_text": False},
+         ]},
+      ]
+      LISTS = [
+        {"id": "a", "name": "case_identifiers", "required_for_relevant": False,
+         "input_helper_text": "IDs of matching cases", "sorted_at": 0},
+      ]
+
+  Cover exactly these cases:
+    1. Return type: build_system_prompt(TAGS, LISTS, "Goal text") returns a
+       2-tuple of (str, str).
+    2. Hash is derived from the prompt: assert
+       prompt_hash == hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+       and len(prompt_hash) == 64.
+    3. Contract present: the prompt contains every group export
+       ("exclusion_reasons", "inclusion_criteria"), every option export
+       ("no_pdf", "other", "infectious_agent"), and the list name
+       ("case_identifiers"). It also contains the response-shape markers
+       "labels", "lists", and the instruction substring
+       "Use export identifiers only." (adjust to match your exact wording).
+    4. Criteria included: "Goal text" appears in the prompt.
+    5. Criteria absent: build_system_prompt(TAGS, LISTS, None) and
+       build_system_prompt(TAGS, LISTS, "   ") both contain "None provided."
+       and do NOT crash.
+    6. Determinism: calling build_system_prompt(TAGS, LISTS, "Goal text")
+       twice yields identical prompt AND identical hash.
+    7. Hash sensitivity: changing criteria_text (e.g. "Goal A" vs "Goal B")
+       yields DIFFERENT hashes; and adding an option to a group's values
+       yields a DIFFERENT hash.
+    8. None forms: build_system_prompt(None, None, "x") does not crash and
+       the prompt contains empty JSON arrays "[]" for both contract sections.
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/webapp/tests/test_api/test_llm_prompt.py -q
+  Paste the full pytest output. Do not report done until it is green.
+
+DONE WHEN
+  - asreview/webapp/_api/llm_prompt.py exists with build_system_prompt as
+    specified, uses only stdlib, and changes no other file.
+  - All eight test cases pass.
+========================================================================
