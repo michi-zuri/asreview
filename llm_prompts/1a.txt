@@ -1,0 +1,147 @@
+========================================================================
+TASK 1a — Add the llm_dispatch and llm_results tables
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+
+GOAL
+  Add two new per-project SQLite tables — llm_dispatch and llm_results — to
+  asreview/database/database.py, created for BOTH new projects and existing
+  projects, following the module's established idempotent-migration pattern.
+
+BEFORE WRITING ANYTHING — read and understand the pattern
+  Open asreview/database/database.py and study:
+    - create_tables(self): creates the base tables, then calls a series of
+      self._ensure_*() methods.
+    - The existing _ensure_* methods (e.g. _ensure_tags_table,
+      _ensure_lists_table): each uses "CREATE TABLE IF NOT EXISTS", commits,
+      and has a numpy-style docstring saying it is idempotent / safe on every
+      open.
+    - _is_valid(self): the ON-OPEN hook (called by open_db). Inside its
+      `if not self.read_only:` block it calls the same _ensure_* methods — this
+      is how EXISTING projects get newly-added tables. New tables MUST be added
+      in BOTH create_tables() AND this block.
+    - CURRENT_DATABASE_VERSION: DO NOT change it. These are additive tables and
+      must NOT trigger a version bump (mirror how the tags/lists tables were
+      added without bumping the version).
+
+WHAT TO IMPLEMENT
+  1. Add two new methods next to the other _ensure_* methods:
+
+       def _ensure_llm_dispatch_table(self):
+           """Create the ``llm_dispatch`` table (LLM screening queue).
+
+           One row per record that has been (or should be) sent to the LLM.
+           ``record_id`` is the primary key: a record has at most one dispatch
+           row, updated in place when it is re-queued. ``dispatched_at`` is a
+           unix timestamp (float, UTC instant) that defines the canonical
+           serving order. ``status`` is one of ``queued``, ``in_flight``,
+           ``ready``, ``failed``, ``missing_pdf``.
+
+           Idempotent (``CREATE TABLE IF NOT EXISTS``); safe on every
+           read-write open.
+           """
+           cur = self._conn.cursor()
+           cur.execute(
+               """CREATE TABLE IF NOT EXISTS llm_dispatch (
+                   record_id INTEGER PRIMARY KEY,
+                   dispatched_at REAL,
+                   status TEXT NOT NULL,
+                   prompt_hash TEXT,
+                   attempts INTEGER NOT NULL DEFAULT 0,
+                   last_error TEXT
+               )"""
+           )
+           cur.execute(
+               """CREATE INDEX IF NOT EXISTS idx_llm_dispatch_status_time
+                  ON llm_dispatch(status, dispatched_at)"""
+           )
+           self._conn.commit()
+
+       def _ensure_llm_results_table(self):
+           """Create the ``llm_results`` table (cached LLM screening output).
+
+           Primary key ``(record_id, prompt_hash)`` so a prompt change
+           naturally invalidates the cache without deleting old rows.
+           ``payload_json`` is the raw LLM JSON; ``created_at`` is a unix
+           timestamp (float, UTC instant).
+
+           Idempotent (``CREATE TABLE IF NOT EXISTS``); safe on every
+           read-write open.
+           """
+           cur = self._conn.cursor()
+           cur.execute(
+               """CREATE TABLE IF NOT EXISTS llm_results (
+                   record_id INTEGER NOT NULL,
+                   prompt_hash TEXT NOT NULL,
+                   model TEXT,
+                   payload_json TEXT,
+                   input_tokens INTEGER,
+                   output_tokens INTEGER,
+                   created_at REAL,
+                   PRIMARY KEY (record_id, prompt_hash)
+               )"""
+           )
+           self._conn.commit()
+
+     (NOTE: we intentionally do NOT store an anthropic file_id — PDFs are sent
+      as base64, so there is no uploaded-file id to cache. Do not add that
+      column.)
+
+  2. Call both new methods from create_tables(self), right after the existing
+     self._ensure_tags_table() call.
+
+  3. Call both new methods inside _is_valid(self), in the
+     `if not self.read_only:` block, right after the existing
+     self._ensure_tags_table() call.
+
+  Do NOT touch CURRENT_DATABASE_VERSION, REQUIRED_TABLES, or any dtype dict.
+  Change no other file.
+
+TEST (write this, then run it)
+  Create a NEW file: asreview/tests/test_llm_db.py
+  Use the same harness style as asreview/tests/test_database.py. Include this
+  fixture (later LLM-db tasks will reuse it — do not duplicate it later):
+
+      from pathlib import Path
+      import pytest
+      import asreview as asr
+
+      @pytest.fixture
+      def db(tmp_path):
+          with asr.Database(Path(tmp_path, "test.db")) as db:
+              db.create_tables()
+              yield db
+
+      def _tables(db):
+          cur = db._conn.cursor()
+          rows = cur.execute(
+              "SELECT name FROM sqlite_master WHERE type='table'"
+          ).fetchall()
+          return {r[0] for r in rows}
+
+      def _columns(db, table):
+          cur = db._conn.cursor()
+          return [r[1] for r in cur.execute(f"PRAGMA table_info({table})")]
+
+  Cover:
+    1. After create_tables (the db fixture), both "llm_dispatch" and
+       "llm_results" are in _tables(db).
+    2. llm_dispatch has exactly the columns: record_id, dispatched_at, status,
+       prompt_hash, attempts, last_error.
+    3. llm_results has exactly the columns: record_id, prompt_hash, model,
+       payload_json, input_tokens, output_tokens, created_at.
+    4. Idempotency: calling db._ensure_llm_dispatch_table() and
+       db._ensure_llm_results_table() again does not raise.
+    5. Migration path: drop both tables (DROP TABLE), then call the two
+       _ensure_* methods directly and assert both tables exist again.
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/tests/test_llm_db.py -q
+  Paste the full pytest output. Do not report done until green.
+
+DONE WHEN
+  - Both tables are created in create_tables() and in _is_valid() (read-write).
+  - CURRENT_DATABASE_VERSION is unchanged.
+  - All five test cases pass.
+========================================================================

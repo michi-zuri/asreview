@@ -286,6 +286,8 @@ class Database:
         self._ensure_tag_groups_table()
         self._ensure_tag_options_table()
         self._ensure_tags_table()
+        self._ensure_llm_dispatch_table()
+        self._ensure_llm_results_table()
 
     def _ensure_lists_table(self):
         """Create the ``lists`` table that stores per-record list items.
@@ -426,6 +428,62 @@ class Database:
         )
         self._conn.commit()
 
+    def _ensure_llm_dispatch_table(self):
+        """Create the ``llm_dispatch`` table (LLM screening queue).
+
+        One row per record that has been (or should be) sent to the LLM.
+        ``record_id`` is the primary key: a record has at most one dispatch
+        row, updated in place when it is re-queued. ``dispatched_at`` is a
+        unix timestamp (float, UTC instant) that defines the canonical
+        serving order. ``status`` is one of ``queued``, ``in_flight``,
+        ``ready``, ``failed``, ``missing_pdf``.
+
+        Idempotent (``CREATE TABLE IF NOT EXISTS``); safe on every
+        read-write open.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS llm_dispatch (
+                record_id INTEGER PRIMARY KEY,
+                dispatched_at REAL,
+                status TEXT NOT NULL,
+                prompt_hash TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )"""
+        )
+        cur.execute(
+            """CREATE INDEX IF NOT EXISTS idx_llm_dispatch_status_time
+               ON llm_dispatch(status, dispatched_at)"""
+        )
+        self._conn.commit()
+
+    def _ensure_llm_results_table(self):
+        """Create the ``llm_results`` table (cached LLM screening output).
+
+        Primary key ``(record_id, prompt_hash)`` so a prompt change
+        naturally invalidates the cache without deleting old rows.
+        ``payload_json`` is the raw LLM JSON; ``created_at`` is a unix
+        timestamp (float, UTC instant).
+
+        Idempotent (``CREATE TABLE IF NOT EXISTS``); safe on every
+        read-write open.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS llm_results (
+                record_id INTEGER NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                model TEXT,
+                payload_json TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                created_at REAL,
+                PRIMARY KEY (record_id, prompt_hash)
+            )"""
+        )
+        self._conn.commit()
+
     def _ensure_results_indexes(self):
         """Create indexes that speed up collection (labeled history) loading.
 
@@ -495,6 +553,8 @@ class Database:
             self._ensure_tag_groups_table()
             self._ensure_tag_options_table()
             self._ensure_tags_table()
+            self._ensure_llm_dispatch_table()
+            self._ensure_llm_results_table()
 
     def _fix_record_schema(self, cur):
         """Add columns introduced after the initial schema to the record table."""
