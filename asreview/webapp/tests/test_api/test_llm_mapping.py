@@ -372,3 +372,93 @@ def test_lists_form_none():
     }
     result = map_llm_payload_to_asreview(payload, TAGS, None)
     assert result["lists"] == []
+
+
+# --- build_prefill_state tests ---
+
+
+def test_build_prefill_state_tags_pass_through():
+    """Tags from mapper pass through unchanged."""
+    from asreview.webapp._api.llm_mapping import build_prefill_state
+
+    payload = {"labels": [], "lists": []}
+    tags_form = [
+        {
+            "id": "g1", "export": "quality", "label": "Quality",
+            "single_select": True, "values": [
+                {"id": "o1", "export": "high", "label": "High",
+                 "free_text": False},
+            ],
+        },
+    ]
+    lists_form = []
+    counter = [0]
+
+    def fake_uuid():
+        counter[0] += 1
+        return f"item-{counter[0]}"
+
+    result = build_prefill_state(payload, tags_form, lists_form,
+                                 uuid_fn=fake_uuid)
+    assert result == {"tags": [], "lists": []}
+
+
+def test_build_prefill_state_lists_gain_item_id():
+    """Each list item gets a deterministic string item_id."""
+    from asreview.webapp._api.llm_mapping import build_prefill_state
+
+    payload = {
+        "labels": [],
+        "lists": [
+            {"list": "issues", "items": ["bug", "feature"]},
+        ],
+    }
+    tags_form = []
+    lists_form = [
+        {"id": "l1", "name": "issues", "input_helper_text": ""},
+    ]
+    counter = [0]
+
+    def fake_uuid():
+        counter[0] += 1
+        return f"item-{counter[0]}"
+
+    result = build_prefill_state(payload, tags_form, lists_form,
+                                 uuid_fn=fake_uuid)
+    assert result["tags"] == []
+    assert result["lists"] == [
+        {"list_id": "l1", "name": "bug", "sorted_at": 0.0,
+         "item_id": "item-1"},
+        {"list_id": "l1", "name": "feature", "sorted_at": 1.0,
+         "item_id": "item-2"},
+    ]
+
+
+def test_build_prefill_state_tags_passthrough_with_lists():
+    """Tags from mapper are included alongside lists."""
+    from asreview.webapp._api.llm_mapping import build_prefill_state
+
+    payload = {
+        "labels": [
+            {"group": "quality", "values": [{"checked": "high"}]},
+        ],
+        "lists": [],
+    }
+    tags_form = [
+        {
+            "id": "g1", "export": "quality", "label": "Quality",
+            "single_select": False, "values": [
+                {"id": "o1", "export": "high", "label": "High",
+                 "free_text": False},
+            ],
+        },
+    ]
+    lists_form = []
+
+    result = build_prefill_state(payload, tags_form, lists_form)
+    assert result["tags"] == [
+        {"id": "g1", "values": [
+            {"id": "o1", "checked": True, "text": None},
+        ]},
+    ]
+    assert result["lists"] == []

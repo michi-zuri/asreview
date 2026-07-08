@@ -1,0 +1,231 @@
+========================================================================
+PHASE 3 — get_record state machine + top-up triggers + server-side
+          pre-fill + label-submission race guard
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: Phases 0, 1, 2 merged.
+
+GOAL
+  Wire the LLM machinery into record serving. Rewrite the get_record route to
+  the new checkout cascade, trigger dispatch top-up, report LLM status/meta,
+  and PRE-FILL the screening form server-side from the cached LLM result. Add a
+  race guard to the label-submission route.
+
+BEFORE WRITING ANYTHING — read
+  - asreview/webapp/_api/projects.py: api_get_record (~line 2172), api_label_record
+    (~2021), and the imports block. Note how it uses `with project.db as db:`,
+    asdict(db.input.get_records(id)), read_tags_data(db), read_lists_data(project),
+    db.get_lists(record_id), current_user, jsonify.
+  - Phase 1 DAO: get_pending, reassign_stale, checkout_oldest_dispatched,
+    query_top_ranked, top_up_dispatch, get_pool, get_last_ranking_table.
+  - asreview/webapp/_api/llm_prompt.py (build_system_prompt),
+    asreview/webapp/_api/llm_mapping.py (map_llm_payload_to_asreview),
+    asreview/database/database.py (uuid7).
+  - asreview/data/record.py: `included` column. Project config allows arbitrary
+    top-level keys (schema additionalProperties=True), so LLM settings live in
+    project.config["llm"].
+
+PART A — small DAO methods (asreview/database/database.py, near top_up_dispatch)
+
+  def get_llm_meta(self, record_id, prompt_hash):
+      """Return combined dispatch+result metadata for a record, or None.
+
+      Keys: status, dispatched_at, attempts, last_error (from llm_dispatch);
+      has_result (bool, whether an llm_results row exists for prompt_hash) and,
+      when present, model, input_tokens, output_tokens, created_at.
+      """
+      cur = self._conn.cursor()
+      d = cur.execute(
+          "SELECT status, dispatched_at, attempts, last_error "
+          "FROM llm_dispatch WHERE record_id = ?", (record_id,)
+      ).fetchone()
+      if d is None:
+          return None
+      meta = {"status": d[0], "dispatched_at": d[1], "attempts": d[2],
+              "last_error": d[3], "has_result": False}
+      r = cur.execute(
+          "SELECT model, input_tokens, output_tokens, created_at "
+          "FROM llm_results WHERE record_id = ? AND prompt_hash = ?",
+          (record_id, prompt_hash),
+      ).fetchone()
+      if r is not None:
+          meta.update(has_result=True, model=r[0], input_tokens=r[1],
+                      output_tokens=r[2], created_at=r[3])
+      return meta
+
+  def get_llm_payload(self, record_id, prompt_hash):
+      """Return the stored payload_json string for (record_id, prompt_hash) or None."""
+      cur = self._conn.cursor()
+      row = cur.execute(
+          "SELECT payload_json FROM llm_results WHERE record_id = ? AND prompt_hash = ?",
+          (record_id, prompt_hash),
+      ).fetchone()
+      return row[0] if row else None
+
+  def get_result_status(self, record_id):
+      """Return {'user_id', 'label'} for a record's results row, or None."""
+      cur = self._conn.cursor()
+      row = cur.execute(
+          "SELECT user_id, label FROM results WHERE record_id = ?", (record_id,)
+      ).fetchone()
+      return None if row is None else {"user_id": row[0], "label": row[1]}
+
+  Add DAO tests to tests/test_llm_db.py for all three.
+
+PART B — pure pre-fill helper (asreview/webapp/_api/llm_mapping.py)
+
+  Add (imports: `import uuid` at top):
+
+      def build_prefill_state(payload, tags_form, lists_form, uuid_fn=None):
+          """Turn an LLM payload into ready-to-render state.tags / state.lists.
+
+          Returns {"tags": [...], "lists": [...]}. List items get a synthetic
+          item_id (frontend key / future primary key) since the mapper omits it.
+          """
+          uuid_fn = uuid_fn or (lambda: uuid.uuid4().hex)
+          mapped = map_llm_payload_to_asreview(payload, tags_form, lists_form)
+          lists = [{**item, "item_id": uuid_fn()} for item in mapped["lists"]]
+          return {"tags": mapped["tags"], "lists": lists}
+
+  Add tests to asreview/webapp/tests/test_api/test_llm_mapping.py: verify tags
+  pass through and each list item gains a string item_id (inject a deterministic
+  uuid_fn to assert exact output).
+
+PART C — LLM settings helpers (asreview/webapp/_api/projects.py, module level)
+
+      DEFAULT_LLM_SETTINGS = {
+          "buffer_size": 20,
+          "max_concurrent_llm": 3,
+          "stale_timeout": 86400,   # 24h, seconds
+          "criteria_text": "",
+      }
+
+      def _llm_settings(project):
+          try:
+              cfg = project.config.get("llm", {}) or {}
+          except Exception:
+              cfg = {}
+          return {**DEFAULT_LLM_SETTINGS, **cfg}
+
+      def _current_prompt_hash(project):
+          """Build the current system prompt hash from tags/lists/criteria."""
+          tags = read_tags_data(project.db)
+          lists = read_lists_data(project)
+          _, prompt_hash = build_system_prompt(
+              tags, lists, _llm_settings(project)["criteria_text"]
+          )
+          return prompt_hash
+
+  Add the needed imports to projects.py:
+      from asreview.webapp._api.llm_prompt import build_system_prompt
+      from asreview.webapp._api.llm_mapping import build_prefill_state
+      from asreview.database.database import uuid7
+
+PART D — rewrite api_get_record (asreview/webapp/_api/projects.py)
+  Keep the existing "finished" early-return and the review/setup fallbacks.
+  Replace the pending/top-ranked block with this cascade:
+
+      settings = _llm_settings(project)
+      prompt_hash = _current_prompt_hash(project)   # BEFORE opening the with-block
+
+      with project.db as db:
+          pending = db.get_pending(user_id=user_id)
+          if pending.empty:
+              pending = db.reassign_stale(
+                  user_id=user_id, older_than=settings["stale_timeout"])
+          if pending.empty:
+              pending = db.checkout_oldest_dispatched(user_id=user_id)
+          if pending.empty:
+              try:
+                  pending = db.query_top_ranked(user_id=user_id)
+              except ValueError:
+                  ranking = db.get_last_ranking_table()
+                  pool = db.get_pool()
+                  db.top_up_dispatch(settings["buffer_size"], prompt_hash)
+                  if not ranking.empty and pool.empty:
+                      return jsonify({"result": None, "status": "review"})
+                  return jsonify({"result": None, "status": "setup"})
+
+          record_id = int(pending["record_id"].iloc[0])
+          item = asdict(db.input.get_records(record_id))
+          record_lists = db.get_lists(record_id)
+          tags_form = read_tags_data(db) or []
+          llm_meta = db.get_llm_meta(record_id, prompt_hash)
+          payload_json = db.get_llm_payload(record_id, prompt_hash)
+          db.top_up_dispatch(settings["buffer_size"], prompt_hash)
+
+      item["state"] = pending.iloc[0].to_dict()
+      item["state"]["lists"] = record_lists
+      item["tags_form"] = tags_form
+      item["lists_form"] = read_lists_data(project)
+      item["state"]["user"] = None
+      del item["state"]["user_id"]
+      item["llm"] = llm_meta   # None if never dispatched
+
+      # Server-side pre-fill: only when a result exists for the current prompt
+      # and the human has no saved input yet (no drafts in this fork).
+      if payload_json and not item["state"].get("tags") and not record_lists:
+          try:
+              prefill = build_prefill_state(
+                  json.loads(payload_json), tags_form, item["lists_form"],
+                  uuid_fn=lambda: uuid7())
+              item["state"]["tags"] = prefill["tags"]
+              item["state"]["lists"] = prefill["lists"]
+          except Exception:
+              logging.exception("LLM pre-fill failed for record %s", record_id)
+
+      # keep the existing get_review_error() try/except and final return
+      return jsonify({"result": item, "status": "review"})
+
+  IMPORTANT: buffer-miss logging. When the served record's llm_meta status is
+  not "ready" (LLM not finished), log at INFO:
+      logging.info("llm buffer-miss: served record %s with status=%s",
+                   record_id, (llm_meta or {}).get("status"))
+
+PART E — race guard in api_label_record (asreview/webapp/_api/projects.py)
+  Near the top of the `with project.db as db:` block, before labeling:
+
+      status = db.get_result_status(record_id)
+      if (status is not None and status["label"] is not None
+              and status["user_id"] != user_id):
+          logging.warning(
+              "Discarding late label for record %s from user %s "
+              "(already decided by user %s)",
+              record_id, user_id, status["user_id"])
+          return jsonify({
+              "discarded": True,
+              "message": ("This article was reassigned and has already been "
+                          "decided; your input was not saved."),
+          }), 200
+  Then proceed with the existing labeling logic unchanged. (A reassigned-but-
+  UNLABELED record is accepted; label_record/update_result set user_id to the
+  submitter, which takes over the checkout — the other user's next heartbeat
+  will report inactive, handled in Phases 4/5.)
+
+TESTS
+  - tests/test_llm_db.py: get_llm_meta (none / dispatched-only / with result),
+    get_llm_payload, get_result_status.
+  - asreview/webapp/tests/test_api/test_llm_mapping.py: build_prefill_state.
+  - Route-level tests: model these on existing tests in
+    asreview/webapp/tests/test_api/test_projects.py (reuse its client/project/
+    user fixtures from conftest.py). Cover at minimum:
+      * get_record returns item["llm"] and, when an llm_results row exists for
+        the current prompt_hash, item["state"]["tags"] is pre-filled.
+      * api_label_record returns {"discarded": True} when the record's results
+        row is already labeled by a different user.
+    If the full Flask fixture setup for a seeded, ranked project proves too
+    heavy, still deliver the DAO + build_prefill_state unit tests (they are the
+    core), and add the smallest viable route test you can.
+
+RUN
+  cd /Users/killi/Dev/asreview/asreview
+  devbox run -- python -m pytest tests/test_llm_db.py \
+      asreview/webapp/tests/test_api/test_llm_mapping.py -q
+  (plus any route test file you add). Paste output; do not report done until green.
+
+DONE WHEN
+  - get_record uses the new cascade, triggers top_up_dispatch, includes
+    item["llm"], and pre-fills state.tags/state.lists from the cached result.
+  - api_label_record discards late labels from other users with a clear notice.
+  - New DAO + build_prefill_state unit tests pass.
+========================================================================

@@ -1038,6 +1038,51 @@ class Database:
         con.commit()
         return row[0] if row else None
 
+    def get_llm_meta(self, record_id, prompt_hash):
+        """Return combined dispatch+result metadata for a record, or None.
+
+        Keys: status, dispatched_at, attempts, last_error (from llm_dispatch);
+        has_result (bool, whether an llm_results row exists for prompt_hash)
+        and, when present, model, input_tokens, output_tokens, created_at.
+        """
+        cur = self._conn.cursor()
+        d = cur.execute(
+            "SELECT status, dispatched_at, attempts, last_error "
+            "FROM llm_dispatch WHERE record_id = ?", (record_id,)
+        ).fetchone()
+        if d is None:
+            return None
+        meta = {"status": d[0], "dispatched_at": d[1], "attempts": d[2],
+                "last_error": d[3], "has_result": False}
+        r = cur.execute(
+            "SELECT model, input_tokens, output_tokens, created_at "
+            "FROM llm_results WHERE record_id = ? AND prompt_hash = ?",
+            (record_id, prompt_hash),
+        ).fetchone()
+        if r is not None:
+            meta.update(has_result=True, model=r[0], input_tokens=r[1],
+                        output_tokens=r[2], created_at=r[3])
+        return meta
+
+    def get_llm_payload(self, record_id, prompt_hash):
+        """Return stored payload_json for (record_id, prompt_hash) or None."""
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT payload_json FROM llm_results "
+            "WHERE record_id = ? AND prompt_hash = ?",
+            (record_id, prompt_hash),
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_result_status(self, record_id):
+        """Return {'user_id', 'label'} for a record's results row, or None."""
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT user_id, label FROM results WHERE record_id = ?",
+            (record_id,),
+        ).fetchone()
+        return None if row is None else {"user_id": row[0], "label": row[1]}
+
     def checkout_oldest_dispatched(self, user_id):
         """Check out the oldest dispatched, not-yet-assigned record.
 

@@ -427,3 +427,72 @@ def test_increment_dispatch_attempts(db_pool):
     db_pool.top_up_dispatch(3, "H")
     assert db_pool.increment_dispatch_attempts(1) == 1
     assert db_pool.increment_dispatch_attempts(1) == 2
+
+
+# --- Phase 3 DAO tests ---
+
+
+def test_get_llm_meta_none(db_pool):
+    """get_llm_meta returns None when the record was never dispatched."""
+    assert db_pool.get_llm_meta(0, "H") is None
+
+
+def test_get_llm_meta_dispatched_only(db_pool):
+    """get_llm_meta returns dispatch info but has_result=False when no result."""
+    db_pool.top_up_dispatch(3, "H")
+    meta = db_pool.get_llm_meta(0, "H")
+    assert meta is not None
+    assert meta["status"] == "queued"
+    assert isinstance(meta["dispatched_at"], float)
+    assert meta["attempts"] == 0
+    assert meta["last_error"] is None
+    assert meta["has_result"] is False
+
+
+def test_get_llm_meta_with_result(db_pool):
+    """get_llm_meta returns has_result=True + result fields when result exists."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "H", "claude-opus-4-8", '{"labels":[]}', 10, 20)
+    meta = db_pool.get_llm_meta(0, "H")
+    assert meta is not None
+    assert meta["has_result"] is True
+    assert meta["model"] == "claude-opus-4-8"
+    assert meta["input_tokens"] == 10
+    assert meta["output_tokens"] == 20
+    assert isinstance(meta["created_at"], float)
+
+
+def test_get_llm_payload(db_pool):
+    """get_llm_payload returns payload_json or None."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    assert db_pool.get_llm_payload(0, "H") is None
+    db_pool.store_llm_result(0, "H", "claude-opus-4-8", '{"labels":[]}', 10, 20)
+    assert db_pool.get_llm_payload(0, "H") == '{"labels":[]}'
+
+
+def test_get_result_status_none(db_pool):
+    """get_result_status returns None when no results row exists."""
+    assert db_pool.get_result_status(0) is None
+
+
+def test_get_result_status_pending(db_pool):
+    """get_result_status returns user_id but label=None for pending checkout."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    status = db_pool.get_result_status(0)
+    assert status is not None
+    assert status["user_id"] == 1
+    assert status["label"] is None
+
+
+def test_get_result_status_labeled(db_pool):
+    """get_result_status returns both user_id and label for a labeled record."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    db_pool.label_record(0, 1, user_id=1)
+    status = db_pool.get_result_status(0)
+    assert status is not None
+    assert status["user_id"] == 1
+    assert status["label"] == 1

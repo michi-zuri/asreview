@@ -75,6 +75,8 @@ from asreview.project.migration import detect_version
 from asreview.project.migration import migrate_project
 from asreview.utils import _get_filename_from_url
 from asreview.webapp import DB
+from asreview.webapp._api.llm_mapping import build_prefill_state
+from asreview.webapp._api.llm_prompt import build_system_prompt
 from asreview.webapp._api.utils import get_all_model_components
 from asreview.webapp._api.utils import read_lists_data
 from asreview.webapp._api.utils import read_tags_data
@@ -104,6 +106,31 @@ except importlib.metadata.PackageNotFoundError:
 
 
 bp = Blueprint("api", __name__, url_prefix="/api")
+
+DEFAULT_LLM_SETTINGS = {
+    "buffer_size": 20,
+    "max_concurrent_llm": 3,
+    "stale_timeout": 86400,   # 24h, seconds
+    "criteria_text": "",
+}
+
+
+def _llm_settings(project):
+    try:
+        cfg = project.config.get("llm", {}) or {}
+    except Exception:
+        cfg = {}
+    return {**DEFAULT_LLM_SETTINGS, **cfg}
+
+
+def _current_prompt_hash(project):
+    """Build the current system prompt hash from tags/lists/criteria."""
+    tags = read_tags_data(project.db)
+    lists = read_lists_data(project)
+    _, prompt_hash = build_system_prompt(
+        tags, lists, _llm_settings(project)["criteria_text"]
+    )
+    return prompt_hash
 
 
 def _fill_last_ranking(project, ranking):
@@ -2046,6 +2073,19 @@ def api_label_record(project, record_id):  # noqa: F401
     )
 
     with project.db as db:
+        status = db.get_result_status(record_id)
+        if (status is not None and status["label"] is not None
+                and status["user_id"] != user_id):
+            logging.warning(
+                "Discarding late label for record %s from user %s "
+                "(already decided by user %s)",
+                record_id, user_id, status["user_id"])
+            return jsonify({
+                "discarded": True,
+                "message": ("This article was reassigned and has already been "
+                            "decided; your input was not saved."),
+            }), 200
+
         if request.method == "PUT":
             db.update_result(record_id, label=label, tags=tags, user_id=user_id)
         else:
@@ -2182,32 +2222,58 @@ def api_get_record(project):  # noqa: F401
     if project.config["review"]["status"] == "finished":
         return jsonify({"result": None, "status": "finished"})
 
+    settings = _llm_settings(project)
+    prompt_hash = _current_prompt_hash(project)
+
     with project.db as db:
         pending = db.get_pending(user_id=user_id)
-
+        if pending.empty:
+            pending = db.reassign_stale(
+                user_id=user_id, older_than=settings["stale_timeout"])
+        if pending.empty:
+            pending = db.checkout_oldest_dispatched(user_id=user_id)
         if pending.empty:
             try:
                 pending = db.query_top_ranked(user_id=user_id)
             except ValueError:
                 ranking = db.get_last_ranking_table()
                 pool = db.get_pool()
-
+                db.top_up_dispatch(settings["buffer_size"], prompt_hash)
                 if not ranking.empty and pool.empty:
                     return jsonify({"result": None, "status": "review"})
-                else:
-                    return jsonify({"result": None, "status": "setup"})
+                return jsonify({"result": None, "status": "setup"})
 
         record_id = int(pending["record_id"].iloc[0])
         item = asdict(db.input.get_records(record_id))
         record_lists = db.get_lists(record_id)
+        tags_form = read_tags_data(db) or []
+        llm_meta = db.get_llm_meta(record_id, prompt_hash)
+        payload_json = db.get_llm_payload(record_id, prompt_hash)
+        db.top_up_dispatch(settings["buffer_size"], prompt_hash)
 
     item["state"] = pending.iloc[0].to_dict()
     item["state"]["lists"] = record_lists
-    with project.db as tmp_db:
-        item["tags_form"] = read_tags_data(tmp_db) or []
+    item["tags_form"] = tags_form
     item["lists_form"] = read_lists_data(project)
     item["state"]["user"] = None
     del item["state"]["user_id"]
+    item["llm"] = llm_meta
+
+    # Server-side pre-fill: only when a result exists for the current prompt
+    # and the human has no saved input yet.
+    if payload_json and not item["state"].get("tags") and not record_lists:
+        try:
+            prefill = build_prefill_state(
+                json.loads(payload_json), tags_form, item["lists_form"],
+                uuid_fn=lambda: uuid7())
+            item["state"]["tags"] = prefill["tags"]
+            item["state"]["lists"] = prefill["lists"]
+        except Exception:
+            logging.exception("LLM pre-fill failed for record %s", record_id)
+
+    if llm_meta is None or llm_meta.get("status") != "ready":
+        logging.info("llm buffer-miss: served record %s with status=%s",
+                     record_id, (llm_meta or {}).get("status"))
 
     try:
         item["error"] = project.get_review_error()

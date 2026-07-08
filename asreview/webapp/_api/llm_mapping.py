@@ -15,6 +15,7 @@
 """Map LLM screening payloads to ASReview tag/list structures."""
 
 import logging
+import uuid
 
 
 def map_llm_payload_to_asreview(payload, tags_form, lists_form):
@@ -247,3 +248,15 @@ def _map_lists(payload, list_lookup):
             item_index += 1
 
     return lists_out
+
+
+def build_prefill_state(payload, tags_form, lists_form, uuid_fn=None):
+    """Turn an LLM payload into ready-to-render state.tags / state.lists.
+
+    Returns ``{"tags": [...], "lists": [...]}``. List items get a synthetic
+    ``item_id`` (frontend key / future primary key) since the mapper omits it.
+    """
+    uuid_fn = uuid_fn or (lambda: uuid.uuid4().hex)
+    mapped = map_llm_payload_to_asreview(payload, tags_form, lists_form)
+    lists = [{**item, "item_id": uuid_fn()} for item in mapped["lists"]]
+    return {"tags": mapped["tags"], "lists": lists}
