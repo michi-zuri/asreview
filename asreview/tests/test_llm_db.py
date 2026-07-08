@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 import asreview as asr
+from asreview.data.record import Record
 
 
 @pytest.fixture
@@ -10,6 +11,16 @@ def db(tmp_path):
     with asr.Database(Path(tmp_path, "test.db")) as db:
         db.create_tables()
         yield db
+
+
+@pytest.fixture
+def db_pool(db):
+    # 6 standalone records (record_id == group_id); rank all of them.
+    db.input.add_records([Record(i, "d") for i in range(6)])
+    db.add_last_ranking(
+        [0, 1, 2, 3, 4, 5], "nb", "max", "balanced", "tfidf", 0
+    )
+    return db
 
 
 def _tables(db):
@@ -23,6 +34,14 @@ def _tables(db):
 def _columns(db, table):
     cur = db._conn.cursor()
     return [r[1] for r in cur.execute(f"PRAGMA table_info({table})")]
+
+
+def _dispatch_rows(db):
+    cur = db._conn.cursor()
+    return cur.execute(
+        "SELECT record_id, status, prompt_hash FROM llm_dispatch "
+        "ORDER BY dispatched_at"
+    ).fetchall()
 
 
 def test_tables_created(db):
@@ -98,3 +117,89 @@ def test_fix_results_schema_idempotent(db):
     cols = _columns(db, "results")
     assert cols.count("assigned_at") == 1
     assert cols.count("last_active") == 1
+
+
+def test_top_up_basic(db_pool):
+    """top_up_dispatch(3, 'H') inserts 3 queued rows in ranking order."""
+    n = db_pool.top_up_dispatch(3, "H")
+    assert n == 3
+    rows = _dispatch_rows(db_pool)
+    assert rows == [
+        (0, "queued", "H"),
+        (1, "queued", "H"),
+        (2, "queued", "H"),
+    ]
+
+
+def test_top_up_deficit_respected(db_pool):
+    """Second call with same buffer_size adds nothing."""
+    db_pool.top_up_dispatch(3, "H")
+    n = db_pool.top_up_dispatch(3, "H")
+    assert n == 0
+    assert len(_dispatch_rows(db_pool)) == 3
+
+
+def test_top_up_grow_buffer(db_pool):
+    """Growing buffer_size tops up with the next pooled records."""
+    db_pool.top_up_dispatch(3, "H")
+    n = db_pool.top_up_dispatch(5, "H")
+    assert n == 2
+    rows = _dispatch_rows(db_pool)
+    assert len(rows) == 5
+    assert (3, "queued", "H") in rows
+    assert (4, "queued", "H") in rows
+
+
+def test_top_up_skips_prior_irrelevant(db):
+    """Records with included==0 are skipped."""
+    db.input.add_records([
+        Record(0, "d", included=None),
+        Record(1, "d", included=0),
+        Record(2, "d", included=None),
+        Record(3, "d", included=None),
+    ])
+    db.add_last_ranking(
+        [0, 1, 2, 3], "nb", "max", "balanced", "tfidf", 0
+    )
+    n = db.top_up_dispatch(10, "H")
+    assert n == 3
+    dispatched = [r[0] for r in _dispatch_rows(db)]
+    assert 1 not in dispatched
+    assert dispatched == [0, 2, 3]
+
+
+def test_top_up_cache_hit_ready(db_pool):
+    """Existing llm_results row produces status 'ready'."""
+    cur = db_pool._conn.cursor()
+    cur.execute(
+        "INSERT INTO llm_results(record_id, prompt_hash, created_at) "
+        "VALUES (0, 'H', 0.0)"
+    )
+    db_pool._conn.commit()
+
+    n = db_pool.top_up_dispatch(3, "H")
+    assert n == 3
+    rows = _dispatch_rows(db_pool)
+    row0 = next(r for r in rows if r[0] == 0)
+    assert row0[1] == "ready"
+    row1 = next(r for r in rows if r[0] == 1)
+    assert row1[1] == "queued"
+    row2 = next(r for r in rows if r[0] == 2)
+    assert row2[1] == "queued"
+
+
+def test_top_up_checked_out_not_re_dispatched(db_pool):
+    """Checked-out records are excluded from active count; deficit refill works."""
+    db_pool.top_up_dispatch(3, "H")
+    cur = db_pool._conn.cursor()
+    cur.execute(
+        "INSERT INTO results(record_id, user_id) VALUES (0, 1)"
+    )
+    db_pool._conn.commit()
+
+    n = db_pool.top_up_dispatch(3, "H")
+    assert n == 1
+    rows = _dispatch_rows(db_pool)
+    dispatched_ids = [r[0] for r in rows]
+    assert 0 in dispatched_ids  # still in dispatch table
+    assert 3 in dispatched_ids  # the new top-up record

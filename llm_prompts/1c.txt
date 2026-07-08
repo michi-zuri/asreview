@@ -1,0 +1,155 @@
+========================================================================
+TASK 1c — DAO: top_up_dispatch(buffer_size, prompt_hash)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: tasks 1a and 1b already merged.
+
+GOAL
+  Add ONE method, top_up_dispatch, to the Database class in
+  asreview/database/database.py. It refills the LLM dispatch queue up to
+  ``buffer_size`` by inserting rows into ``llm_dispatch``, drawn from the pool
+  in ranking order. It inserts rows ONLY — it never performs any LLM/network
+  work.
+
+BEFORE WRITING ANYTHING — read
+  In asreview/database/database.py:
+    - get_pool(self): shows how the pool is defined (records in last_ranking
+      with no results row, group representatives only, ordered by ranking).
+    - query_top_ranked(self): shows the record/group/results relationship and
+      the self.record_table_name interpolation style.
+    - The `record` table has an ``included`` column (0 = prior irrelevant,
+      1 = prior relevant, NULL = no prior). Confirm via asreview/data/record.py.
+  Note: MODEL_COLUMNS and `time` (module) are already available in this file.
+
+WHAT TO IMPLEMENT
+  Add this method (place it near query_top_ranked):
+
+      def top_up_dispatch(self, buffer_size, prompt_hash):
+          """Refill the LLM dispatch queue up to ``buffer_size``.
+
+          Inserts the next needed records into ``llm_dispatch`` from the pool,
+          in ranking order, skipping records that are prior-irrelevant
+          (``record.included == 0``) and records already in the queue. A
+          candidate that already has a cached ``llm_results`` row for
+          ``prompt_hash`` is inserted with status ``ready`` (cache hit);
+          otherwise status ``queued``. Inserts rows only; performs no LLM work.
+
+          Parameters
+          ----------
+          buffer_size : int
+              Desired number of not-yet-checked-out dispatch rows.
+          prompt_hash : str
+              Hash of the current assembled system prompt.
+
+          Returns
+          -------
+          int
+              Number of rows inserted.
+          """
+          con = self._conn
+          cur = con.cursor()
+
+          # Active buffer = dispatch rows not yet checked out (checkout creates
+          # a results row for the record).
+          active = cur.execute(
+              """SELECT COUNT(*) FROM llm_dispatch
+                 WHERE status IN ('queued', 'in_flight', 'ready')
+                   AND record_id NOT IN (SELECT record_id FROM results)"""
+          ).fetchone()[0]
+
+          deficit = buffer_size - active
+          if deficit <= 0:
+              return 0
+
+          candidates = cur.execute(
+              f"""SELECT lr.record_id
+                  FROM last_ranking lr
+                  JOIN {self.record_table_name} rec ON rec.record_id = lr.record_id
+                  LEFT JOIN results r ON r.record_id = lr.record_id
+                  WHERE r.record_id IS NULL
+                    AND (rec.included IS NULL OR rec.included != 0)
+                    AND lr.record_id IN (
+                        SELECT group_id FROM {self.record_table_name}
+                    )
+                    AND lr.record_id NOT IN (SELECT record_id FROM llm_dispatch)
+                  ORDER BY lr.ranking
+                  LIMIT ?""",
+              (deficit,),
+          ).fetchall()
+
+          base = time.time()
+          inserted = 0
+          for i, (record_id,) in enumerate(candidates):
+              has_result = cur.execute(
+                  "SELECT 1 FROM llm_results "
+                  "WHERE record_id = ? AND prompt_hash = ? LIMIT 1",
+                  (record_id, prompt_hash),
+              ).fetchone()
+              status = "ready" if has_result else "queued"
+              cur.execute(
+                  """INSERT INTO llm_dispatch
+                     (record_id, dispatched_at, status, prompt_hash,
+                      attempts, last_error)
+                     VALUES (?, ?, ?, ?, 0, NULL)""",
+                  (record_id, base + i * 1e-6, status, prompt_hash),
+              )
+              inserted += 1
+
+          con.commit()
+          return inserted
+
+  Change no other file.
+
+TEST (write this, then run it)
+  Append to asreview/tests/test_llm_db.py. Add this fixture if not already
+  present (reuse it in later tasks):
+
+      from asreview.data.record import Record
+
+      @pytest.fixture
+      def db_pool(db):
+          # 6 standalone records (record_id == group_id); rank all of them.
+          db.input.add_records([Record(i, "d") for i in range(6)])
+          db.add_last_ranking(
+              [0, 1, 2, 3, 4, 5], "nb", "max", "balanced", "tfidf", 0
+          )
+          return db
+
+      def _dispatch_rows(db):
+          cur = db._conn.cursor()
+          return cur.execute(
+              "SELECT record_id, status, prompt_hash FROM llm_dispatch "
+              "ORDER BY dispatched_at"
+          ).fetchall()
+
+  Cover:
+    1. Basic top-up: db_pool.top_up_dispatch(3, "H") returns 3; _dispatch_rows
+       are records [0,1,2] in that order, all status "queued", prompt_hash "H".
+    2. Deficit respected: calling top_up_dispatch(3, "H") again returns 0 (queue
+       already full) and does not add rows.
+    3. Grow buffer: then top_up_dispatch(5, "H") returns 2 and adds records
+       [3,4] as "queued", preserving ranking order after [0,1,2].
+    4. Prior-irrelevant skipped: build a fresh db where records 0..3 exist and
+       record 1 has included == 0 (Record(1, "d", included=0)); rank [0,1,2,3];
+       top_up_dispatch(10, "H") dispatches [0,2,3] only (1 is skipped).
+    5. Cache hit -> ready: in a fresh db_pool, INSERT a llm_results row for
+       (record_id=0, prompt_hash="H") via raw SQL
+       (INSERT INTO llm_results(record_id, prompt_hash, created_at)
+        VALUES (0, 'H', 0.0)), then top_up_dispatch(3, "H"); record 0's status
+       is "ready" while records 1 and 2 are "queued".
+    6. Already checked out is not re-dispatched and counts against nothing new:
+       after a top-up, insert a results row for record 0 (raw SQL:
+       INSERT INTO results(record_id, user_id) VALUES (0, 1)); a subsequent
+       top_up_dispatch(3, "H") sees active buffer = 2 (record 0 excluded) and
+       tops up by 1 with the next pooled record.
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/tests/test_llm_db.py -q
+  Paste the full pytest output. Do not report done until green.
+
+DONE WHEN
+  - top_up_dispatch exists as specified, inserts rows only, and changes no
+    other file.
+  - All six test cases pass (and earlier LLM-db tests still pass).
+========================================================================

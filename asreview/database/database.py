@@ -877,6 +877,80 @@ class Database:
             raise ValueError("Failed to query top ranked record")
         return self.get_pending(user_id=user_id)
 
+    def top_up_dispatch(self, buffer_size, prompt_hash):
+        """Refill the LLM dispatch queue up to ``buffer_size``.
+
+        Inserts the next needed records into ``llm_dispatch`` from the pool,
+        in ranking order, skipping records that are prior-irrelevant
+        (``record.included == 0``) and records already in the queue. A
+        candidate that already has a cached ``llm_results`` row for
+        ``prompt_hash`` is inserted with status ``ready`` (cache hit);
+        otherwise status ``queued``. Inserts rows only; performs no LLM work.
+
+        Parameters
+        ----------
+        buffer_size : int
+            Desired number of not-yet-checked-out dispatch rows.
+        prompt_hash : str
+            Hash of the current assembled system prompt.
+
+        Returns
+        -------
+        int
+            Number of rows inserted.
+        """
+        con = self._conn
+        cur = con.cursor()
+
+        # Active buffer = dispatch rows not yet checked out (checkout creates
+        # a results row for the record).
+        active = cur.execute(
+            """SELECT COUNT(*) FROM llm_dispatch
+               WHERE status IN ('queued', 'in_flight', 'ready')
+                 AND record_id NOT IN (SELECT record_id FROM results)"""
+        ).fetchone()[0]
+
+        deficit = buffer_size - active
+        if deficit <= 0:
+            return 0
+
+        candidates = cur.execute(
+            f"""SELECT lr.record_id
+                FROM last_ranking lr
+                JOIN {self.record_table_name} rec ON rec.record_id = lr.record_id
+                LEFT JOIN results r ON r.record_id = lr.record_id
+                WHERE r.record_id IS NULL
+                  AND (rec.included IS NULL OR rec.included != 0)
+                  AND lr.record_id IN (
+                      SELECT group_id FROM {self.record_table_name}
+                  )
+                  AND lr.record_id NOT IN (SELECT record_id FROM llm_dispatch)
+                ORDER BY lr.ranking
+                LIMIT ?""",
+            (deficit,),
+        ).fetchall()
+
+        base = time.time()
+        inserted = 0
+        for i, (record_id,) in enumerate(candidates):
+            has_result = cur.execute(
+                "SELECT 1 FROM llm_results "
+                "WHERE record_id = ? AND prompt_hash = ? LIMIT 1",
+                (record_id, prompt_hash),
+            ).fetchone()
+            status = "ready" if has_result else "queued"
+            cur.execute(
+                """INSERT INTO llm_dispatch
+                   (record_id, dispatched_at, status, prompt_hash,
+                    attempts, last_error)
+                   VALUES (?, ?, ?, ?, 0, NULL)""",
+                (record_id, base + i * 1e-6, status, prompt_hash),
+            )
+            inserted += 1
+
+        con.commit()
+        return inserted
+
     def update_result(self, record_id, label=None, tags=None, user_id=None):
         if label is None and tags is None:
             raise ValueError("At least one of 'label' or 'tags' must be provided.")
