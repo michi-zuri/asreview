@@ -18,9 +18,14 @@ REPOSITORY LAYOUT (this is the git root)
       asreview/webapp/_api/projects.py         Flask routes (get_record, labeling, etc.)
       asreview/webapp/_api/zotero.py           Zotero attachment lookup
       asreview/webapp/_api/utils.py            read_tags_data, read_lists_data
-  Tests live under:
-      asreview/webapp/tests/test_api/          Flask/API tests (pytest)
-      tests/                                    package-level unit tests (pytest)
+  Tests live under (RELATIVE TO THE GIT ROOT above):
+      tests/                                   package-level unit tests
+                                               (database, data, records, etc.)
+      asreview/webapp/tests/test_api/          Flask/API + webapp helper tests
+    Put DB-layer / core-library tests in  tests/<name>.py  (NOT
+    asreview/tests/ — that directory does not exist and breaks `import
+    asreview`). Put webapp/_api helper tests in
+    asreview/webapp/tests/test_api/<name>.py .
 
 HARD RULES
   1. READ every file named in the task IN FULL before writing anything.
@@ -68,8 +73,13 @@ FACTS ABOUT THIS CODEBASE (verified — trust these over your assumptions)
   - This fork targets MULTI-USER server installs (AUTHENTICATION=True).
 
 HOW TO RUN TESTS
-  From the git root (/Users/killi/Dev/asreview/asreview):
-      pytest <path to the test file> -q
+  pandas and other deps come from nix via devbox (they are NOT in the plain
+  .venv, and bare `python` is not on PATH). ALWAYS run tests through devbox
+  from the git root:
+      cd /Users/killi/Dev/asreview/asreview
+      devbox run -- python -m pytest tests/<file>.py -q
+  (For webapp tests: devbox run -- python -m pytest
+   asreview/webapp/tests/test_api/<file>.py -q)
   Run only the test you added/changed; do not run the whole suite.
 ========================================================================
 
