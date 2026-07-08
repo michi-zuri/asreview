@@ -1206,6 +1206,25 @@ class Database:
             return self.get_pending(user_id=user_id).iloc[0:0]
         return self.get_pending(user_id=user_id)
 
+    def touch_last_active(self, record_id, user_id):
+        """Bump last_active for a user's pending checkout of a record.
+
+        Returns True if the record is still checked out to this user (a
+        pending results row with label IS NULL and matching user_id existed
+        and was updated); otherwise False.
+        """
+        now = time.time()
+        con = self._conn
+        cur = con.cursor()
+        row = cur.execute(
+            "UPDATE results SET last_active = ? "
+            "WHERE record_id = ? AND user_id = ? AND label IS NULL "
+            "RETURNING record_id",
+            (now, record_id, user_id),
+        ).fetchone()
+        con.commit()
+        return row is not None
+
     def update_result(self, record_id, label=None, tags=None, user_id=None):
         if label is None and tags is None:
             raise ValueError("At least one of 'label' or 'tags' must be provided.")

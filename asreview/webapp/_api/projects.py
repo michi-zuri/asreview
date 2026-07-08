@@ -2123,6 +2123,21 @@ def api_label_record(project, record_id):  # noqa: F401
         return jsonify({"result": item})
 
 
+@bp.route("/projects/<project_id>/record/<record_id>/heartbeat",
+          methods=["POST"])
+@login_required
+@project_authorization
+def api_record_heartbeat(project, record_id):  # noqa: F401
+    """Liveness ping for an open record. Returns {"active": bool}."""
+    user_id = (
+        current_user.id
+        if current_app.config.get("AUTHENTICATION", True) else None
+    )
+    with project.db as db:
+        active = db.touch_last_active(int(record_id), user_id)
+    return jsonify({"active": active})
+
+
 @bp.route("/projects/<project_id>/record/<record_id>/note", methods=["PUT"])
 @login_required
 @project_authorization

@@ -496,3 +496,45 @@ def test_get_result_status_labeled(db_pool):
     assert status is not None
     assert status["user_id"] == 1
     assert status["label"] == 1
+
+
+# --- Phase 4: touch_last_active tests ---
+
+
+def _last_active(db, record_id):
+    cur = db._conn.cursor()
+    return cur.execute(
+        "SELECT last_active FROM results WHERE record_id = ?", (record_id,)
+    ).fetchone()[0]
+
+
+def test_touch_last_active_fresh(db_pool):
+    """Backdated last_active is refreshed; returns True."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    _set_last_active(db_pool, 0, time_module.time() - 10000)
+    old = _last_active(db_pool, 0)
+
+    assert db_pool.touch_last_active(0, 1) is True
+    new = _last_active(db_pool, 0)
+    assert new > old
+
+
+def test_touch_last_active_wrong_user(db_pool):
+    """Different user: returns False, last_active unchanged."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    _set_last_active(db_pool, 0, time_module.time() - 10000)
+    old = _last_active(db_pool, 0)
+
+    assert db_pool.touch_last_active(0, 2) is False
+    assert _last_active(db_pool, 0) == old
+
+
+def test_touch_last_active_labeled(db_pool):
+    """Already labeled: returns False."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    db_pool.label_record(0, 1, user_id=1)
+
+    assert db_pool.touch_last_active(0, 1) is False

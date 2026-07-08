@@ -1,0 +1,81 @@
+========================================================================
+PHASE 4 — Heartbeat endpoint (liveness for stale reassignment)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: Phases 1 and 3 merged.
+
+GOAL
+  Add the backend heartbeat endpoint that keeps a reviewer's checkout "fresh".
+  While an article is open, the frontend (Phase 5) POSTs a heartbeat every 60s.
+  If the record is still checked out to this user, bump last_active and reply
+  {active: true}; otherwise reply {active: false} so the frontend discards its
+  view and fetches a new record.
+
+  NOTE: there are NO drafts in this fork (decided). The heartbeat carries NO
+  draft state — it is purely a liveness ping that bumps last_active.
+
+BEFORE WRITING ANYTHING — read
+  - asreview/webapp/_api/projects.py: api_update_note (~2086) as a template for a
+    small per-record POST/PUT route (decorators @login_required,
+    @project_authorization, how it derives user_id and uses `with project.db`).
+  - asreview/database/database.py: reassign_stale (uses last_active) and the
+    results columns assigned_at / last_active (Phase 1b).
+
+PART A — DAO method (asreview/database/database.py, near reassign_stale)
+
+      def touch_last_active(self, record_id, user_id):
+          """Bump last_active for a user's pending checkout of a record.
+
+          Returns True if the record is still checked out to this user (a
+          pending results row with label IS NULL and matching user_id existed
+          and was updated); otherwise False.
+          """
+          now = time.time()
+          con = self._conn
+          cur = con.cursor()
+          row = cur.execute(
+              "UPDATE results SET last_active = ? "
+              "WHERE record_id = ? AND user_id = ? AND label IS NULL "
+              "RETURNING record_id",
+              (now, record_id, user_id),
+          ).fetchone()
+          con.commit()
+          return row is not None
+
+  Add DAO tests to tests/test_llm_db.py:
+    1. Fresh checkout: after checkout_oldest_dispatched(user_id=1), a backdated
+       last_active is refreshed by touch_last_active(record_id, 1) -> returns
+       True and last_active is close to now.
+    2. Wrong user: touch_last_active(record_id, 2) returns False and does not
+       change last_active.
+    3. Already labeled: after labeling the record, touch_last_active(record_id,
+       1) returns False (no pending row).
+
+PART B — route (asreview/webapp/_api/projects.py)
+
+      @bp.route("/projects/<project_id>/record/<record_id>/heartbeat",
+                methods=["POST"])
+      @login_required
+      @project_authorization
+      def api_record_heartbeat(project, record_id):  # noqa: F401
+          """Liveness ping for an open record. Returns {"active": bool}."""
+          user_id = (
+              current_user.id
+              if current_app.config.get("AUTHENTICATION", True) else None
+          )
+          with project.db as db:
+              active = db.touch_last_active(int(record_id), user_id)
+          return jsonify({"active": active})
+
+  (The frontend integration — a 60s poll and reacting to active:false — is in
+   Phase 5. This phase is backend only.)
+
+RUN
+  cd /Users/killi/Dev/asreview/asreview
+  devbox run -- python -m pytest tests/test_llm_db.py -q
+  Paste output; do not report done until green.
+
+DONE WHEN
+  - touch_last_active exists and its three DAO tests pass.
+  - The heartbeat route is added following the existing route conventions.
+========================================================================
