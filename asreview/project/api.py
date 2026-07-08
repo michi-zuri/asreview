@@ -105,7 +105,7 @@ class Project:
     `asreview/state` for information on the model and the labeling decisions.
     """
 
-    VERSION = 3
+    VERSION = 4
     MODE_SIMULATE = "simulate"
     PATH_CONFIG = "project.json"
     PATH_CONFIG_LOCK = "project.json.lock"

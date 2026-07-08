@@ -418,8 +418,8 @@ def test_label_with_lists(client, project):
     record_id = search.json["result"][0]["record_id"]
 
     items = [
-        {"list_id": "L1", "item_id": "i1", "name": "alpha", "created": 1.0},
-        {"list_id": "L1", "item_id": "i2", "name": "beta", "created": 2.0},
+        {"list_id": "L1", "item_id": "i1", "name": "alpha", "sorted_at": 1.0},
+        {"list_id": "L1", "item_id": "i2", "name": "beta", "sorted_at": 2.0},
     ]
     r = client.post(
         f"/api/projects/{project_id}/record/{record_id}",
@@ -431,7 +431,7 @@ def test_label_with_lists(client, project):
     record = next(
         rec for rec in labeled.json["result"] if rec["record_id"] == record_id
     )
-    # Ordered by created timestamp.
+    # Ordered by sorted_at timestamp.
     names = [item["name"] for item in record["state"]["lists"]]
     assert names == ["alpha", "beta"]
     # No lists.json configured for this project, so lists_form is None.
@@ -446,7 +446,7 @@ def test_label_with_invalid_list_name(client, project):
     record_id = search.json["result"][0]["record_id"]
 
     items = [
-        {"list_id": "L1", "item_id": "i1", "name": "a,b", "created": 1.0},
+        {"list_id": "L1", "item_id": "i1", "name": "a,b", "sorted_at": 1.0},
     ]
     r = client.post(
         f"/api/projects/{project_id}/record/{record_id}",
@@ -463,8 +463,8 @@ def test_label_with_duplicate_list_name(client, project):
     record_id = search.json["result"][0]["record_id"]
 
     items = [
-        {"list_id": "L1", "item_id": "i1", "name": "same", "created": 1.0},
-        {"list_id": "L1", "item_id": "i2", "name": "same", "created": 2.0},
+        {"list_id": "L1", "item_id": "i1", "name": "same", "sorted_at": 1.0},
+        {"list_id": "L1", "item_id": "i2", "name": "same", "sorted_at": 2.0},
     ]
     r = client.post(
         f"/api/projects/{project_id}/record/{record_id}",

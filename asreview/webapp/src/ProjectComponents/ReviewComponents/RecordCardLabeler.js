@@ -99,9 +99,19 @@ const groupRequirementMet = (group, label) => {
   if (!groupRequiredForLabel(group, label)) return true;
   const values = group.values || [];
   if (groupRequiresAll(group)) {
-    return values.length > 0 && values.every((t) => t.checked);
+    return (
+      values.length > 0 &&
+      values.every(
+        (t) =>
+          t.checked &&
+          (!t.free_text_required || (t.text && t.text.trim() !== "")),
+      )
+    );
   }
-  return values.some((t) => t.checked);
+  return values.some(
+    (t) =>
+      t.checked && (!t.free_text_required || (t.text && t.text.trim() !== "")),
+  );
 };
 
 /**
@@ -292,6 +302,14 @@ const TagGroupInput = ({
                     onTextChange?.(group.id, tag.id, e.target.value)
                   }
                   disabled={disabled}
+                  error={
+                    tag.free_text_required && (!text || text.trim() === "")
+                  }
+                  helperText={
+                    tag.free_text_required && (!text || text.trim() === "")
+                      ? "Text is required for this selection"
+                      : undefined
+                  }
                   sx={{ ml: 4, mb: 1, maxWidth: "calc(100% - 32px)" }}
                 />
               )}
@@ -326,7 +344,7 @@ const nowSeconds = () => Date.now() / 1000;
 const isEmptyItem = (item) => !item.name || !item.name.trim();
 
 /**
- * Create a fresh empty input row for a list. It has no ``created`` timestamp
+ * Create a fresh empty input row for a list. It has no ``sorted_at`` timestamp
  * yet: a timestamp is only assigned once the user first edits it, which keeps
  * the untouched input row pinned to the bottom of the list.
  */
@@ -334,7 +352,7 @@ const newEmptyListItem = (listId) => ({
   list_id: listId,
   item_id: newItemId(),
   name: "",
-  created: null,
+  sorted_at: null,
 });
 
 /** Items belonging to a given list. */
@@ -342,17 +360,17 @@ const itemsForList = (listValues, listId) =>
   (listValues || []).filter((item) => item.list_id === listId);
 
 /**
- * Items of a list ordered for display: by their ``created`` timestamp (oldest
+ * Items of a list ordered for display: by their ``sorted_at`` timestamp (oldest
  * first). Items without a timestamp (the untouched input row) always sort to
  * the very bottom. Empty rows that already have a timestamp keep their place
  * and are only removed by an explicit delete or when saving.
  */
 const sortedListItems = (items) =>
   [...items].sort((a, b) => {
-    if (a.created == null && b.created == null) return 0;
-    if (a.created == null) return 1;
-    if (b.created == null) return -1;
-    return a.created - b.created;
+    if (a.sorted_at == null && b.sorted_at == null) return 0;
+    if (a.sorted_at == null) return 1;
+    if (b.sorted_at == null) return -1;
+    return a.sorted_at - b.sorted_at;
   });
 
 /**
@@ -384,8 +402,8 @@ const applyListItemName = (items, itemId, name) =>
   items.map((item) => {
     if (item.item_id !== itemId) return item;
     const next = { ...item, name };
-    if (next.created == null && !isEmptyItem(next)) {
-      next.created = nowSeconds();
+    if (next.sorted_at == null && !isEmptyItem(next)) {
+      next.sorted_at = nowSeconds();
     }
     return next;
   });
@@ -397,7 +415,7 @@ const cleanListValues = (listValues) =>
     .map((item) => ({
       ...item,
       name: item.name.trim(),
-      created: item.created ?? nowSeconds(),
+      sorted_at: item.sorted_at ?? nowSeconds(),
     }));
 
 /** Whether a list is required for the given decision (relevant only). */
@@ -628,7 +646,7 @@ const ListsDialog = ({
   const handleResetItem = (itemId) => {
     setLocalListValues((prev) =>
       prev.map((item) =>
-        item.item_id === itemId ? { ...item, created: nowSeconds() } : item,
+        item.item_id === itemId ? { ...item, sorted_at: nowSeconds() } : item,
       ),
     );
   };
@@ -1022,7 +1040,7 @@ const RecordCardLabeler = ({
   const handleResetListItem = (itemId) => {
     setListValuesState((prev) =>
       prev.map((item) =>
-        item.item_id === itemId ? { ...item, created: nowSeconds() } : item,
+        item.item_id === itemId ? { ...item, sorted_at: nowSeconds() } : item,
       ),
     );
   };

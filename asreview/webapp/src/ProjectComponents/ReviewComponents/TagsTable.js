@@ -141,6 +141,16 @@ const TagsTable = ({
                             )
                           }
                           disabled={disabled}
+                          error={
+                            tag.free_text_required &&
+                            (!text || text.trim() === "")
+                          }
+                          helperText={
+                            tag.free_text_required &&
+                            (!text || text.trim() === "")
+                              ? "Text is required for this selection"
+                              : undefined
+                          }
                           sx={{ ml: 4, mb: 1 }}
                         />
                       )}

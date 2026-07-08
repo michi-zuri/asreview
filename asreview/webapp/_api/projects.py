@@ -51,6 +51,7 @@ from werkzeug.exceptions import InternalServerError
 from werkzeug.utils import secure_filename
 
 import asreview as asr
+from asreview.database.database import uuid7
 from asreview.data import CSVWriter
 from asreview.data import ExcelWriter
 from asreview.data import RISReader
@@ -74,7 +75,6 @@ from asreview.project.migration import detect_version
 from asreview.project.migration import migrate_project
 from asreview.utils import _get_filename_from_url
 from asreview.webapp import DB
-from asreview.webapp._api.utils import add_id_to_tags
 from asreview.webapp._api.utils import get_all_model_components
 from asreview.webapp._api.utils import read_lists_data
 from asreview.webapp._api.utils import read_tags_data
@@ -546,10 +546,12 @@ def api_search_data(project):  # noqa: F401
 
     result = []
     records = project.db.input.get_records(group_ids)
+    with project.db as tmp_db:
+        tags_form = read_tags_data(tmp_db) or []
     for record in records:
         record_d = asdict(record)
         record_d["state"] = None
-        record_d["tags_form"] = read_tags_data(project)
+        record_d["tags_form"] = tags_form
         record_d["lists_form"] = read_lists_data(project)
         result.append(record_d)
 
@@ -721,7 +723,8 @@ def api_get_labeled(project):  # noqa: F401
     exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
 
     # ---- Filters applied as a Python post-scan ----
-    tags_form = read_tags_data(project)
+    with project.db as tmp_db:
+        tags_form = read_tags_data(tmp_db) or []
 
     tag_col_map = {}
     for group in tags_form or []:
@@ -1236,67 +1239,75 @@ def api_import_project():
 @login_required
 @project_authorization
 def get_tag_groups(project):
-    tags_path = Path(project.project_path, "tags.json")
-
-    try:
-        with open(tags_path, "r") as f:
-            return jsonify(json.load(f))
-    except FileNotFoundError:
-        return jsonify([])
-    except Exception as err:
-        logging.exception(err)
-        return jsonify([]), 500
+    with project.db as db:
+        tags_form = read_tags_data(db)
+        return jsonify(tags_form if tags_form is not None else [])
 
 
 @bp.route("/projects/<project_id>/tags", methods=["POST"])
 @login_required
 @project_authorization
 def create_tag_group(project):
-    tags_path = Path(project.project_path, "tags.json")
-
     new_tag_group = json.loads(request.form.get("group", "[]"))
 
     if not new_tag_group:
         return jsonify(message="No tag group found."), 400
 
-    def add_ids_to_group(group, group_id=0):
-        group["id"] = group_id
-        return add_id_to_tags(group)
+    group_id = uuid7()
 
-    try:
-        with open(tags_path, "r") as f:
-            tags = json.load(f)
-
-        tags.append(
-            add_ids_to_group(
-                new_tag_group, group_id=max([g["id"] for g in tags], default=0) + 1
-            )
+    with project.db as db:
+        db._ensure_tag_groups_table()
+        db._ensure_tag_options_table()
+        cur = db._conn.cursor()
+        cur.execute(
+            """INSERT INTO tag_groups
+               (group_id, export_name, label_name, required_for_relevant,
+                required_for_irrelevant, all_required, single,
+                input_helper_text)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                group_id,
+                new_tag_group.get("export", ""),
+                new_tag_group.get("label", ""),
+                1 if new_tag_group.get("required_relevant") else 0,
+                1 if new_tag_group.get("required_irrelevant") else 0,
+                1 if new_tag_group.get("require_all") else 0,
+                1 if new_tag_group.get("single_select") else 0,
+                new_tag_group.get("input_helper_text", ""),
+            ),
         )
 
-        with open(tags_path, "w") as f:
-            json.dump(tags, f)
+        # Insert tag options
+        for i, val in enumerate(new_tag_group.get("values", [])):
+            option_id = uuid7()
+            sorted_at = val.get("sorted_at", time.time())
+            cur.execute(
+                """INSERT INTO tag_options
+                   (option_id, group_id, export_name, label_name,
+                    free_text_enabled, free_text_required, sorted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    option_id,
+                    group_id,
+                    val.get("export", ""),
+                    val.get("label", ""),
+                    1 if val.get("free_text", False) else 0,
+                    1 if val.get("free_text_required", False) else 0,
+                    float(sorted_at),
+                ),
+            )
 
-        return jsonify(tags)
+        db._conn.commit()
 
-    except FileNotFoundError:
-        new_tag_group = add_ids_to_group(new_tag_group)
-
-        with open(tags_path, "w") as f:
-            json.dump([new_tag_group], f)
-
-        return jsonify([new_tag_group])
-    except Exception as err:
-        logging.exception(err)
-        return jsonify(message="Failed to create tag group."), 500
+    with project.db as db:
+        return jsonify(read_tags_data(db) or [])
 
 
-@bp.route("/projects/<project_id>/tags/<int:group_id>", methods=["PUT"])
+@bp.route("/projects/<project_id>/tags/<group_id>", methods=["PUT"])
 @login_required
 @project_authorization
 def update_tag_group(project, group_id):
     """Update a single tag group by its ID."""
-    tags_path = Path(project.project_path, "tags.json")
-
     updated_tag_group = json.loads(request.form.get("group", "[]"))
 
     if not updated_tag_group:
@@ -1311,130 +1322,176 @@ def update_tag_group(project, group_id):
     if "values" not in updated_tag_group:
         return jsonify(message="No tag group values found."), 400
 
-    updated_tag_group = add_id_to_tags(updated_tag_group)
+    with project.db as db:
+        db._ensure_tag_options_table()
+        cur = db._conn.cursor()
 
-    try:
-        with open(tags_path, "r") as f:
-            groups = json.load(f)
-
-        group_index = next(
-            (i for i, g in enumerate(groups) if g["id"] == group_id), None
+        # Update the group itself
+        result = cur.execute(
+            """UPDATE tag_groups SET
+               export_name=?, label_name=?, required_for_relevant=?,
+               required_for_irrelevant=?, all_required=?, single=?,
+               input_helper_text=?
+               WHERE group_id=?""",
+            (
+                updated_tag_group.get("export", ""),
+                updated_tag_group.get("label", ""),
+                1 if updated_tag_group.get("required_relevant") else 0,
+                1 if updated_tag_group.get("required_irrelevant") else 0,
+                1 if updated_tag_group.get("require_all") else 0,
+                1 if updated_tag_group.get("single_select") else 0,
+                updated_tag_group.get("input_helper_text", ""),
+                group_id,
+            ),
         )
 
-        if group_index is None:
+        if result.rowcount == 0:
             return jsonify(message=f"Tag group '{group_id}' not found."), 404
 
-        groups[group_index] = updated_tag_group
+        # Sync tag_options: collect incoming option_ids
+        incoming_ids = set()
+        for val in updated_tag_group.get("values", []):
+            option_id = val.get("id")
+            sorted_at = val.get("sorted_at", time.time())
+            if option_id is not None:
+                incoming_ids.add(option_id)
+                # Upsert: UPDATE if exists, INSERT if new
+                cur.execute(
+                    """INSERT INTO tag_options
+                       (option_id, group_id, export_name, label_name,
+                        free_text_enabled, free_text_required, sorted_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(option_id, group_id) DO UPDATE SET
+                       export_name=excluded.export_name,
+                       label_name=excluded.label_name,
+                       free_text_enabled=excluded.free_text_enabled,
+                       free_text_required=excluded.free_text_required,
+                       sorted_at=excluded.sorted_at""",
+                    (
+                        option_id,
+                        group_id,
+                        val.get("export", ""),
+                        val.get("label", ""),
+                        1 if val.get("free_text", False) else 0,
+                        1 if val.get("free_text_required", False) else 0,
+                        float(sorted_at),
+                    ),
+                )
+            else:
+                # New value without an id: generate one
+                option_id = uuid7()
+                incoming_ids.add(option_id)
+                cur.execute(
+                    """INSERT INTO tag_options
+                       (option_id, group_id, export_name, label_name,
+                        free_text_enabled, free_text_required, sorted_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        option_id,
+                        group_id,
+                        val.get("export", ""),
+                        val.get("label", ""),
+                        1 if val.get("free_text", False) else 0,
+                        1 if val.get("free_text_required", False) else 0,
+                        float(sorted_at),
+                    ),
+                )
 
-        with open(tags_path, "w") as f:
-            json.dump(groups, f)
+        # Remove options no longer present (FK constraint from ``tags`` will
+        # block this if any record still references the option).
+        existing = cur.execute(
+            "SELECT option_id FROM tag_options WHERE group_id = ?",
+            (group_id,),
+        ).fetchall()
+        for (existing_id,) in existing:
+            if existing_id not in incoming_ids:
+                try:
+                    cur.execute(
+                        "DELETE FROM tag_options WHERE option_id = ? AND group_id = ?",
+                        (existing_id, group_id),
+                    )
+                except sqlite3.IntegrityError:
+                    pass  # FK constraint protects referenced options
 
-        return jsonify(updated_tag_group)
-    except FileNotFoundError:
-        return jsonify(message=f"Tag group '{group_id}' not found."), 404
-    except Exception as err:
-        logging.exception(err)
-        return jsonify(message="Failed to update tag group."), 500
+        db._conn.commit()
+
+    with project.db as db:
+        return jsonify(read_tags_data(db) or [])
 
 
 @bp.route("/projects/<project_id>/lists", methods=["GET"])
 @login_required
 @project_authorization
 def get_lists(project):
-    """Get the list configuration (id -> name) for a project."""
-    lists_path = Path(project.project_path, "lists.json")
-
-    try:
-        with open(lists_path, "r") as f:
-            return jsonify(json.load(f))
-    except FileNotFoundError:
-        return jsonify([])
-    except Exception as err:
-        logging.exception(err)
-        return jsonify([]), 500
+    """Get the list configuration for a project."""
+    lists_data = read_lists_data(project)
+    return jsonify(lists_data if lists_data is not None else [])
 
 
 @bp.route("/projects/<project_id>/lists", methods=["POST"])
 @login_required
 @project_authorization
 def create_list(project):
-    """Create a new list. A list has a name and a required flag.
+    """Create a new list definition in the ``list_containers`` table.
 
-    The list id is a ``uuid4`` so that ids are stable and never collide.
+    The list id is a ``uuid7`` so that ids are time-ordered and never collide.
     """
-    lists_path = Path(project.project_path, "lists.json")
-
     new_list = json.loads(request.form.get("list", "{}"))
 
     if not new_list or not new_list.get("name"):
         return jsonify(message="No list name found."), 400
 
-    new_list = {
-        "id": str(uuid4()),
-        "name": new_list["name"],
-        "required_for_relevant": bool(new_list.get("required_for_relevant", False)),
-        "input_helper_text": new_list.get("input_helper_text", ""),
-    }
+    list_id = uuid7()
 
-    try:
-        with open(lists_path, "r") as f:
-            lists = json.load(f)
+    with project.db as db:
+        db._ensure_list_containers_table()
+        cur = db._conn.cursor()
+        cur.execute(
+            """INSERT INTO list_containers
+               (list_id, name, required_for_relevant, description)
+               VALUES (?, ?, ?, ?)""",
+            (
+                list_id,
+                new_list["name"],
+                1 if new_list.get("required_for_relevant", False) else 0,
+                new_list.get("input_helper_text") or None,
+            ),
+        )
+        db._conn.commit()
 
-        lists.append(new_list)
-
-        with open(lists_path, "w") as f:
-            json.dump(lists, f)
-
-        return jsonify(lists)
-    except FileNotFoundError:
-        with open(lists_path, "w") as f:
-            json.dump([new_list], f)
-
-        return jsonify([new_list])
-    except Exception as err:
-        logging.exception(err)
-        return jsonify(message="Failed to create list."), 500
+    return jsonify(read_lists_data(project) or [])
 
 
 @bp.route("/projects/<project_id>/lists/<list_id>", methods=["PUT"])
 @login_required
 @project_authorization
 def update_list(project, list_id):
-    """Update a single list by its ID."""
-    lists_path = Path(project.project_path, "lists.json")
-
+    """Update a single list definition by its ID."""
     updated_list = json.loads(request.form.get("list", "{}"))
 
     if not updated_list or not updated_list.get("name"):
         return jsonify(message="No list name found."), 400
 
-    updated_list = {
-        "id": list_id,
-        "name": updated_list["name"],
-        "required_for_relevant": bool(updated_list.get("required_for_relevant", False)),
-        "input_helper_text": updated_list.get("input_helper_text", ""),
-    }
+    with project.db as db:
+        db._ensure_list_containers_table()
+        cur = db._conn.cursor()
+        result = cur.execute(
+            """UPDATE list_containers SET
+               name=?, required_for_relevant=?, description=?
+               WHERE list_id=?""",
+            (
+                updated_list["name"],
+                1 if updated_list.get("required_for_relevant", False) else 0,
+                updated_list.get("input_helper_text") or None,
+                list_id,
+            ),
+        )
+        db._conn.commit()
 
-    try:
-        with open(lists_path, "r") as f:
-            lists = json.load(f)
-
-        index = next((i for i, lst in enumerate(lists) if lst["id"] == list_id), None)
-
-        if index is None:
+        if result.rowcount == 0:
             return jsonify(message=f"List '{list_id}' not found."), 404
 
-        lists[index] = updated_list
-
-        with open(lists_path, "w") as f:
-            json.dump(lists, f)
-
-        return jsonify(updated_list)
-    except FileNotFoundError:
-        return jsonify(message=f"List '{list_id}' not found."), 404
-    except Exception as err:
-        logging.exception(err)
-        return jsonify(message="Failed to update list."), 500
+        return jsonify(read_lists_data(project) or [])
 
 
 @bp.route("/projects/<project_id>/highlights", methods=["GET"])
@@ -1613,6 +1670,7 @@ def api_export_dataset(project):
         df_results = db.get_results_table(groups=export_groups).set_index("record_id")
         df_unlabeled = db.get_unlabeled(groups=export_groups)
         df_groups = db.input[["record_id", "group_id"]].set_index("record_id")
+        tags_config = read_tags_data(db)
 
     export_order = []
 
@@ -1627,7 +1685,7 @@ def api_export_dataset(project):
 
     df_results = _flatten_tags(
         df_results,
-        read_tags_data(project),
+        tags_config,
     )
     df_results["time"] = pd.to_datetime(df_results["time"], unit="s").dt.strftime(
         "%Y-%m-%d %H:%M:%S"
@@ -1953,7 +2011,7 @@ def api_label_record(project, record_id):  # noqa: F401
             item = asdict(db.input.get_records(record_id))
             item["state"] = record.iloc[0].to_dict()
             item["state"]["lists"] = db.get_lists(record_id)
-        item["tags_form"] = read_tags_data(project)
+            item["tags_form"] = read_tags_data(db) or []
         item["lists_form"] = read_lists_data(project)
         item["state"]["user"] = None
         del item["state"]["user_id"]
@@ -2081,7 +2139,8 @@ def api_get_record(project):  # noqa: F401
 
     item["state"] = pending.iloc[0].to_dict()
     item["state"]["lists"] = record_lists
-    item["tags_form"] = read_tags_data(project)
+    with project.db as tmp_db:
+        item["tags_form"] = read_tags_data(tmp_db) or []
     item["lists_form"] = read_lists_data(project)
     item["state"]["user"] = None
     del item["state"]["user_id"]

@@ -31,6 +31,7 @@ import { ProjectAPI } from "api";
 import { useMutation, useQuery, useQueryClient } from "react-query";
 
 import { Add } from "@mui/icons-material";
+import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import BookmarksIcon from "@mui/icons-material/Bookmarks";
 import FolderOpenIcon from "@mui/icons-material/FolderOpen";
 import StyleIcon from "@mui/icons-material/Style";
@@ -217,6 +218,8 @@ function labelToExport(label) {
     .replaceAll(/[^a-z0-9_]/g, "");
 }
 
+const nowSeconds = () => Date.now() / 1000;
+
 const EMPTY_GROUP = {
   label: "",
   export: "",
@@ -226,9 +229,9 @@ const EMPTY_GROUP = {
   required_irrelevant: false,
   require_all: false,
   values: [
-    { label: "", export: "" },
-    { label: "", export: "" },
-    { label: "", export: "" },
+    { label: "", export: "", sorted_at: nowSeconds() },
+    { label: "", export: "", sorted_at: nowSeconds() },
+    { label: "", export: "", sorted_at: nowSeconds() },
   ],
 };
 
@@ -379,7 +382,27 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
     setState((prev) => ({
       ...prev,
       values: prev.values.map((tag, i) =>
-        i === index ? { ...tag, free_text: e.target.checked } : tag,
+        i === index
+          ? { ...tag, free_text: e.target.checked, free_text_required: false }
+          : tag,
+      ),
+    }));
+  };
+
+  const handleTagFreeTextRequiredChange = (index, e) => {
+    setState((prev) => ({
+      ...prev,
+      values: prev.values.map((tag, i) =>
+        i === index ? { ...tag, free_text_required: e.target.checked } : tag,
+      ),
+    }));
+  };
+
+  const handleTagMoveToBottom = (index) => {
+    setState((prev) => ({
+      ...prev,
+      values: prev.values.map((tag, i) =>
+        i === index ? { ...tag, sorted_at: nowSeconds() } : tag,
       ),
     }));
   };
@@ -392,6 +415,7 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
         {
           label: "",
           export: "",
+          sorted_at: nowSeconds(),
         },
       ],
     }));
@@ -530,6 +554,31 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
                   }
                   label="Free text"
                 />
+              </Tooltip>
+              {tag.free_text && (
+                <Tooltip title="Require non-empty text when this tag is selected">
+                  <FormControlLabel
+                    sx={{ flexShrink: 0, whiteSpace: "nowrap" }}
+                    control={
+                      <Switch
+                        checked={Boolean(tag.free_text_required)}
+                        onChange={(e) =>
+                          handleTagFreeTextRequiredChange(index, e)
+                        }
+                      />
+                    }
+                    label="Text required"
+                  />
+                </Tooltip>
+              )}
+              <Tooltip title="Move to bottom">
+                <IconButton
+                  size="small"
+                  onClick={() => handleTagMoveToBottom(index)}
+                  aria-label="move tag to bottom"
+                >
+                  <ArrowDownwardIcon fontSize="small" />
+                </IconButton>
               </Tooltip>
             </Stack>
           ))}

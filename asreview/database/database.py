@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import time
 from functools import cached_property
@@ -9,9 +10,49 @@ from asreview.data.record import Record
 from asreview.database.store import DataStore
 from asreview.database.store import _build_conn_uri
 
+
+def uuid7():
+    """Generate a UUID v7 (RFC 9562).
+
+    48-bit Unix ms timestamp + version (4 bits) + variant (2 bits) +
+    74 random bits. Returns the standard 36-character hex string with hyphens.
+
+    Python 3.14 adds ``uuid.uuid7()``; this backport can be replaced once
+    that is available.
+    """
+    timestamp_ms = int(time.time() * 1000)
+    rand_bytes = os.urandom(12)
+
+    # timestamp (48 bits) as 6 bytes, big-endian
+    ts = timestamp_ms.to_bytes(6, "big")
+
+    # version nibble: 7
+    ts = bytes([ts[0], ts[1], ts[2], ts[3], ts[4], ts[5]])
+
+    # Build UUID bytes: 6-byte timestamp + 10-byte random
+    uuid_bytes = bytearray(16)
+
+    # bytes 0-5: timestamp (first 48 bits)
+    uuid_bytes[0:6] = ts
+
+    # bytes 6-7: version (4 bits → 0x7xxx) + random
+    uuid_bytes[6] = 0x70 | (rand_bytes[0] & 0x0F)
+    uuid_bytes[7] = rand_bytes[1]
+
+    # bytes 8-9: variant (2 bits → 10xx) + random
+    uuid_bytes[8] = 0x80 | (rand_bytes[2] & 0x3F)
+    uuid_bytes[9] = rand_bytes[3]
+
+    # bytes 10-15: remaining random
+    uuid_bytes[10:16] = rand_bytes[4:10]
+
+    # Format: 00000000-0000-7000-8000-000000000000
+    h = uuid_bytes.hex()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
 __all__ = ["Database"]
 
-CURRENT_DATABASE_VERSION = 3
+CURRENT_DATABASE_VERSION = 4
 
 MODEL_COLUMNS = [
     "classifier",
@@ -37,7 +78,6 @@ RESULTS_TABLE_COLUMNS_PANDAS_DTYPES = {
     "training_set": "Int64",
     "time": "Float64",
     "note": "object",
-    "tags": "object",
     "user_id": "Int64",
 }
 
@@ -214,7 +254,6 @@ class Database:
                             training_set INTEGER,
                             time FLOAT,
                             note TEXT,
-                            tags JSON,
                             user_id INTEGER)"""
         )
 
@@ -243,17 +282,21 @@ class Database:
         self._set_results_changes_triggers()
         self._ensure_results_indexes()
         self._ensure_lists_table()
+        self._ensure_list_containers_table()
+        self._ensure_tag_groups_table()
+        self._ensure_tag_options_table()
+        self._ensure_tags_table()
 
     def _ensure_lists_table(self):
         """Create the ``lists`` table that stores per-record list items.
 
         A record can have several user-defined lists (configured in
-        ``lists.json``), and each list can contain multiple free-text items.
-        Because of this clear many-to-one relationship the items live in their
-        own table instead of a JSON column on ``results``. Both ``list_id`` and
-        ``item_id`` are ``uuid4`` strings; ``created`` is a unix timestamp used
-        to order the items within a list. ``item_id`` is the primary key so the
-        items can later be referenced by foreign keys.
+        ``list_containers``), and each list can contain multiple free-text
+        items. Because of this clear many-to-one relationship the items live
+        in their own table instead of a JSON column on ``results``. Both
+        ``list_id`` and ``item_id`` are ``uuid7`` strings; ``sorted_at`` is a
+        unix timestamp used to order the items within a list. ``item_id`` is
+        the primary key so the items can later be referenced by foreign keys.
 
         Idempotent (``CREATE TABLE IF NOT EXISTS``), so it is safe to call on
         every read-write open. The table is only ever created, never migrated:
@@ -267,8 +310,116 @@ class Database:
                 list_id TEXT NOT NULL,
                 item_id TEXT NOT NULL PRIMARY KEY,
                 name TEXT NOT NULL,
-                created FLOAT NOT NULL,
+                sorted_at FLOAT NOT NULL,
                 UNIQUE (record_id, list_id, name))"""
+        )
+        self._conn.commit()
+
+    def _ensure_list_containers_table(self):
+        """Create the ``list_containers`` table that stores list definitions.
+
+        Replaces the ``lists.json`` file. Each row defines one list with its
+        display name, behaviour flags, and optional description.
+
+        Idempotent (``CREATE TABLE IF NOT EXISTS``), so it is safe to call on
+        every read-write open.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS list_containers (
+                list_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                required_for_relevant INTEGER NOT NULL DEFAULT 0,
+                description TEXT
+            )"""
+        )
+        self._conn.commit()
+
+    def _ensure_tag_groups_table(self):
+        """Create the ``tag_groups`` table that stores tag group definitions.
+
+        Replaces the ``tags.json`` file. Each row defines one tag group with
+        its behaviour flags. Tag options are stored in the ``tag_options``
+        table.
+
+        Idempotent (``CREATE TABLE IF NOT EXISTS``), so it is safe to call on
+        every read-write open.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS tag_groups (
+                group_id TEXT PRIMARY KEY,
+                export_name TEXT NOT NULL,
+                label_name TEXT NOT NULL,
+                required_for_relevant INTEGER NOT NULL DEFAULT 0,
+                required_for_irrelevant INTEGER NOT NULL DEFAULT 0,
+                all_required INTEGER NOT NULL DEFAULT 0,
+                single INTEGER NOT NULL DEFAULT 0,
+                input_helper_text TEXT DEFAULT ''
+            )"""
+        )
+        self._conn.commit()
+
+    def _ensure_tag_options_table(self):
+        """Create the ``tag_options`` table that stores tag option definitions.
+
+        Each row is one selectable tag value within a tag group. Replaces the
+        JSON ``tag_values`` column that was previously stored on
+        ``tag_groups``.  Options are ordered by ``sorted_at`` (oldest first).
+
+        Idempotent (``CREATE TABLE IF NOT EXISTS``), so it is safe to call on
+        every read-write open.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS tag_options (
+                option_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                export_name TEXT NOT NULL,
+                label_name TEXT NOT NULL,
+                free_text_enabled INTEGER NOT NULL DEFAULT 0,
+                free_text_required INTEGER NOT NULL DEFAULT 0,
+                sorted_at FLOAT NOT NULL DEFAULT 0,
+                UNIQUE (option_id, group_id),
+                FOREIGN KEY (group_id) REFERENCES tag_groups(group_id)
+            )"""
+        )
+        cur.execute(
+            """CREATE INDEX IF NOT EXISTS idx_tag_options_group
+            ON tag_options(group_id)"""
+        )
+        self._conn.commit()
+
+    def _ensure_tags_table(self):
+        """Create the ``tags`` table that stores per-record tag selections.
+
+        Each row represents one tag value applied (or not) to one record.
+        Rows are keyed by the unique combination of record and option,
+        allowing efficient upserts when a label is changed.
+
+        Idempotent (``CREATE TABLE IF NOT EXISTS``), so it is safe to call on
+        every read-write open.
+        """
+        cur = self._conn.cursor()
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS tags (
+                tag_id TEXT PRIMARY KEY,
+                record_id INTEGER NOT NULL,
+                option_id TEXT NOT NULL,
+                checked INTEGER NOT NULL DEFAULT 0,
+                additional_text TEXT,
+                UNIQUE(record_id, option_id),
+                FOREIGN KEY (record_id) REFERENCES record(record_id),
+                FOREIGN KEY (option_id) REFERENCES tag_options(option_id)
+            )"""
+        )
+        cur.execute(
+            """CREATE INDEX IF NOT EXISTS idx_tags_record
+            ON tags(record_id)"""
+        )
+        cur.execute(
+            """CREATE INDEX IF NOT EXISTS idx_tags_record_option
+            ON tags(record_id, option_id)"""
         )
         self._conn.commit()
 
@@ -291,8 +442,10 @@ class Database:
         )
         self._conn.commit()
 
-    def _is_valid(self):
-        if self.user_version != CURRENT_DATABASE_VERSION:
+    def _is_valid(self, expected_version=None):
+        if expected_version is None:
+            expected_version = CURRENT_DATABASE_VERSION
+        if self.user_version != expected_version:
             raise ValueError(
                 f"Database version {self.user_version} is not supported. "
                 "See migration guide."
@@ -330,8 +483,13 @@ class Database:
         if not self.read_only:
             self._fix_decision_changes_schema(cur)
             self._fix_record_schema(cur)
+            self._fix_tag_options_schema(cur)
             self._ensure_results_indexes()
             self._ensure_lists_table()
+            self._ensure_list_containers_table()
+            self._ensure_tag_groups_table()
+            self._ensure_tag_options_table()
+            self._ensure_tags_table()
 
     def _fix_record_schema(self, cur):
         """Add columns introduced after the initial schema to the record table."""
@@ -349,6 +507,26 @@ class Database:
         if "attachment" not in columns:
             cur.execute(
                 f"ALTER TABLE {self.record_table_name} ADD COLUMN attachment TEXT"
+            )
+            self._conn.commit()
+
+    def _fix_tag_options_schema(self, cur):
+        """Add ``sorted_at`` column to ``tag_options`` if it is missing.
+
+        Projects created or migrated before this column was introduced will
+        have a ``tag_options`` table without ``sorted_at``.  The column is
+        added with a default of 0 so existing options keep their UUID v7
+        creation order as a fallback.
+        """
+        exists = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_options'"
+        ).fetchone()
+        if not exists:
+            return
+        columns = [row[1] for row in cur.execute("PRAGMA table_info(tag_options)")]
+        if "sorted_at" not in columns:
+            cur.execute(
+                "ALTER TABLE tag_options ADD COLUMN sorted_at FLOAT NOT NULL DEFAULT 0"
             )
             self._conn.commit()
 
@@ -414,6 +592,10 @@ class Database:
             return len(labeled) > last_training_set.max()
 
     def _replace_results_from_df(self, results):
+        # Drop the tags column if present -- tags are now stored in the
+        # separate ``tags`` table, not as a results table column.
+        results = results.drop(columns=["tags"], errors="ignore")
+
         if not set(results.columns) == set(RESULTS_TABLE_COLUMNS_PANDAS_DTYPES):
             raise ValueError(
                 f"Columns of the results dataframe should be "
@@ -499,8 +681,6 @@ class Database:
         )
 
     def label_record(self, record_id, label, tags=None, user_id=None):
-        if tags is not None:
-            tags = json.dumps(tags)
         labeling_time = time.time()
         con = self._conn
         cur = con.cursor()
@@ -508,7 +688,7 @@ class Database:
         target_result_string = ", ".join(
             f"target_result.{col}" for col in MODEL_COLUMNS
         )
-        upsert_columns = ["label", "time", "tags", "user_id"] + MODEL_COLUMNS
+        upsert_columns = ["label", "time", "user_id"] + MODEL_COLUMNS
         upsert_string = ", ".join(f"{col} = excluded.{col}" for col in upsert_columns)
 
         cur.execute(
@@ -526,8 +706,8 @@ class Database:
                 FROM results
                 WHERE record_id = :record_id
             )
-            INSERT INTO results(record_id, label, time, tags, user_id, {model_string})
-            SELECT target_group.record_id, :label, :time, :tags, :user_id, {target_result_string}
+            INSERT INTO results(record_id, label, time, user_id, {model_string})
+            SELECT target_group.record_id, :label, :time, :user_id, {target_result_string}
             FROM target_group
             LEFT JOIN target_result ON 1
             ON CONFLICT(record_id) DO UPDATE
@@ -537,11 +717,13 @@ class Database:
                 "record_id": record_id,
                 "label": label,
                 "time": labeling_time,
-                "tags": tags,
                 "user_id": user_id,
             },
         )
         con.commit()
+
+        if tags is not None:
+            self._save_tags(record_id, tags)
 
     def query_top_ranked(self, user_id=None):
         model_string = ", ".join(MODEL_COLUMNS)
@@ -600,31 +782,32 @@ class Database:
                 # We only update the user_id if the label changes.
                 fields.append("user_id = :user_id")
                 values["user_id"] = user_id
-        if tags is not None:
-            fields.append("tags = :tags")
-            values["tags"] = json.dumps(tags)
-        set_string = ", ".join(fields)
 
-        con = self._conn
-        cur = con.cursor()
-        cur.execute(
-            f"""
-            WITH target_group AS (
-                SELECT record_id
-                FROM {self.record_table_name}
-                WHERE group_id = (
-                    SELECT group_id
+        if fields:
+            set_string = ", ".join(fields)
+            con = self._conn
+            cur = con.cursor()
+            cur.execute(
+                f"""
+                WITH target_group AS (
+                    SELECT record_id
                     FROM {self.record_table_name}
-                    WHERE record_id=:record_id
+                    WHERE group_id = (
+                        SELECT group_id
+                        FROM {self.record_table_name}
+                        WHERE record_id=:record_id
+                    )
                 )
+                UPDATE results
+                SET {set_string}
+                WHERE record_id IN (SELECT record_id FROM target_group)
+                """,
+                values,
             )
-            UPDATE results
-            SET {set_string}
-            WHERE record_id IN (SELECT record_id FROM target_group)
-            """,
-            values,
-        )
-        con.commit()
+            con.commit()
+
+        if tags is not None:
+            self._save_tags(record_id, tags)
 
     def update_note(self, record_id, note=None):
         """Change the note of an already labeled or pending record.
@@ -667,15 +850,15 @@ class Database:
         -------
         list[dict]
             One dict per item with keys ``list_id``, ``item_id``, ``name`` and
-            ``created``, ordered by ``created`` (oldest first). Empty list when
-            the record has no items (or the ``lists`` table does not exist yet
-            in a read-only legacy project).
+            ``sorted_at``, ordered by ``sorted_at`` (oldest first). Empty list
+            when the record has no items (or the ``lists`` table does not exist
+            yet in a read-only legacy project).
         """
         cur = self._conn.cursor()
         try:
             rows = cur.execute(
-                """SELECT list_id, item_id, name, created
-                FROM lists WHERE record_id = ? ORDER BY list_id, created, rowid""",
+                """SELECT list_id, item_id, name, sorted_at
+                FROM lists WHERE record_id = ? ORDER BY list_id, sorted_at, rowid""",
                 (record_id,),
             ).fetchall()
         except sqlite3.OperationalError:
@@ -686,7 +869,7 @@ class Database:
                 "list_id": row[0],
                 "item_id": row[1],
                 "name": row[2],
-                "created": row[3],
+                "sorted_at": row[3],
             }
             for row in rows
         ]
@@ -698,7 +881,7 @@ class Database:
         -------
         dict[int, list[dict]]
             Mapping of ``record_id`` to its list items (see :meth:`get_lists`),
-            ordered by ``created`` within each list. Records without items are
+            ordered by ``sorted_at`` within each list. Records without items are
             absent from the mapping.
         """
         record_ids = [int(r) for r in record_ids]
@@ -708,9 +891,9 @@ class Database:
         placeholders = ",".join("?" * len(record_ids))
         try:
             rows = cur.execute(
-                f"""SELECT record_id, list_id, item_id, name, created
+                f"""SELECT record_id, list_id, item_id, name, sorted_at
                 FROM lists WHERE record_id IN ({placeholders})
-                ORDER BY record_id, list_id, created, rowid""",
+                ORDER BY record_id, list_id, sorted_at, rowid""",
                 record_ids,
             ).fetchall()
         except sqlite3.OperationalError:
@@ -722,7 +905,7 @@ class Database:
                     "list_id": row[1],
                     "item_id": row[2],
                     "name": row[3],
-                    "created": row[4],
+                    "sorted_at": row[4],
                 }
             )
         return result
@@ -740,7 +923,7 @@ class Database:
             Record whose list items should be replaced.
         items : list[dict]
             Items with keys ``list_id``, ``item_id``, ``name`` and optionally
-            ``created``. An empty list clears the record's items.
+            ``sorted_at``. An empty list clears the record's items.
         """
         self._ensure_lists_table()
         con = self._conn
@@ -753,26 +936,222 @@ class Database:
             name = item["name"]
             if "," in name or ";" in name:
                 raise ValueError("List item names may not contain ',' or ';'.")
-            created = item.get("created")
-            if created is None:
-                created = time.time()
+            sorted_at = item.get("sorted_at")
+            if sorted_at is None:
+                sorted_at = time.time()
             rows.append(
                 (
                     int(record_id),
                     str(item["list_id"]),
                     str(item["item_id"]),
                     name,
-                    float(created),
+                    float(sorted_at),
                 )
             )
         if rows:
             cur.executemany(
                 """INSERT INTO lists
-                (record_id, list_id, item_id, name, created)
+                (record_id, list_id, item_id, name, sorted_at)
                 VALUES (?, ?, ?, ?, ?)""",
                 rows,
             )
         con.commit()
+
+    def _save_tags(self, record_id, tags, cur=None):
+        """Store tag selections for a record in the ``tags`` table.
+
+        Deletes existing tag rows for the given record within the affected
+        groups, then inserts one row per checked tag value. Only checked tags
+        are persisted; unchecked tags are omitted (their absence means
+        unchecked).
+
+        The ``tags`` parameter uses the same nested format as the API:
+
+            [{"id": group_id, "values": [{"id": option_id, "checked": bool,
+                                          "text": str}, ...]}, ...]
+
+        Each value ``id`` maps directly to a ``tag_options.option_id``.
+        """
+        if not tags:
+            return
+
+        own_cur = cur is None
+        if own_cur:
+            cur = self._conn.cursor()
+
+        # Collect all option_ids to delete existing rows in one pass
+        option_ids = []
+        rows = []
+        for group in tags:
+            if not isinstance(group, dict):
+                continue
+            for tag_val in group.get("values", []):
+                if not isinstance(tag_val, dict):
+                    continue
+                option_id = tag_val.get("id")
+                if option_id is None:
+                    continue
+                option_ids.append(str(option_id))
+                checked = bool(tag_val.get("checked", False))
+                text = tag_val.get("text")
+                rows.append(
+                    (
+                        uuid7(),
+                        int(record_id),
+                        str(option_id),
+                        1 if checked else 0,
+                        text if checked and text else None,
+                    )
+                )
+
+        if option_ids:
+            placeholders = ",".join("?" * len(option_ids))
+            cur.execute(
+                f"DELETE FROM tags WHERE record_id = ? AND option_id IN ({placeholders})",
+                [int(record_id)] + option_ids,
+            )
+
+        if rows:
+            cur.executemany(
+                """INSERT OR REPLACE INTO tags
+                   (tag_id, record_id, option_id, checked, additional_text)
+                   VALUES (?, ?, ?, ?, ?)""",
+                rows,
+            )
+
+        if own_cur:
+            self._conn.commit()
+            cur.close()
+
+    def _load_tags(self, record_ids):
+        """Load per-record tag selections and reconstruct the nested format.
+
+        Returns a ``dict[int, list[dict]]`` mapping ``record_id`` to a list of
+        tag group objects in the same format the API expects:
+
+            [{"id": group_id, "export": ..., "label": ...,
+              "values": [{"id": option_id, "export": ..., "label": ...,
+                          "checked": bool, "text": str | None}, ...]}, ...]
+
+        Records without any tag rows are absent from the result.
+        """
+        result = {}
+        if not record_ids:
+            return result
+
+        record_ids = [int(r) for r in record_ids]
+        cur = self._conn.cursor()
+
+        try:
+            # Phase 1: build template from tag_groups + tag_options
+            option_rows = cur.execute(
+                """SELECT g.group_id, g.export_name, g.label_name,
+                          g.single, g.required_for_relevant,
+                          g.required_for_irrelevant, g.all_required,
+                          g.input_helper_text,
+                          o.option_id, o.export_name, o.label_name,
+                          o.free_text_enabled, o.free_text_required
+                   FROM tag_groups g
+                   JOIN tag_options o ON o.group_id = g.group_id
+                   ORDER BY g.group_id, o.sorted_at, o.option_id"""
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # tables do not exist (read-only legacy project)
+            return result
+
+        # Build template: group_id → group_dict with all values unchecked
+        groups_by_id = {}
+        for row in option_rows:
+            gid = row[0]
+            if gid not in groups_by_id:
+                groups_by_id[gid] = {
+                    "id": gid,
+                    "export": row[1],
+                    "label": row[2],
+                    "single_select": bool(row[3]),
+                    "required_relevant": bool(row[4]),
+                    "required_irrelevant": bool(row[5]),
+                    "require_all": bool(row[6]),
+                    "input_helper_text": row[7] or "",
+                    "values": [],
+                }
+            groups_by_id[gid]["values"].append(
+                {
+                    "id": row[8],
+                    "export": row[9],
+                    "label": row[10],
+                    "free_text": bool(row[11]),
+                    "free_text_required": bool(row[12]),
+                    "checked": False,
+                    "text": None,
+                }
+            )
+
+        if not groups_by_id:
+            return result
+
+        # Phase 2: load checked tags for requested records
+        placeholders = ",".join("?" * len(record_ids))
+        try:
+            checked_rows = cur.execute(
+                f"""SELECT t.record_id, t.option_id, t.checked,
+                           t.additional_text
+                    FROM tags t
+                    WHERE t.record_id IN ({placeholders})""",
+                record_ids,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            checked_rows = []
+
+        # Phase 3: apply checkmarks
+        # Build option_id → group_id map for fast lookup
+        option_to_group = {}
+        for gid, gdata in groups_by_id.items():
+            for v in gdata["values"]:
+                option_to_group[v["id"]] = gid
+
+        record_checkmarks = {}
+        for row in checked_rows:
+            rid = int(row[0])
+            option_id = row[1]
+            if rid not in record_checkmarks:
+                record_checkmarks[rid] = {}
+            record_checkmarks[rid][option_id] = {
+                "checked": bool(row[2]),
+                "text": row[3],
+            }
+
+        # Build per-record results
+        for rid, checkmarks in record_checkmarks.items():
+            # Deep-copy the template groups that have checkmarks
+            seen_groups = set()
+            for option_id, chk in checkmarks.items():
+                gid = option_to_group.get(option_id)
+                if gid is None:
+                    continue
+                if rid not in result:
+                    result[rid] = []
+                if gid not in seen_groups:
+                    # Copy the group template
+                    template = groups_by_id[gid]
+                    group_copy = {
+                        k: v for k, v in template.items() if k != "values"
+                    }
+                    group_copy["values"] = [dict(v) for v in template["values"]]
+                    result[rid].append(group_copy)
+                    seen_groups.add(gid)
+
+                # Apply checkmark to the matching value
+                for gdata in result[rid]:
+                    if gdata["id"] == gid:
+                        for v in gdata["values"]:
+                            if v["id"] == option_id:
+                                v["checked"] = chk["checked"]
+                                v["text"] = chk["text"]
+                                break
+                        break
+
+        return result
 
     def delete_result(self, record_id):
         con = self._conn
@@ -815,7 +1194,13 @@ class Database:
             self._conn,
             dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES,
         )
-        result["tags"] = result["tags"].map(json.loads, na_action="ignore")
+        if not result.empty:
+            tags_by_record = self._load_tags(result["record_id"].tolist())
+            result["tags"] = result["record_id"].map(
+                lambda rid: tags_by_record.get(int(rid), [])
+            )
+        else:
+            result["tags"] = pd.Series(dtype="object")
         return result
 
     def get_results_table(self, columns=None, priors=True, pending=False, groups=False):
@@ -847,6 +1232,15 @@ class Database:
         if isinstance(columns, str):
             columns = [columns]
 
+        # Remove "tags" from SQL columns list since it is no longer a results
+        # table column -- it is reconstructed from the ``tags`` table below.
+        want_tags = columns is None or "tags" in columns
+        sql_columns = (
+            None
+            if columns is None
+            else [c for c in columns if c != "tags"]
+        )
+
         if (not priors) or (not pending) or (not groups):
             sql_where = []
             if not priors:
@@ -861,24 +1255,43 @@ class Database:
         else:
             sql_where_str = ""
 
-        if columns is None:
+        if sql_columns is None:
             col_dtype = RESULTS_TABLE_COLUMNS_PANDAS_DTYPES
         else:
             col_dtype = {
                 k: v
                 for k, v in RESULTS_TABLE_COLUMNS_PANDAS_DTYPES.items()
-                if columns and k in columns
+                if sql_columns and k in sql_columns
             }
 
-        query_string = "*" if columns is None else ",".join(columns)
+        query_string = "*" if sql_columns is None else ",".join(sql_columns)
         df_results = pd.read_sql_query(
             f"SELECT {query_string} FROM results {sql_where_str} ORDER BY rowid",
             self._conn,
             dtype=col_dtype,
         )
 
-        if columns is None or "tags" in columns:
-            df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
+        if want_tags:
+            if not df_results.empty:
+                tags_by_record = self._load_tags(df_results["record_id"].tolist())
+                tags_series = df_results["record_id"].map(
+                    lambda rid: tags_by_record.get(int(rid), [])
+                )
+            else:
+                tags_series = pd.Series(dtype="object")
+            # Preserve the original column order by inserting tags at the
+            # position it was requested (or appending if columns is None).
+            if columns is not None and "tags" in columns:
+                tag_index = columns.index("tags")
+                # Adjust for columns already present in the dataframe (which
+                # don't include "tags" since it was stripped from the SQL).
+                df_columns = df_results.columns.tolist()
+                insert_at = tag_index
+                if insert_at > len(df_columns):
+                    insert_at = len(df_columns)
+                df_results.insert(insert_at, "tags", tags_series)
+            else:
+                df_results["tags"] = tags_series
         return df_results
 
     def get_results_page(
@@ -1013,7 +1426,13 @@ class Database:
             params=params,
             dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES,
         )
-        df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
+        if not df_results.empty:
+            tags_by_record = self._load_tags(df_results["record_id"].tolist())
+            df_results["tags"] = df_results["record_id"].map(
+                lambda rid: tags_by_record.get(int(rid), [])
+            )
+        else:
+            df_results["tags"] = pd.Series(dtype="object")
         return df_results
 
     def get_priors(self):
@@ -1039,7 +1458,13 @@ class Database:
             self._conn,
             dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES,
         )
-        df_results["tags"] = df_results["tags"].map(json.loads, na_action="ignore")
+        if not df_results.empty:
+            tags_by_record = self._load_tags(df_results["record_id"].tolist())
+            df_results["tags"] = df_results["record_id"].map(
+                lambda rid: tags_by_record.get(int(rid), [])
+            )
+        else:
+            df_results["tags"] = pd.Series(dtype="object")
         return df_results
 
     def get_pool(self):

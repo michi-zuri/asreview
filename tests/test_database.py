@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import asreview as asr
 from asreview.data.loader import load_records
 from asreview.database.database import CURRENT_DATABASE_VERSION
 from asreview.database.database import REQUIRED_TABLES
+from asreview.database.database import uuid7
 from asreview.data.record import Record
 
 
@@ -261,6 +263,46 @@ def test_label_record(db):
     db.input.add_records(records)
     groups = [(0, 0), (0, 1), (0, 2), (3, 3), (3, 4)]
     db.input.set_groups(groups)
+
+    # Create a tag group with tag options so we can test tag storage
+    db._ensure_tag_groups_table()
+    db._ensure_tag_options_table()
+    tag_group_cur = db._conn.cursor()
+    group_id = uuid7()
+    option_id = uuid7()
+    tag_group_cur.execute(
+        """INSERT INTO tag_groups
+           (group_id, export_name, label_name, required_for_relevant,
+            required_for_irrelevant, all_required, single,
+            input_helper_text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            group_id,
+            "test_group",
+            "Test Group",
+            0,
+            0,
+            0,
+            0,
+            "",
+        ),
+    )
+    tag_group_cur.execute(
+        """INSERT INTO tag_options
+           (option_id, group_id, export_name, label_name,
+            free_text_enabled, free_text_required)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            option_id,
+            group_id,
+            "tag1",
+            "Tag 1",
+            0,
+            0,
+        ),
+    )
+    db._conn.commit()
+
     con = db._conn
     cur = con.cursor()
     cur.executemany(
@@ -287,45 +329,72 @@ def test_label_record(db):
         ),
     )
     con.commit()
+
+    tags_empty = []
+
+    def _make_tag_group(checked):
+        return [{
+            "id": group_id,
+            "export": "test_group",
+            "label": "Test Group",
+            "single_select": False,
+            "required_relevant": False,
+            "required_irrelevant": False,
+            "require_all": False,
+            "input_helper_text": "",
+            "values": [{
+                "id": option_id,
+                "export": "tag1",
+                "label": "Tag 1",
+                "free_text": False,
+                "free_text_required": False,
+                "checked": checked,
+                "text": None,
+            }],
+        }]
+
     state = [
-        [0, None, None, None, "c0", "q0", "b0", "f0", 40],
-        [5, None, None, None, "c5", "q5", "b5", "f5", 45],
+        [0, None, None, "c0", "q0", "b0", "f0", 40, tags_empty],
+        [5, None, None, "c5", "q5", "b5", "f5", 45, tags_empty],
     ]
     columns = [
         "record_id",
         "label",
-        "tags",
         "user_id",
         "classifier",
         "querier",
         "balancer",
         "feature_extractor",
         "training_set",
+        "tags",
     ]
 
     # record_id 0 is grouped and in the table. The existing record is updated, the new
     # records are added with model information of the existing.
-    db.label_record(0, 1, "foo", 2)
-    state[0] = [0, 1, "foo", 2, "c0", "q0", "b0", "f0", 40]
-    state.append([1, 1, "foo", 2, "c0", "q0", "b0", "f0", 40])
-    state.append([2, 1, "foo", 2, "c0", "q0", "b0", "f0", 40])
+    # Tags are saved only for the base record, not for group members.
+    tags_format = [{"id": group_id, "values": [{"id": option_id, "checked": True, "text": None}]}]
+    db.label_record(0, 1, tags_format, 2)
+    state[0] = [0, 1, 2, "c0", "q0", "b0", "f0", 40, _make_tag_group(True)]
+    state.append([1, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty])
+    state.append([2, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty])
     assert_state(db, state, columns)
 
     # record_id 3 is grouped but not in the table. The records are added without model
     # information.
     db.label_record(3, 0)
-    state.append([3, 0, None, None, None, None, None, None, None])
-    state.append([4, 0, None, None, None, None, None, None, None])
+    state.append([3, 0, None, None, None, None, None, None, tags_empty])
+    state.append([4, 0, None, None, None, None, None, None, tags_empty])
     assert_state(db, state, columns)
 
     # record_id 5 is not in a group, but in the table already, so is updated.
     db.label_record(5, 0)
-    state[1] = [5, 0, None, None, "c5", "q5", "b5", "f5", 45]
+    state[1] = [5, 0, None, "c5", "q5", "b5", "f5", 45, tags_empty]
     assert_state(db, state, columns)
 
     # record_id 6 is not grouped and not in the table. It's added without model info.
-    db.label_record(6, 1, "tag", 3)
-    state.append([6, 1, "tag", 3, None, None, None, None, None])
+    tags_format2 = [{"id": group_id, "values": [{"id": option_id, "checked": False, "text": None}]}]
+    db.label_record(6, 1, tags_format2, 3)
+    state.append([6, 1, 3, None, None, None, None, None, _make_tag_group(False)])
     assert_state(db, state, columns)
 
 
@@ -422,46 +491,46 @@ def test_update(db):
     db.input.add_records(records)
     groups = [(0, 0), (0, 1)]
     db.input.set_groups(groups)
-    db.label_record(record_id=0, label=0, tags="foo", user_id=0)
-    db.label_record(record_id=2, label=1, tags="bar", user_id=1)
+    db.label_record(record_id=0, label=0, user_id=0)
+    db.label_record(record_id=2, label=1, user_id=1)
 
-    state = [[0, 0, "foo", 0], [1, 0, "foo", 0], [2, 1, "bar", 1]]
+    state = [[0, 0, [], 0], [1, 0, [], 0], [2, 1, [], 1]]
     changes_state = []
     # Update everything, grouped record.
-    db.update_result(record_id=0, label=1, tags="foofoo", user_id=2)
-    state[0] = [0, 1, "foofoo", 2]
-    state[1] = [1, 1, "foofoo", 2]
+    db.update_result(record_id=0, label=1, user_id=2)
+    state[0] = [0, 1, [], 2]
+    state[1] = [1, 1, [], 2]
     assert_state(db, state, columns=["record_id", "label", "tags", "user_id"])
     changes_state.append([0, 0, 0])
     changes_state.append([1, 0, 0])
     assert_changes_state(db, changes_state)
 
     # Update everything, non-grouped record.
-    db.update_result(record_id=2, label=0, tags="barbar", user_id=3)
-    state[2] = [2, 0, "barbar", 3]
+    db.update_result(record_id=2, label=0, user_id=3)
+    state[2] = [2, 0, [], 3]
     assert_state(db, state, columns=["record_id", "label", "tags", "user_id"])
     changes_state.append([2, 1, 1])
     assert_changes_state(db, changes_state)
 
     # Update only label
     db.update_result(record_id=1, label=0)
-    state[0] = [0, 0, "foofoo", 2]
-    state[1] = [1, 0, "foofoo", 2]
+    state[0] = [0, 0, [], 2]
+    state[1] = [1, 0, [], 2]
     assert_state(db, state, columns=["record_id", "label", "tags", "user_id"])
     changes_state.append([0, 1, 2])
     changes_state.append([1, 1, 2])
     assert_changes_state(db, changes_state)
 
     # Update only tags
-    db.update_result(record_id=2, tags="barbarbar")
-    state[2] = [2, 0, "barbarbar", 3]
+    db.update_result(record_id=2, tags=[])
+    state[2] = [2, 0, [], 3]
     assert_state(db, state, columns=["record_id", "label", "tags", "user_id"])
     assert_changes_state(db, changes_state)
 
     # Update tags check user_id is not changed.
-    db.update_result(record_id=0, tags="foofoofoo", user_id=4)
-    state[0] = [0, 0, "foofoofoo", 2]
-    state[1] = [1, 0, "foofoofoo", 2]
+    db.update_result(record_id=0, tags=[], user_id=4)
+    state[0] = [0, 0, [], 2]
+    state[1] = [1, 0, [], 2]
     assert_state(db, state, columns=["record_id", "label", "tags", "user_id"])
     assert_changes_state(db, changes_state)
 
@@ -762,15 +831,15 @@ def test_lists_table_created(db):
 def test_replace_and_get_lists(db_with_data):
     db = db_with_data
     items = [
-        {"list_id": "L1", "item_id": "a", "name": "alpha", "created": 1.0},
-        {"list_id": "L1", "item_id": "b", "name": "beta", "created": 2.0},
-        {"list_id": "L2", "item_id": "c", "name": "gamma", "created": 1.0},
+        {"list_id": "L1", "item_id": "a", "name": "alpha", "sorted_at": 1.0},
+        {"list_id": "L1", "item_id": "b", "name": "beta", "sorted_at": 2.0},
+        {"list_id": "L2", "item_id": "c", "name": "gamma", "sorted_at": 1.0},
     ]
     db.replace_lists(2, items)
     got = db.get_lists(2)
     assert sorted(i["name"] for i in got) == ["alpha", "beta", "gamma"]
     assert {i["list_id"] for i in got} == {"L1", "L2"}
-    assert all("created" in i for i in got)
+    assert all("sorted_at" in i for i in got)
     # The duplicate column has been removed.
     assert all("duplicate" not in i for i in got)
 
@@ -780,17 +849,17 @@ def test_lists_schema_has_pk_and_unique(db):
     # item_id is the primary key.
     pk_columns = [row[1] for row in cur.execute("PRAGMA table_info(lists)") if row[5]]
     assert pk_columns == ["item_id"]
-    # No duplicate column; created column present.
+    # No duplicate column; sorted_at column present.
     columns = [row[1] for row in cur.execute("PRAGMA table_info(lists)")]
     assert "duplicate" not in columns
-    assert "created" in columns
+    assert "sorted_at" in columns
 
 
 def test_replace_lists_rejects_duplicate_item_id(db_with_data):
     db = db_with_data
     items = [
-        {"list_id": "L1", "item_id": "dup", "name": "alpha", "created": 1.0},
-        {"list_id": "L1", "item_id": "dup", "name": "beta", "created": 2.0},
+        {"list_id": "L1", "item_id": "dup", "name": "alpha", "sorted_at": 1.0},
+        {"list_id": "L1", "item_id": "dup", "name": "beta", "sorted_at": 2.0},
     ]
     with pytest.raises(sqlite3.IntegrityError):
         db.replace_lists(2, items)
@@ -799,8 +868,8 @@ def test_replace_lists_rejects_duplicate_item_id(db_with_data):
 def test_replace_lists_rejects_duplicate_name(db_with_data):
     db = db_with_data
     items = [
-        {"list_id": "L1", "item_id": "a", "name": "same", "created": 1.0},
-        {"list_id": "L1", "item_id": "b", "name": "same", "created": 2.0},
+        {"list_id": "L1", "item_id": "a", "name": "same", "sorted_at": 1.0},
+        {"list_id": "L1", "item_id": "b", "name": "same", "sorted_at": 2.0},
     ]
     with pytest.raises(sqlite3.IntegrityError):
         db.replace_lists(2, items)
@@ -809,9 +878,9 @@ def test_replace_lists_rejects_duplicate_name(db_with_data):
 def test_get_lists_ordered_by_created(db_with_data):
     db = db_with_data
     items = [
-        {"list_id": "L1", "item_id": "a", "name": "third", "created": 30.0},
-        {"list_id": "L1", "item_id": "b", "name": "first", "created": 10.0},
-        {"list_id": "L1", "item_id": "c", "name": "second", "created": 20.0},
+        {"list_id": "L1", "item_id": "a", "name": "third", "sorted_at": 30.0},
+        {"list_id": "L1", "item_id": "b", "name": "first", "sorted_at": 10.0},
+        {"list_id": "L1", "item_id": "c", "name": "second", "sorted_at": 20.0},
     ]
     db.replace_lists(2, items)
     got = [i["name"] for i in db.get_lists(2) if i["list_id"] == "L1"]

@@ -163,4 +163,4 @@ def _validate(project):
         raise ValueError("Migrated project is missing results.db.")
 
     with Database(results_db_fp) as db:
-        db._is_valid()
+        db._is_valid(expected_version=3)

@@ -1,7 +1,6 @@
 import {
   Box,
   Button,
-  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
@@ -20,12 +19,8 @@ import useMediaQuery from "@mui/material/useMediaQuery";
 
 import {
   DatasetCard,
-  HighlightCard,
-  ListCard,
   ModelCard,
   PriorCard,
-  ScreeningCard,
-  TagCard,
 } from "ProjectComponents/SetupComponents";
 import { ProjectAPI } from "api";
 import { ProjectContext } from "context/ProjectContext";
@@ -105,7 +100,6 @@ const SetupDialog = ({ project_id, mode, open, onClose }) => {
   const fullScreen = useMediaQuery((theme) => theme.breakpoints.down("md"));
 
   // state management
-  const [showSettings, setShowSettings] = React.useState(false);
   const [feedbackBar, setFeedbackBar] = React.useState(null);
   const [simulationStarted, setSimulationStarted] = React.useState(false);
 
@@ -155,8 +149,6 @@ const SetupDialog = ({ project_id, mode, open, onClose }) => {
                 : `Your project has been saved as draft`,
             );
             setSimulationStarted(false);
-
-            setShowSettings(false);
           },
         }}
         closeAfterTransition={false}
@@ -182,46 +174,13 @@ const SetupDialog = ({ project_id, mode, open, onClose }) => {
                   </Box>
                 </>
               ) : (
-                <>
-                  <Collapse in={!showSettings}>
-                    <Box sx={{ mt: 3 }}>
-                      <DatasetCard
-                        project_id={data?.id}
-                        onResetDataset={onClose}
-                        hideLabeledInfo={false}
-                      />
-                    </Box>
-                  </Collapse>
-
-                  <Box sx={{ textAlign: "center", my: 2 }}>
-                    <Button onClick={() => setShowSettings(!showSettings)}>
-                      {showSettings ? "Show dataset" : "Show options"}
-                    </Button>
-                  </Box>
-                  <Collapse in={showSettings} mountOnEnter>
-                    <Box sx={{ mb: 3 }}>
-                      <ScreeningCard />
-                    </Box>
-                    <Box sx={{ mb: 3 }}>
-                      <HighlightCard project_id={data?.id} />
-                    </Box>
-                    <Box sx={{ mb: 3 }}>
-                      <TagCard
-                        project_id={data?.id}
-                        mobileScreen={fullScreen}
-                      />
-                    </Box>
-                    <Box sx={{ mb: 3 }}>
-                      <ListCard project_id={data?.id} />
-                    </Box>
-                    <Box sx={{ my: 3 }}>
-                      <ModelCard mode={mode} />
-                    </Box>
-                    <Box sx={{ my: 3 }}>
-                      <PriorCard mode={mode} />
-                    </Box>
-                  </Collapse>
-                </>
+                <Box sx={{ mt: 3 }}>
+                  <DatasetCard
+                    project_id={data?.id}
+                    onResetDataset={onClose}
+                    hideLabeledInfo={false}
+                  />
+                </Box>
               )}
             </DialogContent>
             <DialogActions>
