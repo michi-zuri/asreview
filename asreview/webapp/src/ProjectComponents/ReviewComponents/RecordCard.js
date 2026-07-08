@@ -24,7 +24,7 @@ import { StyledIconButton } from "StyledComponents/StyledButton";
 import { useToggle } from "hooks/useToggle";
 import { useHighlightToggle } from "hooks/useHighlightToggle";
 import { DOIIcon } from "icons";
-import { RecordCardLabeler, RecordCardModelTraining } from ".";
+import { LlmResultCard, RecordCardLabeler, RecordCardModelTraining } from ".";
 import { useTheme } from "@mui/material/styles";
 import {
   buildHighlightPatterns,
@@ -304,6 +304,7 @@ const RecordCard = ({
   project_id,
   record,
   afterDecision = null,
+  onDiscarded = null,
   retrainAfterDecision = true,
   showBorder = true,
   fontSize = 1,
@@ -360,6 +361,11 @@ const RecordCard = ({
           borderRadius: !showBorder ? 0 : undefined,
         })}
       >
+        <LlmResultCard
+          project_id={project_id}
+          record_id={record.record_id}
+          llm={record.llm}
+        />
         <Grid
           container
           columns={5}
@@ -390,6 +396,7 @@ const RecordCard = ({
               onDecisionClose={
                 transitionType ? () => setOpen(false) : afterDecision
               }
+              onDiscarded={onDiscarded}
               retrainAfterDecision={retrainAfterDecision}
               note={record.state?.note}
               labelTime={record.state?.time}

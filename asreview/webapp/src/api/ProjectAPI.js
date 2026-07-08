@@ -1027,6 +1027,74 @@ class ProjectAPI {
         });
     });
   }
+
+  static fetchLlmMeta({ queryKey }) {
+    const { project_id, record_id } = queryKey[1];
+    const url = api_url + `projects/${project_id}/record/${record_id}/llm`;
+    return new Promise((resolve, reject) => {
+      axios
+        .get(url, { withCredentials: true })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static sendHeartbeat(variables) {
+    const url =
+      api_url +
+      `projects/${variables.project_id}/record/${variables.record_id}/heartbeat`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static fetchLlmSettings({ queryKey }) {
+    const { project_id } = queryKey[1];
+    const url = api_url + `projects/${project_id}/llm_settings`;
+    return new Promise((resolve, reject) => {
+      axios
+        .get(url, { withCredentials: true })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static mutateLlmSettings(variables) {
+    const { project_id, ...settings } = variables;
+    const url = api_url + `projects/${project_id}/llm_settings`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "put",
+        url: url,
+        data: settings,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
 }
 
 export default ProjectAPI;

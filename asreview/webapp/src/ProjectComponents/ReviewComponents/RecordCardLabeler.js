@@ -942,6 +942,7 @@ const RecordCardLabeler = ({
   labelTime = null,
   user = null,
   onDecisionClose = null,
+  onDiscarded = null,
   hotkeys = false,
   landscape = false,
   retrainAfterDecision = true,
@@ -973,7 +974,14 @@ const RecordCardLabeler = ({
   const { error, isError, isLoading, mutate, isSuccess } = useMutation(
     ProjectAPI.mutateClassification,
     {
-      onSuccess: () => {
+      onSuccess: (data) => {
+        const discarded = data?.discarded || data?.data?.discarded;
+        if (discarded && onDiscarded) {
+          onDiscarded(
+            data?.message || data?.data?.message || "Label discarded.",
+          );
+          return;
+        }
         if (onDecisionClose) {
           onDecisionClose();
         }

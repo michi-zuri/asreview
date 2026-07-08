@@ -2298,6 +2298,39 @@ def api_get_record(project):  # noqa: F401
     return jsonify({"result": item, "status": "review"})
 
 
+@bp.route("/projects/<project_id>/record/<record_id>/llm", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_record_llm(project, record_id):  # noqa: F401
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        meta = db.get_llm_meta(int(record_id), prompt_hash)
+    return jsonify(meta)
+
+
+@bp.route("/projects/<project_id>/llm_settings", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_llm_settings(project):  # noqa: F401
+    return jsonify(_llm_settings(project))
+
+
+@bp.route("/projects/<project_id>/llm_settings", methods=["PUT"])
+@login_required
+@project_authorization
+def api_update_llm_settings(project):  # noqa: F401
+    body = request.get_json(silent=True) or {}
+    current = _llm_settings(project)
+    merged = {**current, **{k: body[k] for k in DEFAULT_LLM_SETTINGS
+                            if k in body}}
+    merged["buffer_size"] = max(1, int(merged["buffer_size"]))
+    merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
+    merged["stale_timeout"] = max(1, int(merged["stale_timeout"]))
+    merged["criteria_text"] = str(merged["criteria_text"])
+    project.update_config(llm=merged)
+    return jsonify(_llm_settings(project))
+
+
 @bp.route("/projects/<project_id>/delete", methods=["DELETE"])
 @login_required
 @project_authorization

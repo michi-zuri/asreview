@@ -1,0 +1,231 @@
+========================================================================
+PHASE 5 — Frontend: criteria panel, LLM result card + polling, settings
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: Phases 3 and 4 merged (backend already pre-fills the form
+server-side and exposes item["llm"], the heartbeat route, and llm settings
+in project.config["llm"]).
+
+This is a React phase. There are no pytest tests here; you VERIFY by building
+the frontend. See "VERIFY" at the bottom. Match the existing MUI v5 + react-query
+conventions in the files you touch. Do NOT restyle unrelated components.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/webapp/src/Components/Header.js
+      The "Go on adventure with Elas" button lives here, gated by
+      `project_id && isReviewPath`, inside the right-hand
+      <Box sx={{ display: "flex", alignItems: "center" }}>. The lightbulb
+      criteria button goes immediately BEFORE that Tooltip/IconButton.
+  - asreview/webapp/src/api/ProjectAPI.js
+      Convention: each call is a `static` method returning a Promise wrapping
+      axios, using `api_url + \`projects/${project_id}/...\``. Copy the exact
+      shape of fetchInfo / mutateInfo / fetchRecord.
+  - asreview/webapp/src/ProjectComponents/ReviewComponents/ReviewPage.js
+      Fetches the record via ProjectAPI.fetchRecord (react-query). The record
+      object now carries item["llm"] (may be null) and pre-filled
+      item.state.tags / item.state.lists (done server-side in Phase 3).
+  - asreview/webapp/src/ProjectComponents/ReviewComponents/RecordCard.js
+      Where per-record cards render. The LLM result card mounts here.
+  - asreview/webapp/src/ProjectComponents/DetailsComponents/DetailsPage.js
+      Renders setting cards (ScreeningCard, TagCard, ListCard, ModelCard...).
+      The new LlmSettingsCard mounts here. Look at one existing *Card to copy
+      the read(fetchInfo)/save(mutateInfo) pattern and MUI Card layout.
+
+The backend `item["llm"]` object (from Phase 3 get_llm_meta) has keys:
+  status ("queued"|"in_flight"|"ready"|"failed"|"missing_pdf"),
+  dispatched_at (epoch seconds, UTC), attempts, last_error, has_result (bool),
+  and when has_result: model, input_tokens, output_tokens, created_at.
+item["llm"] is null when the record was never dispatched.
+
+------------------------------------------------------------------------
+PART A — ProjectAPI methods (asreview/webapp/src/api/ProjectAPI.js)
+------------------------------------------------------------------------
+Add three static methods, each following the file's existing Promise/axios
+shape exactly:
+
+  1. fetchLlmMeta({ queryKey })
+        queryKey = ["fetchLlmMeta", { project_id, record_id }]
+        GET  projects/${project_id}/record/${record_id}/llm
+     (Backend note: this endpoint does NOT exist yet — add it in PART E.)
+
+  2. sendHeartbeat(variables)   // variables: { project_id, record_id }
+        POST projects/${project_id}/record/${record_id}/heartbeat
+        resolves with response.data ({ active: bool })
+
+  3. LLM settings need DEDICATED JSON endpoints — do NOT reuse fetchInfo/
+     mutateInfo. (VERIFIED: the existing PUT projects/<id>/info route reads
+     request.form.to_dict(), a FLAT string dict; it cannot carry the nested
+     "llm" settings object, so reusing it would silently drop the settings.)
+     Add:
+        fetchLlmSettings({ queryKey })
+            queryKey = ["fetchLlmSettings", { project_id }]
+            GET  projects/${project_id}/llm_settings
+            resolves with response.data (the settings object)
+        mutateLlmSettings(variables)   // { project_id, ...settings }
+            PUT  projects/${project_id}/llm_settings
+            Send the settings as a JSON body (axios data: {...}, NOT form data),
+            resolves with response.data.
+     The backend routes for these are in PART E.
+
+------------------------------------------------------------------------
+PART B — LLM result card
+  (new file: asreview/webapp/src/ProjectComponents/ReviewComponents/
+             LlmResultCard.js)
+------------------------------------------------------------------------
+A small MUI <Card> that takes props { project_id, record_id, llm } where `llm`
+is the initial item["llm"] from the record fetch.
+
+Behavior:
+  - If `llm` is null: render nothing (return null).
+  - Poll ProjectAPI.fetchLlmMeta with react-query, ONLY while the status is a
+    non-terminal state ("queued" | "in_flight"): set refetchInterval to 4000,
+    seed initialData with the `llm` prop. Terminal states
+    ("ready" | "failed" | "missing_pdf") stop polling (refetchInterval false).
+  - Render by status:
+      queued / in_flight -> a small CircularProgress + "Analyzing full text…"
+      ready              -> a check icon + a compact metadata line:
+                            model, latency (created_at − dispatched_at, in s),
+                            input/output tokens, dispatched time (local).
+      failed             -> plain error text incl. last_error.
+      missing_pdf        -> plain text "No PDF available for this record."
+  - This card is INFORMATIONAL only. The actual pre-fill of the label/list
+    controls already happened server-side (Phase 3) and flows through
+    RecordCardLabeler's existing state initializers — do NOT re-implement
+    pre-fill here, and do NOT auto-submit anything.
+
+Mount <LlmResultCard project_id record_id llm={record.state ? record.llm : ...}/>
+inside RecordCard.js near the top of the record's card stack (above the
+labeler). Read RecordCard.js to see how it receives the record object and the
+project_id, and pass record.llm through.
+
+------------------------------------------------------------------------
+PART C — heartbeat integration (ReviewPage.js)
+------------------------------------------------------------------------
+While a record is open, POST a heartbeat every 60s:
+  - Use a react-query useMutation or a useEffect+setInterval that calls
+    ProjectAPI.sendHeartbeat({ project_id, record_id }) every 60000 ms.
+  - On response { active: false }: the current checkout was reassigned. Discard
+    the open record and refetch the next one (invalidate/refetch the
+    fetchRecord query the page already uses). Show a brief non-blocking notice
+    (snackbar/toast in the app's existing style, or a simple console-free MUI
+    Alert) e.g. "This article was reassigned; loading the next one."
+  - Clear the interval on unmount and when record_id changes.
+Read ReviewPage.js to find the record_id in scope and the existing query key so
+you invalidate the right query.
+
+Also handle the label-submit "discarded" response: the label mutation used by
+RecordCardLabeler may now receive { discarded: true, message } (Phase 3). On
+that response, show the message as a notice and advance to the next record
+instead of treating it as a normal successful label. Find the label mutation
+(search RecordCardLabeler.js for the mutate that POSTs the label/decision) and
+branch on response.data.discarded.
+
+------------------------------------------------------------------------
+PART D — criteria panel (lightbulb button + drawer)
+------------------------------------------------------------------------
+  - In Header.js, immediately before the existing "Go on adventure with Elas"
+    Tooltip/IconButton (same `project_id && isReviewPath` gate), add a
+    Tooltip("Screening criteria") + IconButton with a lightbulb icon
+    (import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined")
+    that toggles a right-side MUI <Drawer> (use the existing useToggle hook, as
+    ElasGame does with toggleGame).
+  - New component asreview/webapp/src/ProjectComponents/ReviewComponents/
+    CriteriaPanel.js: a <Drawer anchor="right">. It reads the criteria text via
+    ProjectAPI.fetchLlmSettings (settings.criteria_text) for the current
+    project_id and renders it as markdown. The repo already renders markdown
+    somewhere — search src for an existing markdown renderer
+    (rg "react-markdown|ReactMarkdown|MarkdownText" src) and reuse it; if none
+    exists, render the text in a <Typography sx={{ whiteSpace: "pre-wrap" }}>.
+    Do NOT add a new markdown dependency.
+  - If criteria_text is empty, show a muted placeholder "No screening criteria
+    have been configured yet."
+
+------------------------------------------------------------------------
+PART E — backend: the llm-meta GET endpoint used by PART A.1
+  (asreview/webapp/_api/projects.py)
+------------------------------------------------------------------------
+Add a tiny read-only route (model it on api_get_record's decorators/user_id
+handling, reuse _current_prompt_hash + get_llm_meta from Phase 3):
+
+    @bp.route("/projects/<project_id>/record/<record_id>/llm", methods=["GET"])
+    @login_required
+    @project_authorization
+    def api_get_record_llm(project, record_id):  # noqa: F401
+        prompt_hash = _current_prompt_hash(project)
+        with project.db as db:
+            meta = db.get_llm_meta(int(record_id), prompt_hash)
+        return jsonify(meta)   # null when never dispatched
+
+Also add the two dedicated LLM-settings routes (JSON, NOT form-encoded — the
+existing api_update_project_info can't carry the nested "llm" object). Reuse
+_llm_settings and DEFAULT_LLM_SETTINGS from Phase 3:
+
+    @bp.route("/projects/<project_id>/llm_settings", methods=["GET"])
+    @login_required
+    @project_authorization
+    def api_get_llm_settings(project):  # noqa: F401
+        return jsonify(_llm_settings(project))
+
+    @bp.route("/projects/<project_id>/llm_settings", methods=["PUT"])
+    @login_required
+    @project_authorization
+    def api_update_llm_settings(project):  # noqa: F401
+        body = request.get_json(silent=True) or {}
+        # merge onto current, coerce numeric fields, keep only known keys
+        current = _llm_settings(project)
+        merged = {**current, **{k: body[k] for k in DEFAULT_LLM_SETTINGS
+                                if k in body}}
+        merged["buffer_size"] = max(1, int(merged["buffer_size"]))
+        merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
+        merged["stale_timeout"] = max(1, int(merged["stale_timeout"]))
+        merged["criteria_text"] = str(merged["criteria_text"])
+        project.update_config(llm=merged)
+        # NOTE: Phase 6 adds the auto-reprocess trigger to THIS route.
+        return jsonify(_llm_settings(project))
+
+------------------------------------------------------------------------
+PART F — LLM settings card (DetailsComponents)
+------------------------------------------------------------------------
+New file asreview/webapp/src/ProjectComponents/DetailsComponents/
+LlmSettingsCard.js, mounted in DetailsPage.js alongside the other cards
+(guard with mode !== projectModes.SIMULATION like its neighbors).
+
+Fields (read via fetchLlmSettings, write via mutateLlmSettings):
+  - buffer_size          number, default 20   (min 1)
+  - max_concurrent_llm   number, default 3    (min 1)
+  - stale_timeout        number of HOURS in the UI, default 24; convert to/from
+                         SECONDS on save/load (backend stores seconds)
+  - criteria_text        multiline text area (this is the SINGLE SOURCE OF TRUTH
+                         shown in the criteria panel and injected into the
+                         prompt — see §5 of the spec)
+Use mutateLlmSettings (useMutation) + invalidate the fetchLlmSettings query on
+success + a Save button that disables while pristine/saving. Copy the layout of
+an existing settings card. On save, send stale_timeout in SECONDS (hours × 3600).
+Warn inline,
+via a small helper text under criteria_text, that editing it changes the prompt
+and will re-screen not-yet-labeled records (the auto-reprocess itself is
+backend Phase 6 — this is just the copy).
+
+------------------------------------------------------------------------
+VERIFY
+------------------------------------------------------------------------
+Frontend build (do NOT run pytest for this phase):
+    cd /Users/killi/Dev/asreview/asreview/asreview/webapp
+    # inspect package manager: there is a package.json here.
+    npm ci   # or: npm install, if ci fails for lockfile reasons
+    npm run build
+Paste the tail of the build output. It MUST compile with no new errors.
+If a lint step exists (npm run lint), run it and paste the result.
+
+DONE WHEN
+  - npm run build succeeds.
+  - Lightbulb criteria button sits next to the ELAS button and opens a drawer
+    showing project.config.llm.criteria_text.
+  - LlmResultCard shows analyzing/ready/failed/missing_pdf and polls only while
+    non-terminal.
+  - ReviewPage sends a 60s heartbeat and advances on {active:false} and on a
+    {discarded:true} label response.
+  - LlmSettingsCard reads/writes buffer_size, max_concurrent_llm, stale_timeout
+    (hours↔seconds), and criteria_text.
+  - GET .../record/<id>/llm and GET/PUT .../llm_settings routes added.
+========================================================================
