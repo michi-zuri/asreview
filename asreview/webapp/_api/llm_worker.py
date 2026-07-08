@@ -17,7 +17,18 @@
 import base64
 import json
 import logging
+import os
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor
 
+import anthropic
+
+import asreview as asr
+from asreview.database.database import open_db
+from asreview.webapp._api.llm_prompt import build_system_prompt
+from asreview.webapp._api.pdf_resolver import PdfResolver
+from asreview.webapp._api.utils import read_tags_data, read_lists_data
 from asreview.webapp._api.zotero import ZoteroLookupError
 
 
@@ -143,3 +154,145 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
         input_tokens=in_tok, output_tokens=out_tok,
     )
     return "ready"
+
+
+# Transient HTTP status codes that warrant a retry.
+_TRANSIENT_STATUS = {429, 500, 502, 503, 529}
+
+
+def _default_is_transient(exc):
+    """Return True for transient Anthropic API errors."""
+    if isinstance(exc, (anthropic.APIConnectionError,
+                        anthropic.RateLimitError,
+                        anthropic.InternalServerError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        return getattr(exc, "status_code", None) in _TRANSIENT_STATUS
+    return False
+
+
+def process_with_retry(db, resolver, client, record, prompt, prompt_hash,
+                       model, max_attempts=5, base_delay=1.0,
+                       max_delay=60.0, is_transient=None,
+                       sleep=time.sleep, jitter=random.random):
+    """Run screen_record with exponential backoff + jitter on transient errors.
+
+    Returns the final status string. On a non-transient error, or after
+    max_attempts transient errors, marks the dispatch row failed and returns
+    "failed".
+    """
+    is_transient = is_transient or _default_is_transient
+    record_id = record.record_id
+    attempt = 0
+    while True:
+        try:
+            start = time.time()
+            status = screen_record(db, resolver, client, record, prompt,
+                                   prompt_hash, model)
+            logging.info(
+                "llm screen record_id=%s status=%s latency=%.2fs",
+                record_id, status, time.time() - start,
+            )
+            return status
+        except Exception as err:
+            attempt += 1
+            db.increment_dispatch_attempts(record_id)
+            if not is_transient(err) or attempt >= max_attempts:
+                logging.warning(
+                    "record %s failed after %d attempt(s): %s",
+                    record_id, attempt, err,
+                )
+                db.mark_dispatch_failed(record_id, err)
+                return "failed"
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1))) \
+                + jitter()
+            logging.info(
+                "record %s transient error (attempt %d): %s; retrying in "
+                "%.1fs", record_id, attempt, err, delay,
+            )
+            sleep(delay)
+
+
+def run_worker_once(project, client, model, criteria_text="",
+                    max_concurrent=3, max_attempts=5,
+                    db_factory=None, resolver_factory=None):
+    """Claim and process all currently-queued dispatch rows once.
+
+    Returns the number of records processed. Builds the current system
+    prompt from the project's tags/lists + criteria_text. Each pooled
+    job opens its own Database (db_factory) so sqlite is never shared
+    across threads.
+    """
+    # criteria_text has no project-level storage yet (planned for Phase 5);
+    # it defaults to "".
+    tags = read_tags_data(project.db)
+    lists = read_lists_data(project)
+    prompt, prompt_hash = build_system_prompt(tags, lists, criteria_text)
+
+    db_factory = db_factory or (lambda: open_db(project.db_path))
+    resolver_factory = resolver_factory or (
+        lambda: PdfResolver(project.project_path)
+    )
+
+    claimed = []
+    while True:
+        rid = project.db.claim_next_queued_dispatch()
+        if rid is None:
+            break
+        claimed.append(rid)
+    if not claimed:
+        return 0
+
+    def _job(record_id):
+        job_db = db_factory()
+        try:
+            resolver = resolver_factory()
+            record = job_db.input.get_records(record_id)
+            return process_with_retry(
+                job_db, resolver, client, record, prompt, prompt_hash,
+                model, max_attempts=max_attempts,
+            )
+        finally:
+            job_db.close()
+
+    with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+        list(pool.map(_job, claimed))
+    return len(claimed)
+
+
+def run_worker(project_path, model=None, criteria_text="",
+               max_concurrent=None, poll_interval=5.0):
+    """Continuously drain a project's LLM queue using the real client."""
+    model = model or os.environ.get("ASREVIEW_LLM_MODEL", "claude-opus-4-8")
+    if max_concurrent is None:
+        max_concurrent = int(
+            os.environ.get("ASREVIEW_LLM_MAX_CONCURRENT", "3")
+        )
+    client = anthropic.Anthropic()
+    with asr.Project(project_path) as project:
+        while True:
+            n = run_worker_once(
+                project, client, model, criteria_text=criteria_text,
+                max_concurrent=max_concurrent,
+            )
+            if n == 0:
+                time.sleep(poll_interval)
+
+
+def main():
+    """CLI entrypoint for the LLM screening worker."""
+    import argparse
+    logging.basicConfig(level=logging.INFO)
+    ap = argparse.ArgumentParser(description="ASReview LLM screening worker")
+    ap.add_argument("project_path")
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--max-concurrent", type=int, default=None)
+    ap.add_argument("--poll-interval", type=float, default=5.0)
+    args = ap.parse_args()
+    run_worker(args.project_path, model=args.model,
+               max_concurrent=args.max_concurrent,
+               poll_interval=args.poll_interval)
+
+
+if __name__ == "__main__":
+    main()

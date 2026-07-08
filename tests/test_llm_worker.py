@@ -213,3 +213,127 @@ def test_transient_propagates(db, tmp_path):
     # Dispatch status should still be 'queued' (not 'failed')
     status, _ = _dispatch_status(db, 0)
     assert status == "queued"
+
+
+# --- process_with_retry tests ---
+
+
+class Transient(Exception):
+    pass
+
+
+def _retry_harness(tmp_path):
+    """Build a fresh in-memory db with one claimed dispatch row and a PDF."""
+    db = asr.Database(":memory:")
+    db.create_tables()
+    db.input.add_records([Record(0, "d")])
+    db.add_last_ranking([0], "nb", "max", "balanced", "tfidf", 0)
+    db.top_up_dispatch(1, "H")
+    db.claim_next_queued_dispatch()
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.7")
+    resolver = FakeResolver(pdf)
+    client = mock.MagicMock()
+    return db, resolver, client
+
+
+def test_retry_transient_then_success(tmp_path):
+    """Transient error then success: returns 'ready', attempts==1."""
+    db, resolver, client = _retry_harness(tmp_path)
+    client.messages.create.side_effect = [
+        Transient(),
+        make_response('{"labels":[]}'),
+    ]
+
+    status = llm_worker.process_with_retry(
+        db, resolver, client, fake_record(), "prompt", "H",
+        "claude-opus-4-8",
+        is_transient=lambda e: isinstance(e, Transient),
+        sleep=lambda s: None,
+        jitter=lambda: 0.0,
+    )
+
+    assert status == "ready"
+    _, _, attempts = _dispatch_status_full(db, 0)
+    assert attempts == 1
+
+
+def test_retry_give_up_after_max(db, tmp_path):
+    """Always transient, max_attempts=3: returns 'failed', attempts==3."""
+    # Use the module-level db fixture since _retry_harness doesn't need
+    # claim_next here (screen_record will try to re-claim, but the harness
+    # has the claim). Actually we need a proper harness for process_with_retry
+    # which calls screen_record -> needs a PDF and a dispatch row claimed.
+    db2, resolver, client = _retry_harness(tmp_path)
+    client.messages.create.side_effect = Transient()
+
+    status = llm_worker.process_with_retry(
+        db2, resolver, client, fake_record(), "prompt", "H",
+        "claude-opus-4-8", max_attempts=3,
+        is_transient=lambda e: isinstance(e, Transient),
+        sleep=lambda s: None,
+        jitter=lambda: 0.0,
+    )
+
+    assert status == "failed"
+    status_col, _, attempts = _dispatch_status_full(db2, 0)
+    assert status_col == "failed"
+    assert attempts == 3
+
+
+def test_retry_non_transient(db, tmp_path):
+    """Non-transient error with default is_transient: fails after 1 attempt."""
+    db2, resolver, client = _retry_harness(tmp_path)
+    client.messages.create.side_effect = ValueError("boom")
+
+    status = llm_worker.process_with_retry(
+        db2, resolver, client, fake_record(), "prompt", "H",
+        "claude-opus-4-8",
+        sleep=lambda s: None,
+        jitter=lambda: 0.0,
+    )
+
+    assert status == "failed"
+    _, _, attempts = _dispatch_status_full(db2, 0)
+    assert attempts == 1
+
+
+def _dispatch_status_full(db, record_id):
+    """Return (status, last_error, attempts) from llm_dispatch."""
+    cur = db._conn.cursor()
+    return cur.execute(
+        "SELECT status, last_error, attempts FROM llm_dispatch "
+        "WHERE record_id = ?", (record_id,),
+    ).fetchone()
+
+
+# --- run_worker_once test ---
+
+
+def test_run_worker_once(tmp_path):
+    """run_worker_once processes all 3 queued dispatch rows."""
+    proj = asr.Project.create(Path(tmp_path, "proj"))
+    proj.db.input.add_records([Record(i, "d") for i in range(3)])
+    proj.db.add_last_ranking([0, 1, 2], "nb", "max", "balanced", "tfidf", 0)
+    proj.db.top_up_dispatch(3, "seed")
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.7")
+    client = types.SimpleNamespace(messages=types.SimpleNamespace(
+        create=mock.Mock(return_value=make_response('{"labels":[],"lists":[]}'))))
+
+    n = llm_worker.run_worker_once(
+        proj, client, "claude-opus-4-8", max_concurrent=1,
+        resolver_factory=lambda: FakeResolver(pdf))
+
+    assert n == 3
+    cur = proj.db._conn.cursor()
+    rows = cur.execute(
+        "SELECT record_id, status FROM llm_dispatch ORDER BY record_id"
+    ).fetchall()
+    for rid, status in rows:
+        assert status == "ready", f"record {rid} status is {status}"
+
+    result_count = cur.execute(
+        "SELECT COUNT(*) FROM llm_results"
+    ).fetchone()[0]
+    assert result_count == 3
