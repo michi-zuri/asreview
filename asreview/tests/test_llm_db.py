@@ -73,3 +73,28 @@ def test_migration_path(db):
     tables = _tables(db)
     assert "llm_dispatch" in tables
     assert "llm_results" in tables
+
+
+def test_results_has_assigned_at_and_last_active(db):
+    """After create_tables, results table includes assigned_at and last_active."""
+    cols = _columns(db, "results")
+    assert "assigned_at" in cols
+    assert "last_active" in cols
+
+
+def test_original_results_columns_present(db):
+    """Spot-check that the original results columns are still present."""
+    cols = _columns(db, "results")
+    assert "record_id" in cols
+    assert "label" in cols
+    assert "note" in cols
+    assert "user_id" in cols
+
+
+def test_fix_results_schema_idempotent(db):
+    """Calling _fix_results_schema again does not duplicate columns."""
+    db._fix_results_schema(db._conn.cursor())
+    db._fix_results_schema(db._conn.cursor())
+    cols = _columns(db, "results")
+    assert cols.count("assigned_at") == 1
+    assert cols.count("last_active") == 1

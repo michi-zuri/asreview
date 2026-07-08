@@ -1,0 +1,86 @@
+========================================================================
+TASK 1b — Add assigned_at and last_active columns to the results table
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: task 1a already merged.
+
+GOAL
+  Add two nullable columns to the per-project ``results`` table:
+    - assigned_at  (REAL, unix timestamp) — when a record was checked out.
+    - last_active  (REAL, unix timestamp) — last heartbeat/autosave; drives
+      stale-checkout reassignment.
+  They must exist for BOTH new projects and existing (migrated) projects.
+  (There is NO draft column — decided: no drafts, only filled-out forms.)
+
+BEFORE WRITING ANYTHING — read the pattern
+  Open asreview/database/database.py and study:
+    - create_tables(self): the inline ``CREATE TABLE results (...)`` DDL.
+    - _fix_record_schema(self, cur): the template for additive column
+      migrations — it reads PRAGMA table_info and runs
+      ``ALTER TABLE ... ADD COLUMN ...`` guarded by "if col not in columns".
+    - _is_valid(self): note the CRITICAL ordering — it checks that every key
+      of RESULTS_TABLE_COLUMNS_PANDAS_DTYPES exists in the results table and
+      RAISES if any is missing, BEFORE the `if not self.read_only:` block runs
+      the _fix_* migrations.
+
+  IMPORTANT CONSEQUENCE: do NOT add assigned_at / last_active to
+  RESULTS_TABLE_COLUMNS_PANDAS_DTYPES. If you did, every existing project would
+  fail _is_valid on open (the missing-columns check runs before the migration
+  that would add them). Leaving them out is fine: get_pending uses
+  ``SELECT *`` and the dtype dict only maps the columns it lists; extra columns
+  are returned with an inferred dtype and cause no error.
+
+WHAT TO IMPLEMENT
+  1. In create_tables(self), extend the inline ``CREATE TABLE results`` DDL by
+     adding two columns at the end of the column list:
+         note TEXT,
+         user_id INTEGER,
+         assigned_at REAL,
+         last_active REAL)
+     (Keep all existing columns and their order; just append the two.)
+
+  2. Add a new method mirroring _fix_record_schema:
+
+       def _fix_results_schema(self, cur):
+           """Add columns introduced after the initial results schema."""
+           columns = [
+               row[1] for row in cur.execute("PRAGMA table_info(results)")
+           ]
+           if "assigned_at" not in columns:
+               cur.execute("ALTER TABLE results ADD COLUMN assigned_at REAL")
+               self._conn.commit()
+           if "last_active" not in columns:
+               cur.execute("ALTER TABLE results ADD COLUMN last_active REAL")
+               self._conn.commit()
+
+  3. Call self._fix_results_schema(cur) inside _is_valid(self), in the
+     `if not self.read_only:` block, alongside the other _fix_* calls (e.g.
+     right after self._fix_record_schema(cur)).
+
+  Do NOT change CURRENT_DATABASE_VERSION or RESULTS_TABLE_COLUMNS_PANDAS_DTYPES.
+  Change no other file.
+
+TEST (write this, then run it)
+  Append to asreview/tests/test_llm_db.py (reuse the existing `db` and
+  `_columns` helpers from task 1a — do NOT redeclare them).
+
+  Cover:
+    1. After create_tables (the db fixture), the results table columns include
+       both "assigned_at" and "last_active" (use _columns(db, "results")).
+    2. The original results columns are still present (spot-check: record_id,
+       label, note, user_id).
+    3. Idempotency: db._fix_results_schema(db._conn.cursor()) does not raise
+       and does not duplicate columns (count of "assigned_at" occurrences in
+       _columns is exactly 1 afterwards).
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/tests/test_llm_db.py -q
+  Paste the full pytest output. Do not report done until green.
+
+DONE WHEN
+  - Fresh projects get assigned_at + last_active from the DDL; existing
+    projects get them via _fix_results_schema in _is_valid.
+  - RESULTS_TABLE_COLUMNS_PANDAS_DTYPES is unchanged.
+  - All three new test cases pass (and the 1a tests still pass).
+========================================================================

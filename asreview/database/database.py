@@ -254,7 +254,9 @@ class Database:
                             training_set INTEGER,
                             time FLOAT,
                             note TEXT,
-                            user_id INTEGER)"""
+                            user_id INTEGER,
+                            assigned_at REAL,
+                            last_active REAL)"""
         )
 
         cur.execute(
@@ -544,6 +546,7 @@ class Database:
         if not self.read_only:
             self._fix_decision_changes_schema(cur)
             self._fix_record_schema(cur)
+            self._fix_results_schema(cur)
             self._fix_tag_options_schema(cur)
             self._fix_list_containers_schema(cur)
             self._fix_tag_groups_schema(cur)
@@ -573,6 +576,18 @@ class Database:
             cur.execute(
                 f"ALTER TABLE {self.record_table_name} ADD COLUMN attachment TEXT"
             )
+            self._conn.commit()
+
+    def _fix_results_schema(self, cur):
+        """Add columns introduced after the initial results schema."""
+        columns = [
+            row[1] for row in cur.execute("PRAGMA table_info(results)")
+        ]
+        if "assigned_at" not in columns:
+            cur.execute("ALTER TABLE results ADD COLUMN assigned_at REAL")
+            self._conn.commit()
+        if "last_active" not in columns:
+            cur.execute("ALTER TABLE results ADD COLUMN last_active REAL")
             self._conn.commit()
 
     def _fix_tag_options_schema(self, cur):
