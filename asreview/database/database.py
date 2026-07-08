@@ -319,7 +319,8 @@ class Database:
         """Create the ``list_containers`` table that stores list definitions.
 
         Replaces the ``lists.json`` file. Each row defines one list with its
-        display name, behaviour flags, and optional description.
+        display name, behaviour flags, and optional description. Lists are
+        ordered by ``sorted_at`` (oldest first).
 
         Idempotent (``CREATE TABLE IF NOT EXISTS``), so it is safe to call on
         every read-write open.
@@ -330,7 +331,8 @@ class Database:
                 list_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 required_for_relevant INTEGER NOT NULL DEFAULT 0,
-                description TEXT
+                description TEXT,
+                sorted_at FLOAT NOT NULL DEFAULT 0
             )"""
         )
         self._conn.commit()
@@ -340,7 +342,7 @@ class Database:
 
         Replaces the ``tags.json`` file. Each row defines one tag group with
         its behaviour flags. Tag options are stored in the ``tag_options``
-        table.
+        table. Groups are ordered by ``sorted_at`` (oldest first).
 
         Idempotent (``CREATE TABLE IF NOT EXISTS``), so it is safe to call on
         every read-write open.
@@ -355,7 +357,8 @@ class Database:
                 required_for_irrelevant INTEGER NOT NULL DEFAULT 0,
                 all_required INTEGER NOT NULL DEFAULT 0,
                 single INTEGER NOT NULL DEFAULT 0,
-                input_helper_text TEXT DEFAULT ''
+                input_helper_text TEXT DEFAULT '',
+                sorted_at FLOAT NOT NULL DEFAULT 0
             )"""
         )
         self._conn.commit()
@@ -484,6 +487,8 @@ class Database:
             self._fix_decision_changes_schema(cur)
             self._fix_record_schema(cur)
             self._fix_tag_options_schema(cur)
+            self._fix_list_containers_schema(cur)
+            self._fix_tag_groups_schema(cur)
             self._ensure_results_indexes()
             self._ensure_lists_table()
             self._ensure_list_containers_table()
@@ -527,6 +532,34 @@ class Database:
         if "sorted_at" not in columns:
             cur.execute(
                 "ALTER TABLE tag_options ADD COLUMN sorted_at FLOAT NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
+
+    def _fix_list_containers_schema(self, cur):
+        """Add ``sorted_at`` column to ``list_containers`` if it is missing."""
+        exists = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='list_containers'"
+        ).fetchone()
+        if not exists:
+            return
+        columns = [row[1] for row in cur.execute("PRAGMA table_info(list_containers)")]
+        if "sorted_at" not in columns:
+            cur.execute(
+                "ALTER TABLE list_containers ADD COLUMN sorted_at FLOAT NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
+
+    def _fix_tag_groups_schema(self, cur):
+        """Add ``sorted_at`` column to ``tag_groups`` if it is missing."""
+        exists = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tag_groups'"
+        ).fetchone()
+        if not exists:
+            return
+        columns = [row[1] for row in cur.execute("PRAGMA table_info(tag_groups)")]
+        if "sorted_at" not in columns:
+            cur.execute(
+                "ALTER TABLE tag_groups ADD COLUMN sorted_at FLOAT NOT NULL DEFAULT 0"
             )
             self._conn.commit()
 
@@ -957,6 +990,105 @@ class Database:
             )
         con.commit()
 
+    def delete_list_container(self, list_id):
+        """Delete a list container definition.
+
+        A list container can only be deleted when no records have items
+        referencing it.  If any ``lists`` rows still reference the container
+        the method raises ``ValueError`` with a descriptive message.
+
+        Parameters
+        ----------
+        list_id : str
+            The list container ID to delete.
+        """
+        self._ensure_list_containers_table()
+        self._ensure_lists_table()
+        cur = self._conn.cursor()
+        refs = cur.execute(
+            "SELECT COUNT(*) FROM lists WHERE list_id = ?", (list_id,)
+        ).fetchone()[0]
+        if refs > 0:
+            raise ValueError(
+                "This list cannot be deleted because it still has items "
+                "assigned to records. Remove all items from this list first."
+            )
+        cur.execute(
+            "DELETE FROM list_containers WHERE list_id = ?", (list_id,)
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"List with id '{list_id}' not found.")
+        self._conn.commit()
+
+    def delete_tag_option(self, option_id, group_id):
+        """Delete a single tag option from a group.
+
+        The option can only be deleted when no tag selection rows in the
+        ``tags`` table reference it (enforced by the FK constraint).  If any
+        record still references the option the method raises ``ValueError``.
+
+        Parameters
+        ----------
+        option_id : str
+            The option to delete.
+        group_id : str
+            The group the option belongs to.
+        """
+        self._ensure_tag_options_table()
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                "DELETE FROM tag_options WHERE option_id = ? AND group_id = ?",
+                (option_id, group_id),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError(
+                "This tag cannot be deleted because one or more records "
+                "have been labeled with this tag. Remove the tag from all "
+                "records first."
+            )
+        if cur.rowcount == 0:
+            raise ValueError(f"Tag option '{option_id}' not found.")
+        self._conn.commit()
+
+    def delete_tag_group(self, group_id):
+        """Delete a tag group and all its options.
+
+        A tag group can only be deleted when none of its options are
+        referenced by the ``tags`` table — the FK from ``tag_options`` to
+        ``tag_groups`` blocks the delete if any options still exist, and the
+        FK from ``tags`` to ``tag_options`` prevents deleting options that
+        are in use.  Both conditions must be satisfied before calling this
+        method.
+
+        Parameters
+        ----------
+        group_id : str
+            The tag group ID to delete.
+        """
+        self._ensure_tag_groups_table()
+        self._ensure_tag_options_table()
+        cur = self._conn.cursor()
+        opt_count = cur.execute(
+            "SELECT COUNT(*) FROM tag_options WHERE group_id = ?", (group_id,)
+        ).fetchone()[0]
+        if opt_count > 0:
+            raise ValueError(
+                "This tag group cannot be deleted because it still contains "
+                "options. Delete all options first."
+            )
+        try:
+            cur.execute(
+                "DELETE FROM tag_groups WHERE group_id = ?", (group_id,)
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError(
+                "This tag group cannot be deleted because it is still in use."
+            )
+        if cur.rowcount == 0:
+            raise ValueError(f"Tag group with id '{group_id}' not found.")
+        self._conn.commit()
+
     def _save_tags(self, record_id, tags, cur=None):
         """Store tag selections for a record in the ``tags`` table.
 
@@ -1053,7 +1185,7 @@ class Database:
                           o.free_text_enabled, o.free_text_required
                    FROM tag_groups g
                    JOIN tag_options o ON o.group_id = g.group_id
-                   ORDER BY g.group_id, o.sorted_at, o.option_id"""
+                   ORDER BY g.sorted_at, g.group_id, o.sorted_at, o.option_id"""
             ).fetchall()
         except sqlite3.OperationalError:
             # tables do not exist (read-only legacy project)

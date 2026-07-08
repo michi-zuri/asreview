@@ -1254,6 +1254,7 @@ def create_tag_group(project):
         return jsonify(message="No tag group found."), 400
 
     group_id = uuid7()
+    group_sorted_at = new_tag_group.get("sorted_at", time.time())
 
     with project.db as db:
         db._ensure_tag_groups_table()
@@ -1263,8 +1264,8 @@ def create_tag_group(project):
             """INSERT INTO tag_groups
                (group_id, export_name, label_name, required_for_relevant,
                 required_for_irrelevant, all_required, single,
-                input_helper_text)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                input_helper_text, sorted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 group_id,
                 new_tag_group.get("export", ""),
@@ -1274,6 +1275,7 @@ def create_tag_group(project):
                 1 if new_tag_group.get("require_all") else 0,
                 1 if new_tag_group.get("single_select") else 0,
                 new_tag_group.get("input_helper_text", ""),
+                float(group_sorted_at),
             ),
         )
 
@@ -1303,6 +1305,26 @@ def create_tag_group(project):
         return jsonify(read_tags_data(db) or [])
 
 
+@bp.route(
+    "/projects/<project_id>/tags/<group_id>/options/<option_id>", methods=["DELETE"]
+)
+@login_required
+@project_authorization
+def delete_tag_option(project, group_id, option_id):
+    """Delete a single tag option from a group.
+
+    The option cannot be deleted if any record has a tag selection that
+    references it (FK constraint).
+    """
+    with project.db as db:
+        try:
+            db.delete_tag_option(option_id, group_id)
+        except ValueError as e:
+            return jsonify(message=str(e)), 409
+    with project.db as db:
+        return jsonify(read_tags_data(db) or [])
+
+
 @bp.route("/projects/<project_id>/tags/<group_id>", methods=["PUT"])
 @login_required
 @project_authorization
@@ -1326,12 +1348,14 @@ def update_tag_group(project, group_id):
         db._ensure_tag_options_table()
         cur = db._conn.cursor()
 
+        group_sorted_at = updated_tag_group.get("sorted_at", time.time())
+
         # Update the group itself
         result = cur.execute(
             """UPDATE tag_groups SET
                export_name=?, label_name=?, required_for_relevant=?,
                required_for_irrelevant=?, all_required=?, single=?,
-               input_helper_text=?
+               input_helper_text=?, sorted_at=?
                WHERE group_id=?""",
             (
                 updated_tag_group.get("export", ""),
@@ -1341,6 +1365,7 @@ def update_tag_group(project, group_id):
                 1 if updated_tag_group.get("require_all") else 0,
                 1 if updated_tag_group.get("single_select") else 0,
                 updated_tag_group.get("input_helper_text", ""),
+                float(group_sorted_at),
                 group_id,
             ),
         )
@@ -1419,6 +1444,24 @@ def update_tag_group(project, group_id):
         return jsonify(read_tags_data(db) or [])
 
 
+@bp.route("/projects/<project_id>/tags/<group_id>", methods=["DELETE"])
+@login_required
+@project_authorization
+def delete_tag_group(project, group_id):
+    """Delete a tag group and all its options.
+
+    The group can only be deleted when all options have been removed first
+    and no records reference any option in the group.
+    """
+    with project.db as db:
+        try:
+            db.delete_tag_group(group_id)
+        except ValueError as e:
+            return jsonify(message=str(e)), 409
+    with project.db as db:
+        return jsonify(read_tags_data(db) or [])
+
+
 @bp.route("/projects/<project_id>/lists", methods=["GET"])
 @login_required
 @project_authorization
@@ -1442,19 +1485,21 @@ def create_list(project):
         return jsonify(message="No list name found."), 400
 
     list_id = uuid7()
+    list_sorted_at = new_list.get("sorted_at", time.time())
 
     with project.db as db:
         db._ensure_list_containers_table()
         cur = db._conn.cursor()
         cur.execute(
             """INSERT INTO list_containers
-               (list_id, name, required_for_relevant, description)
-               VALUES (?, ?, ?, ?)""",
+               (list_id, name, required_for_relevant, description, sorted_at)
+               VALUES (?, ?, ?, ?, ?)""",
             (
                 list_id,
                 new_list["name"],
                 1 if new_list.get("required_for_relevant", False) else 0,
                 new_list.get("input_helper_text") or None,
+                float(list_sorted_at),
             ),
         )
         db._conn.commit()
@@ -1472,17 +1517,20 @@ def update_list(project, list_id):
     if not updated_list or not updated_list.get("name"):
         return jsonify(message="No list name found."), 400
 
+    list_sorted_at = updated_list.get("sorted_at", time.time())
+
     with project.db as db:
         db._ensure_list_containers_table()
         cur = db._conn.cursor()
         result = cur.execute(
             """UPDATE list_containers SET
-               name=?, required_for_relevant=?, description=?
+               name=?, required_for_relevant=?, description=?, sorted_at=?
                WHERE list_id=?""",
             (
                 updated_list["name"],
                 1 if updated_list.get("required_for_relevant", False) else 0,
                 updated_list.get("input_helper_text") or None,
+                float(list_sorted_at),
                 list_id,
             ),
         )
@@ -1492,6 +1540,22 @@ def update_list(project, list_id):
             return jsonify(message=f"List '{list_id}' not found."), 404
 
         return jsonify(read_lists_data(project) or [])
+
+
+@bp.route("/projects/<project_id>/lists/<list_id>", methods=["DELETE"])
+@login_required
+@project_authorization
+def delete_list(project, list_id):
+    """Delete a list container definition.
+
+    The list can only be deleted when no records have items referencing it.
+    """
+    with project.db as db:
+        try:
+            db.delete_list_container(list_id)
+        except ValueError as e:
+            return jsonify(message=str(e)), 409
+    return jsonify(read_lists_data(project) or [])
 
 
 @bp.route("/projects/<project_id>/highlights", methods=["GET"])

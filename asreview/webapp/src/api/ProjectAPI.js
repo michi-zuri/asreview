@@ -783,6 +783,61 @@ class ProjectAPI {
     });
   }
 
+  static deleteList(variables) {
+    const url =
+      api_url + `projects/${variables.project_id}/lists/${variables.list_id}`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "delete",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static deleteTagGroup(variables) {
+    const url =
+      api_url + `projects/${variables.project_id}/tags/${variables.group_id}`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "delete",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static deleteTagOption(variables) {
+    const url =
+      api_url +
+      `projects/${variables.project_id}/tags/${variables.group_id}/options/${variables.option_id}`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "delete",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
   static fetchHighlights({ queryKey }) {
     const { project_id } = queryKey[1];
     const url = api_url + `projects/${project_id}/highlights`;

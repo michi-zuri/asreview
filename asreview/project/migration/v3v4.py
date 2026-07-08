@@ -80,7 +80,8 @@ def _migrate(project):
                 required_for_irrelevant INTEGER NOT NULL DEFAULT 0,
                 all_required INTEGER NOT NULL DEFAULT 0,
                 single INTEGER NOT NULL DEFAULT 0,
-                input_helper_text TEXT DEFAULT ''
+                input_helper_text TEXT DEFAULT '',
+                sorted_at FLOAT NOT NULL DEFAULT 0
             )"""
         )
 
@@ -131,7 +132,8 @@ def _migrate(project):
                 list_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 required_for_relevant INTEGER NOT NULL DEFAULT 0,
-                description TEXT
+                description TEXT,
+                sorted_at FLOAT NOT NULL DEFAULT 0
             )"""
         )
 

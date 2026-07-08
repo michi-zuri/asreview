@@ -25,12 +25,12 @@ def read_tags_data(db):
         rows = cur.execute(
             "SELECT g.group_id, g.export_name, g.label_name, "
             "g.required_for_relevant, g.required_for_irrelevant, "
-            "g.all_required, g.single, g.input_helper_text, "
+            "g.all_required, g.single, g.input_helper_text, g.sorted_at, "
             "o.option_id, o.export_name, o.label_name, "
             "o.free_text_enabled, o.free_text_required, o.sorted_at "
             "FROM tag_groups g "
             "LEFT JOIN tag_options o ON o.group_id = g.group_id "
-            "ORDER BY g.group_id, o.sorted_at, o.option_id"
+            "ORDER BY g.sorted_at, g.group_id, o.sorted_at, o.option_id"
         ).fetchall()
     except sqlite3.OperationalError:
         return None
@@ -48,17 +48,18 @@ def read_tags_data(db):
                 "require_all": bool(row[5]),
                 "single_select": bool(row[6]),
                 "input_helper_text": row[7] or "",
+                "sorted_at": row[8],
                 "values": [],
             }
-        if row[8] is not None:
+        if row[9] is not None:
             groups[gid]["values"].append(
                 {
-                    "id": row[8],
-                    "export": row[9],
-                    "label": row[10],
-                    "free_text": bool(row[11]),
-                    "free_text_required": bool(row[12]),
-                    "sorted_at": row[13],
+                    "id": row[9],
+                    "export": row[10],
+                    "label": row[11],
+                    "free_text": bool(row[12]),
+                    "free_text_required": bool(row[13]),
+                    "sorted_at": row[14],
                 }
             )
     return list(groups.values())
@@ -82,8 +83,8 @@ def read_lists_data(project):
         with project.db as db:
             cur = db._conn.cursor()
             rows = cur.execute(
-                "SELECT list_id, name, required_for_relevant, description "
-                "FROM list_containers ORDER BY list_id"
+                "SELECT list_id, name, required_for_relevant, description, sorted_at "
+                "FROM list_containers ORDER BY sorted_at, list_id"
             ).fetchall()
     except sqlite3.OperationalError:
         return None
@@ -94,6 +95,7 @@ def read_lists_data(project):
             "name": row[1],
             "required_for_relevant": bool(row[2]),
             "input_helper_text": row[3] or "",
+            "sorted_at": row[4],
         }
         for row in rows
     ]

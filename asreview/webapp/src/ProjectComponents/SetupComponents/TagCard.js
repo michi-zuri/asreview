@@ -32,6 +32,7 @@ import { useMutation, useQuery, useQueryClient } from "react-query";
 
 import { Add } from "@mui/icons-material";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import DeleteIcon from "@mui/icons-material/Delete";
 import BookmarksIcon from "@mui/icons-material/Bookmarks";
 import FolderOpenIcon from "@mui/icons-material/FolderOpen";
 import StyleIcon from "@mui/icons-material/Style";
@@ -228,6 +229,7 @@ const EMPTY_GROUP = {
   required_relevant: false,
   required_irrelevant: false,
   require_all: false,
+  sorted_at: nowSeconds(),
   values: [
     { label: "", export: "", sorted_at: nowSeconds() },
     { label: "", export: "", sorted_at: nowSeconds() },
@@ -243,6 +245,7 @@ function normalizeGroup(group) {
     required_relevant: Boolean(group.required_relevant),
     required_irrelevant: Boolean(group.required_irrelevant),
     require_all: Boolean(group.require_all),
+    sorted_at: group.sorted_at || nowSeconds(),
   };
 }
 
@@ -293,6 +296,29 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
       },
     },
   );
+
+  const { mutate: deleteTagOption, error: deleteOptionError } = useMutation(
+    ProjectAPI.deleteTagOption,
+    {
+      mutationKey: ["deleteTagOption"],
+      onSuccess: (data) => {
+        queryClient.setQueryData(["fetchTagGroups", { project_id }], data);
+      },
+    },
+  );
+
+  const { mutate: deleteTagGroup, error: deleteGroupError } = useMutation(
+    ProjectAPI.deleteTagGroup,
+    {
+      mutationKey: ["deleteTagGroup"],
+      onSuccess: () => {
+        queryClient.invalidateQueries(["fetchTagGroups", { project_id }]);
+        closeDialog();
+      },
+    },
+  );
+
+  const deleteError = deleteOptionError || deleteGroupError;
 
   const handleGroupLabelChange = (e) => {
     setState((prev) => ({
@@ -421,6 +447,35 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
     }));
   };
 
+  const handleMoveGroupToBottom = () => {
+    setState((prev) => ({
+      ...prev,
+      sorted_at: nowSeconds(),
+    }));
+  };
+
+  const handleDeleteOption = (index) => {
+    const tag = state.values[index];
+    if (tag.id) {
+      deleteTagOption({
+        project_id,
+        group_id: group.id,
+        option_id: tag.id,
+      });
+    }
+    setState((prev) => ({
+      ...prev,
+      values: prev.values.filter((_, i) => i !== index),
+    }));
+  };
+
+  const handleDeleteGroup = () => {
+    deleteTagGroup({
+      project_id,
+      group_id: group.id,
+    });
+  };
+
   const closeDialog = () => {
     if (group == null) {
       setState(structuredClone(EMPTY_GROUP));
@@ -524,6 +579,18 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
               label="Require all options to be selected (checklist)"
             />
           </Tooltip>
+          <Stack direction="row" spacing={2} alignItems="center">
+            <Tooltip title="Move group to bottom">
+              <Button
+                variant="outlined"
+                size="small"
+                startIcon={<ArrowDownwardIcon />}
+                onClick={handleMoveGroupToBottom}
+              >
+                Move to bottom
+              </Button>
+            </Tooltip>
+          </Stack>
         </Stack>
         <Stack spacing={3}>
           <TypographySubtitle1Medium>Tags</TypographySubtitle1Medium>
@@ -580,6 +647,15 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
                   <ArrowDownwardIcon fontSize="small" />
                 </IconButton>
               </Tooltip>
+              <Tooltip title="Delete tag">
+                <IconButton
+                  size="small"
+                  onClick={() => handleDeleteOption(index)}
+                  aria-label="delete tag"
+                >
+                  <DeleteIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
             </Stack>
           ))}
         </Stack>
@@ -596,6 +672,21 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
           </Tooltip>
         </Stack>
 
+        {group !== null && state.values.length === 0 && (
+          <Stack direction="row" justifyContent="flex-end" sx={{ mt: 2 }}>
+            <Tooltip title="Delete this tag group permanently">
+              <Button
+                variant="outlined"
+                color="error"
+                startIcon={<DeleteIcon />}
+                onClick={handleDeleteGroup}
+              >
+                Delete group
+              </Button>
+            </Tooltip>
+          </Stack>
+        )}
+
         {mutateError && (
           <Alert severity="error" sx={{ mt: 2 }}>
             {mutateError?.message}
@@ -604,6 +695,11 @@ const MutateGroupDialog = ({ project_id, open, onClose, group = null }) => {
         {createError && (
           <Alert severity="error" sx={{ mt: 2 }}>
             {createError?.message}
+          </Alert>
+        )}
+        {deleteError && (
+          <Alert severity="error" sx={{ mt: 2 }}>
+            {deleteError?.message}
           </Alert>
         )}
       </DialogContent>
