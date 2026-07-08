@@ -203,3 +203,54 @@ def test_top_up_checked_out_not_re_dispatched(db_pool):
     dispatched_ids = [r[0] for r in rows]
     assert 0 in dispatched_ids  # still in dispatch table
     assert 3 in dispatched_ids  # the new top-up record
+
+
+def _results_row(db, record_id):
+    cur = db._conn.cursor()
+    return cur.execute(
+        "SELECT user_id, label, assigned_at, last_active "
+        "FROM results WHERE record_id = ?",
+        (record_id,),
+    ).fetchone()
+
+
+def test_checkout_oldest(db_pool):
+    """checkout_oldest_dispatched picks the oldest dispatch row."""
+    db_pool.top_up_dispatch(3, "H")
+    pending = db_pool.checkout_oldest_dispatched(user_id=1)
+    assert not pending.empty
+    assert 0 in pending["record_id"].values
+    row = _results_row(db_pool, 0)
+    assert row[0] == 1
+    assert row[1] is None  # label
+    assert isinstance(row[2], float)  # assigned_at
+    assert isinstance(row[3], float)  # last_active
+
+
+def test_checkout_two_users_get_distinct(db_pool):
+    """Two users check out different records, not the same one."""
+    db_pool.top_up_dispatch(3, "H")
+    pending_1 = db_pool.checkout_oldest_dispatched(user_id=1)
+    pending_2 = db_pool.checkout_oldest_dispatched(user_id=2)
+    assert not pending_1.empty
+    assert not pending_2.empty
+    ids_1 = set(pending_1["record_id"].values)
+    ids_2 = set(pending_2["record_id"].values)
+    # Groups can overlap, but the dispatch record_ids are group reps
+    # and must differ.
+    assert ids_1 != ids_2
+
+
+def test_checkout_no_steal(db_pool):
+    """Record 0 stays assigned to user 1 after user 2 checks out."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    db_pool.checkout_oldest_dispatched(user_id=2)
+    row = _results_row(db_pool, 0)
+    assert row[0] == 1  # still user 1
+
+
+def test_checkout_nothing_available(db_pool):
+    """Empty queue → checkout returns empty DataFrame."""
+    pending = db_pool.checkout_oldest_dispatched(user_id=1)
+    assert pending.empty

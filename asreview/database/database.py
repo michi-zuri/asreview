@@ -951,6 +951,67 @@ class Database:
         con.commit()
         return inserted
 
+    def checkout_oldest_dispatched(self, user_id):
+        """Check out the oldest dispatched, not-yet-assigned record.
+
+        Selects the record with the smallest ``dispatched_at`` among
+        ``llm_dispatch`` rows with status in (queued, in_flight, ready) that
+        have no ``results`` row yet, and creates ``results`` rows for its
+        whole group assigned to ``user_id`` with ``assigned_at`` and
+        ``last_active`` set to now. Concurrency-safe: the INSERT ... ON
+        CONFLICT DO NOTHING guard means two callers cannot claim the same
+        record (SQLite serializes writers; the second caller sees the first's
+        committed row and picks the next record, or gets nothing).
+
+        Returns
+        -------
+        pandas.DataFrame
+            The user's pending row(s) (same shape as get_pending). Empty when
+            nothing was available to check out.
+        """
+        now = time.time()
+        model_string = ", ".join(MODEL_COLUMNS)
+        top_cols = ", ".join(f"top_record.{c}" for c in MODEL_COLUMNS)
+
+        con = self._conn
+        cur = con.cursor()
+        result = cur.execute(
+            f"""
+            WITH top_record AS (
+                SELECT last_ranking.*
+                FROM llm_dispatch
+                JOIN last_ranking USING (record_id)
+                LEFT JOIN results ON results.record_id = llm_dispatch.record_id
+                WHERE llm_dispatch.status IN ('queued', 'in_flight', 'ready')
+                  AND results.record_id IS NULL
+                ORDER BY llm_dispatch.dispatched_at ASC
+                LIMIT 1
+            ),
+            group_records AS (
+                SELECT record.record_id
+                FROM {self.record_table_name} AS record
+                WHERE group_id = (
+                    SELECT group_id
+                    FROM {self.record_table_name}
+                    WHERE record_id = (SELECT record_id FROM top_record)
+                )
+            )
+            INSERT INTO results
+                (record_id, user_id, assigned_at, last_active, {model_string})
+            SELECT group_records.record_id, :user_id, :now, :now, {top_cols}
+            FROM group_records
+            CROSS JOIN top_record ON TRUE
+            ON CONFLICT(record_id) DO NOTHING
+            RETURNING record_id
+            """,
+            {"user_id": user_id, "now": now},
+        ).fetchone()
+        con.commit()
+
+        if result is None:
+            return self.get_pending(user_id=user_id).iloc[0:0]
+        return self.get_pending(user_id=user_id)
+
     def update_result(self, record_id, label=None, tags=None, user_id=None):
         if label is None and tags is None:
             raise ValueError("At least one of 'label' or 'tags' must be provided.")
