@@ -137,7 +137,7 @@ const Header = ({ toggleNavDrawer, menuOpenButton = true }) => {
           </Box>
 
           <Box sx={{ display: "flex", alignItems: "center" }}>
-            {project_id && isReviewPath && (
+            {project_id && (
               <Tooltip title="Screening criteria" placement="right">
                 <IconButton onClick={toggleCriteria}>
                   <LightbulbOutlinedIcon />
