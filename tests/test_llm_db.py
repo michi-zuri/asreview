@@ -257,6 +257,15 @@ def test_checkout_nothing_available(db_pool):
     assert pending.empty
 
 
+def _dispatch_status(db, record_id):
+    cur = db._conn.cursor()
+    r = cur.execute(
+        "SELECT status, last_error, attempts FROM llm_dispatch "
+        "WHERE record_id = ?", (record_id,)
+    ).fetchone()
+    return r  # (status, last_error, attempts)
+
+
 def _set_last_active(db, record_id, value):
     cur = db._conn.cursor()
     cur.execute(
@@ -319,3 +328,102 @@ def test_reassign_oldest_first(db_pool):
     assert row0[0] == 1  # reassigned to user 1
     row1 = _results_row(db_pool, 1)
     assert row1[0] == 3  # still user 3
+
+
+# --- Task 2a: Worker DAO helpers ---
+
+
+def test_claim_oldest(db_pool):
+    """claim_next_queued_dispatch returns oldest queued record_id."""
+    db_pool.top_up_dispatch(3, "H")
+    claimed = db_pool.claim_next_queued_dispatch()
+    assert claimed == 0
+    status, _, _ = _dispatch_status(db_pool, 0)
+    assert status == "in_flight"
+
+
+def test_claim_distinct(db_pool):
+    """Second claim returns the next oldest, leaving first in_flight."""
+    db_pool.top_up_dispatch(3, "H")
+    first = db_pool.claim_next_queued_dispatch()
+    second = db_pool.claim_next_queued_dispatch()
+    assert first == 0
+    assert second == 1
+    status0, _, _ = _dispatch_status(db_pool, 0)
+    assert status0 == "in_flight"
+
+
+def test_claim_none(db_pool):
+    """After claiming all queued rows, returns None."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.claim_next_queued_dispatch()
+    db_pool.claim_next_queued_dispatch()
+    assert db_pool.claim_next_queued_dispatch() is None
+
+
+def test_store_llm_result(db_pool):
+    """store_llm_result creates llm_results row and sets dispatch status ready."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "H", "claude-opus-4-8", '{"labels":[]}', 10, 20)
+
+    cur = db_pool._conn.cursor()
+    row = cur.execute(
+        "SELECT record_id, prompt_hash, model, payload_json, input_tokens, "
+        "output_tokens FROM llm_results WHERE record_id = 0 AND prompt_hash = 'H'"
+    ).fetchone()
+    assert row is not None
+    assert row[2] == "claude-opus-4-8"
+    assert row[3] == '{"labels":[]}'
+    assert row[4] == 10
+    assert row[5] == 20
+
+    status, last_error, _ = _dispatch_status(db_pool, 0)
+    assert status == "ready"
+    assert last_error is None
+
+
+def test_store_upsert(db_pool):
+    """Second store_llm_result overwrites payload; still one row per (record_id, hash)."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "H", "claude-opus-4-8", '{"labels":[]}', 10, 20)
+    db_pool.store_llm_result(0, "H", "claude-opus-4-8", '{"labels":[1]}', 15, 25)
+
+    cur = db_pool._conn.cursor()
+    count = cur.execute(
+        "SELECT COUNT(*) FROM llm_results WHERE record_id = 0 AND prompt_hash = 'H'"
+    ).fetchone()[0]
+    assert count == 1
+    payload = cur.execute(
+        "SELECT payload_json, input_tokens, output_tokens FROM llm_results "
+        "WHERE record_id = 0 AND prompt_hash = 'H'"
+    ).fetchone()
+    assert payload[0] == '{"labels":[1]}'
+    assert payload[1] == 15
+    assert payload[2] == 25
+
+
+def test_mark_dispatch_failed(db_pool):
+    """mark_dispatch_failed sets status 'failed' and records last_error."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.mark_dispatch_failed(1, "boom")
+    status, last_error, _ = _dispatch_status(db_pool, 1)
+    assert status == "failed"
+    assert last_error == "boom"
+
+
+def test_mark_dispatch_missing_pdf(db_pool):
+    """mark_dispatch_missing_pdf sets status 'missing_pdf'."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.mark_dispatch_missing_pdf(2)
+    status, _, _ = _dispatch_status(db_pool, 2)
+    assert status == "missing_pdf"
+
+
+def test_increment_dispatch_attempts(db_pool):
+    """increment_dispatch_attempts returns new count; two calls give 1 then 2."""
+    db_pool.top_up_dispatch(3, "H")
+    assert db_pool.increment_dispatch_attempts(1) == 1
+    assert db_pool.increment_dispatch_attempts(1) == 2

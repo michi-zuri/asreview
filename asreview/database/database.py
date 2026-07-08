@@ -951,6 +951,93 @@ class Database:
         con.commit()
         return inserted
 
+    def claim_next_queued_dispatch(self):
+        """Atomically claim the oldest queued dispatch row.
+
+        Sets its status to 'in_flight' and returns its record_id, or None if
+        no queued rows exist. Concurrency-safe: SQLite serializes writers, so
+        two workers claim different rows.
+        """
+        con = self._conn
+        cur = con.cursor()
+        row = cur.execute(
+            """UPDATE llm_dispatch
+               SET status = 'in_flight'
+               WHERE record_id = (
+                   SELECT record_id FROM llm_dispatch
+                   WHERE status = 'queued'
+                   ORDER BY dispatched_at ASC
+                   LIMIT 1
+               )
+               RETURNING record_id"""
+        ).fetchone()
+        con.commit()
+        return row[0] if row else None
+
+    def store_llm_result(self, record_id, prompt_hash, model, payload_json,
+                         input_tokens=None, output_tokens=None):
+        """Upsert an llm_results row and mark its dispatch row 'ready'.
+
+        Keyed by (record_id, prompt_hash); re-processing overwrites. Also
+        clears last_error on the dispatch row.
+        """
+        now = time.time()
+        con = self._conn
+        cur = con.cursor()
+        cur.execute(
+            """INSERT INTO llm_results
+               (record_id, prompt_hash, model, payload_json,
+                input_tokens, output_tokens, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(record_id, prompt_hash) DO UPDATE SET
+                   model = excluded.model,
+                   payload_json = excluded.payload_json,
+                   input_tokens = excluded.input_tokens,
+                   output_tokens = excluded.output_tokens,
+                   created_at = excluded.created_at""",
+            (record_id, prompt_hash, model, payload_json,
+             input_tokens, output_tokens, now),
+        )
+        cur.execute(
+            "UPDATE llm_dispatch SET status = 'ready', last_error = NULL "
+            "WHERE record_id = ?",
+            (record_id,),
+        )
+        con.commit()
+
+    def mark_dispatch_failed(self, record_id, error):
+        """Set a dispatch row to 'failed' and record last_error."""
+        con = self._conn
+        cur = con.cursor()
+        cur.execute(
+            "UPDATE llm_dispatch SET status = 'failed', last_error = ? "
+            "WHERE record_id = ?",
+            (str(error) if error is not None else None, record_id),
+        )
+        con.commit()
+
+    def mark_dispatch_missing_pdf(self, record_id):
+        """Set a dispatch row to 'missing_pdf'."""
+        con = self._conn
+        cur = con.cursor()
+        cur.execute(
+            "UPDATE llm_dispatch SET status = 'missing_pdf' WHERE record_id = ?",
+            (record_id,),
+        )
+        con.commit()
+
+    def increment_dispatch_attempts(self, record_id):
+        """Increment attempts on a dispatch row; return the new count."""
+        con = self._conn
+        cur = con.cursor()
+        row = cur.execute(
+            "UPDATE llm_dispatch SET attempts = attempts + 1 "
+            "WHERE record_id = ? RETURNING attempts",
+            (record_id,),
+        ).fetchone()
+        con.commit()
+        return row[0] if row else None
+
     def checkout_oldest_dispatched(self, user_id):
         """Check out the oldest dispatched, not-yet-assigned record.
 
