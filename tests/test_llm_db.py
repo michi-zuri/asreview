@@ -538,3 +538,129 @@ def test_touch_last_active_labeled(db_pool):
     db_pool.label_record(0, 1, user_id=1)
 
     assert db_pool.touch_last_active(0, 1) is False
+
+
+# --- Phase 6: requeue_for_prompt_change + force_requeue tests ---
+
+
+def test_requeue_for_prompt_change_basic(db_pool):
+    """All queued rows switch to new_prompt_hash."""
+    db_pool.top_up_dispatch(3, "A")
+    count = db_pool.requeue_for_prompt_change("B")
+    assert count == 3
+    rows = _dispatch_rows(db_pool)
+    for r in rows:
+        assert r[1] == "queued"
+        assert r[2] == "B"
+    # Attempts reset to 0 on all rows.
+    cur = db_pool._conn.cursor()
+    for r in rows:
+        attempts = cur.execute(
+            "SELECT attempts FROM llm_dispatch WHERE record_id=?", (r[0],)
+        ).fetchone()[0]
+        assert attempts == 0
+
+
+def test_requeue_for_prompt_change_count(db_pool):
+    """Returns number of re-queued records."""
+    db_pool.top_up_dispatch(5, "A")
+    # Label records 0 and 1 so they are skipped.
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    db_pool.label_record(0, 1, user_id=1)
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    db_pool.label_record(1, 1, user_id=1)
+    count = db_pool.requeue_for_prompt_change("B")
+    assert count == 3  # records 2, 3, 4
+
+
+def test_requeue_for_prompt_change_skips_labeled(db_pool):
+    """Already-labeled records keep their original prompt_hash."""
+    db_pool.top_up_dispatch(3, "A")
+    db_pool.checkout_oldest_dispatched(user_id=1)
+    db_pool.label_record(0, 1, user_id=1)
+    db_pool.requeue_for_prompt_change("B")
+    rows = _dispatch_rows(db_pool)
+    row0 = next(r for r in rows if r[0] == 0)
+    assert row0[2] == "A"  # unchanged
+
+
+def test_requeue_for_prompt_change_skips_same_hash(db_pool):
+    """Records already at target hash are not touched."""
+    db_pool.top_up_dispatch(3, "A")
+    db_pool.requeue_for_prompt_change("A")
+    # All 3 already have prompt_hash "A" → no rows match the WHERE clause.
+    # But wait: the WHERE says d.prompt_hash != new_prompt_hash.
+    # So none match. Count = 0.
+    # Re-verify they are still there.
+    rows = _dispatch_rows(db_pool)
+    assert len(rows) == 3
+    for r in rows:
+        assert r[2] == "A"
+
+
+def test_requeue_for_prompt_change_preserves_order(db_pool):
+    """Re-queued dispatched_at values are monotonically increasing."""
+    db_pool.top_up_dispatch(5, "A")
+    db_pool.requeue_for_prompt_change("B")
+    cur = db_pool._conn.cursor()
+    times = [
+        r[0] for r in cur.execute(
+            "SELECT dispatched_at FROM llm_dispatch ORDER BY dispatched_at"
+        ).fetchall()
+    ]
+    assert times == sorted(times)
+    # All times should be close together (within a second)
+    assert times[-1] - times[0] < 1.0
+
+
+def test_requeue_for_prompt_change_clears_error(db_pool):
+    """Re-queued rows have last_error=NULL and attempts=0."""
+    db_pool.top_up_dispatch(3, "A")
+    db_pool.mark_dispatch_failed(1, "boom")
+    db_pool.requeue_for_prompt_change("B")
+    cur = db_pool._conn.cursor()
+    row = cur.execute(
+        "SELECT attempts, last_error FROM llm_dispatch WHERE record_id=1"
+    ).fetchone()
+    assert row[0] == 0
+    assert row[1] is None
+
+
+def test_force_requeue_new_record(db_pool):
+    """force_requeue inserts a dispatch row for a record not yet dispatched."""
+    assert db_pool.force_requeue(99, "H") is True
+    status, _, _ = _dispatch_status(db_pool, 99)
+    assert status == "queued"
+
+
+def test_force_requeue_overwrites(db_pool):
+    """force_requeue resets an existing dispatch row to queued."""
+    db_pool.top_up_dispatch(3, "A")
+    db_pool.mark_dispatch_failed(0, "network error")
+    assert db_pool.force_requeue(0, "B") is True
+    status, last_error, attempts = _dispatch_status(db_pool, 0)
+    assert status == "queued"
+    assert last_error is None
+    assert attempts == 0
+    cur = db_pool._conn.cursor()
+    ph = cur.execute(
+        "SELECT prompt_hash FROM llm_dispatch WHERE record_id=0"
+    ).fetchone()[0]
+    assert ph == "B"
+
+
+def test_force_requeue_bypasses_cache(db_pool):
+    """force_requeue works even when a ready result exists for old hash."""
+    db_pool.top_up_dispatch(3, "A")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "A", "claude-opus-4-8", '{"labels":[]}', 10, 20)
+    # Record 0 is "ready" under hash "A". force_requeue with "B".
+    assert db_pool.force_requeue(0, "B") is True
+    status, _, _ = _dispatch_status(db_pool, 0)
+    assert status == "queued"
+    # Old result still exists, just the dispatch row was re-queued.
+    cur = db_pool._conn.cursor()
+    result = cur.execute(
+        "SELECT prompt_hash FROM llm_results WHERE record_id=0"
+    ).fetchone()
+    assert result[0] == "A"

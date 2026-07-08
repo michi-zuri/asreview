@@ -1095,6 +1095,42 @@ class ProjectAPI {
         });
     });
   }
+
+  static reprocessRecord({ project_id, record_id }) {
+    const url =
+      api_url + `projects/${project_id}/record/${record_id}/reprocess`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static recheckPdf({ project_id, record_id }) {
+    const url =
+      api_url + `projects/${project_id}/record/${record_id}/recheck_pdf`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
 }
 
 export default ProjectAPI;

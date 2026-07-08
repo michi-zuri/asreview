@@ -1,0 +1,192 @@
+========================================================================
+PHASE 6 — Auto-reprocess on prompt change + manual reprocess +
+          recheck-missing-PDFs (low priority; implement last)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: Phases 1, 2, 3, 5 merged.
+
+GOAL
+  1. When the assembled system prompt changes (prompt_hash changes, e.g. the
+     criteria_text or tag/list config was edited), automatically re-queue every
+     record that is NOT yet labeled — i.e. records in status "ready" and records
+     checked out but not yet labeled — into llm_dispatch under the new
+     prompt_hash, preserving their original relative order. Already-labeled
+     records are left untouched.
+  2. Manual "reprocess this article" button on a finished/open article
+     (re-inserts the current record with the current prompt_hash, bypassing the
+     cache-skip).
+  3. Project-level "recheck missing PDF" for the currently open article
+     (re-runs PDF resolution / re-dispatches a record whose status was
+     missing_pdf).
+
+These are lower priority than Phases 1–5; keep each piece minimal.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/database/database.py: top_up_dispatch, checkout_oldest_dispatched,
+    the llm_dispatch schema (columns record_id, dispatched_at, status,
+    prompt_hash, attempts, last_error), and how results rows encode
+    labeled/unlabeled (label IS NULL).
+  - asreview/webapp/_api/projects.py: _current_prompt_hash, _llm_settings,
+    api_update_project_info (this is where an edit to config["llm"] lands),
+    api_get_record, and the route/decorator conventions.
+  - asreview/webapp/_api/pdf_resolver.py (Phase 0b) for the missing-PDF recheck.
+
+------------------------------------------------------------------------
+PART A — DAO: requeue_for_prompt_change
+  (asreview/database/database.py, near top_up_dispatch)
+------------------------------------------------------------------------
+    def requeue_for_prompt_change(self, new_prompt_hash):
+        """Re-queue all not-yet-labeled dispatched records under a new prompt.
+
+        Targets records that have an llm_dispatch row whose prompt_hash differs
+        from new_prompt_hash AND whose results row (if any) is not yet labeled
+        (label IS NULL) or has no results row. Already-labeled records are
+        skipped. Rewrites their llm_dispatch rows to status 'queued' with the
+        new prompt_hash and a fresh, contiguous, monotonically increasing block
+        of dispatched_at values that PRESERVES the previous relative order.
+        Resets attempts=0 and last_error=NULL. Returns the number of records
+        re-queued.
+        """
+        con = self._conn
+        cur = con.cursor()
+        rows = cur.execute(
+            "SELECT d.record_id FROM llm_dispatch d "
+            "LEFT JOIN results r ON r.record_id = d.record_id "
+            "WHERE d.prompt_hash != ? "
+            "AND (r.record_id IS NULL OR r.label IS NULL) "
+            "ORDER BY d.dispatched_at ASC",
+            (new_prompt_hash,),
+        ).fetchall()
+        base = time.time()
+        for i, (record_id,) in enumerate(rows):
+            cur.execute(
+                "UPDATE llm_dispatch SET status='queued', prompt_hash=?, "
+                "dispatched_at=?, attempts=0, last_error=NULL "
+                "WHERE record_id=?",
+                (new_prompt_hash, base + i * 1e-6, record_id),
+            )
+        con.commit()
+        return len(rows)
+
+  (VERIFIED against Phase 1: llm_dispatch.dispatched_at is a REAL column holding
+   a unix timestamp float, record_id is the PRIMARY KEY, status/prompt_hash/
+   attempts/last_error are as named above. The epoch-float sequence above is
+   correct — do NOT switch to ISO strings.)
+
+  Add DAO tests to tests/test_llm_db.py:
+    - Seed 3 dispatched records with an OLD prompt_hash and distinct
+      dispatched_at; label one (results.label set). requeue_for_prompt_change
+      re-queues exactly the 2 unlabeled ones, sets their prompt_hash to the new
+      value, status 'queued', attempts 0, and preserves their relative order by
+      dispatched_at. The labeled one is untouched.
+
+------------------------------------------------------------------------
+PART B — trigger auto-reprocess when the LLM prompt changes
+  (asreview/webapp/_api/projects.py, in api_update_llm_settings from Phase 5)
+------------------------------------------------------------------------
+The criteria_text (and thus the prompt_hash) is edited through the dedicated
+PUT projects/<id>/llm_settings route added in Phase 5 — NOT the form-encoded
+api_update_project_info. Add the trigger THERE. Capture the prompt_hash BEFORE
+update_config, recompute AFTER, and re-queue if it changed:
+
+    old_hash = _current_prompt_hash(project)     # before project.update_config
+    project.update_config(llm=merged)            # existing Phase 5 line
+    new_hash = _current_prompt_hash(project)
+    if new_hash != old_hash:
+        with project.db as db:
+            n = db.requeue_for_prompt_change(new_hash)
+        logging.info("prompt changed; re-queued %s records", n)
+    return jsonify(_llm_settings(project))        # existing Phase 5 return
+
+(VERIFIED: project.config caches in self._config and update_config sets it, so
+_current_prompt_hash reads the fresh value after the call — the before/after
+comparison is real. Note prompt_hash also depends on tag/list config, so editing
+those elsewhere can change it too; this route only needs to cover criteria_text.)
+Read the Phase 5 api_update_llm_settings to place this correctly; only insert
+these lines, don't restructure it.
+
+------------------------------------------------------------------------
+PART C — manual reprocess route + DAO
+------------------------------------------------------------------------
+DAO (asreview/database/database.py):
+    def force_requeue(self, record_id, prompt_hash):
+        """Force one record back into llm_dispatch (bypass cache-skip).
+
+        Upserts an llm_dispatch row for record_id: status 'queued',
+        prompt_hash, fresh dispatched_at, attempts 0, last_error NULL.
+        Returns True.
+        """
+        # INSERT ... ON CONFLICT(record_id) DO UPDATE ... matching the table's
+        # primary key / uniqueness on record_id. Confirm the PK from Phase 1.
+
+Route (asreview/webapp/_api/projects.py):
+    @bp.route("/projects/<project_id>/record/<record_id>/reprocess",
+              methods=["POST"])
+    @login_required
+    @project_authorization
+    def api_reprocess_record(project, record_id):  # noqa: F401
+        prompt_hash = _current_prompt_hash(project)
+        with project.db as db:
+            db.force_requeue(int(record_id), prompt_hash)
+        return jsonify({"success": True})
+
+DAO test in tests/test_llm_db.py: force_requeue on a record with an existing
+'ready' dispatch flips it back to 'queued' with attempts 0 and the given
+prompt_hash; force_requeue on a record with no dispatch row inserts one.
+
+------------------------------------------------------------------------
+PART D — recheck missing PDF route
+------------------------------------------------------------------------
+Reuse force_requeue: for a record currently in status missing_pdf (or any
+record the user points at), re-queue it so the worker re-attempts PDF
+resolution on the next drain.
+
+    @bp.route("/projects/<project_id>/record/<record_id>/recheck_pdf",
+              methods=["POST"])
+    @login_required
+    @project_authorization
+    def api_recheck_pdf(project, record_id):  # noqa: F401
+        prompt_hash = _current_prompt_hash(project)
+        with project.db as db:
+            db.force_requeue(int(record_id), prompt_hash)
+        return jsonify({"success": True})
+
+(If a fresh Zotero attachment lookup should also be forced here — clearing a
+stale failure timestamp in record.attachment so the resolver retries — read
+pdf_resolver.py / zotero.py and add ONLY the minimal call needed. If unclear,
+leave PDF re-resolution to the worker and just re-queue; note this in your
+report.)
+
+------------------------------------------------------------------------
+PART E — frontend buttons (asreview/webapp/src/...)
+------------------------------------------------------------------------
+Add two ProjectAPI static methods (same Promise/axios shape as the rest):
+    reprocessRecord(variables)  // POST .../record/${record_id}/reprocess
+    recheckPdf(variables)       // POST .../record/${record_id}/recheck_pdf
+
+Wire minimal buttons:
+  - In LlmResultCard.js (Phase 5): when status is "ready"/"failed", show a small
+    "Re-screen" button that calls reprocessRecord then invalidates the
+    fetchLlmMeta query so the card returns to the analyzing state.
+  - When status is "missing_pdf", show a "Recheck PDF" button calling
+    recheckPdf, then invalidate fetchLlmMeta.
+Keep the UI minimal and consistent with the card's existing MUI style.
+
+------------------------------------------------------------------------
+VERIFY
+------------------------------------------------------------------------
+Backend:
+    cd /Users/killi/Dev/asreview/asreview
+    devbox run -- python -m pytest tests/test_llm_db.py -q
+Frontend:
+    cd /Users/killi/Dev/asreview/asreview/asreview/webapp
+    npm run build
+Paste both outputs. Do not report done until backend tests are green and the
+frontend build compiles.
+
+DONE WHEN
+  - requeue_for_prompt_change + force_requeue exist with passing DAO tests.
+  - Editing config["llm"] auto-re-queues not-yet-labeled records under the new
+    prompt_hash (labeled records untouched).
+  - reprocess + recheck_pdf routes exist and the two card buttons call them.
+========================================================================

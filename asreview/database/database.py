@@ -951,6 +951,65 @@ class Database:
         con.commit()
         return inserted
 
+    def requeue_for_prompt_change(self, new_prompt_hash):
+        """Re-queue all not-yet-labeled dispatched records under a new prompt.
+
+        Targets records that have an llm_dispatch row whose prompt_hash differs
+        from new_prompt_hash AND whose results row (if any) is not yet labeled
+        (label IS NULL) or has no results row. Already-labeled records are
+        skipped. Rewrites their llm_dispatch rows to status 'queued' with the
+        new prompt_hash and a fresh, contiguous, monotonically increasing block
+        of dispatched_at values that PRESERVES the previous relative order.
+        Resets attempts=0 and last_error=NULL. Returns the number of records
+        re-queued.
+        """
+        con = self._conn
+        cur = con.cursor()
+        rows = cur.execute(
+            "SELECT d.record_id FROM llm_dispatch d "
+            "LEFT JOIN results r ON r.record_id = d.record_id "
+            "WHERE d.prompt_hash != ? "
+            "AND (r.record_id IS NULL OR r.label IS NULL) "
+            "ORDER BY d.dispatched_at ASC",
+            (new_prompt_hash,),
+        ).fetchall()
+        base = time.time()
+        for i, (record_id,) in enumerate(rows):
+            cur.execute(
+                "UPDATE llm_dispatch SET status='queued', prompt_hash=?, "
+                "dispatched_at=?, attempts=0, last_error=NULL "
+                "WHERE record_id=?",
+                (new_prompt_hash, base + i * 1e-6, record_id),
+            )
+        con.commit()
+        return len(rows)
+
+    def force_requeue(self, record_id, prompt_hash):
+        """Force one record back into llm_dispatch (bypass cache-skip).
+
+        Upserts an llm_dispatch row for record_id: status 'queued',
+        prompt_hash, fresh dispatched_at, attempts 0, last_error NULL.
+        Returns True.
+        """
+        now = time.time()
+        con = self._conn
+        cur = con.cursor()
+        cur.execute(
+            """INSERT INTO llm_dispatch
+               (record_id, dispatched_at, status, prompt_hash,
+                attempts, last_error)
+               VALUES (?, ?, 'queued', ?, 0, NULL)
+               ON CONFLICT(record_id) DO UPDATE SET
+                   status = 'queued',
+                   prompt_hash = excluded.prompt_hash,
+                   dispatched_at = excluded.dispatched_at,
+                   attempts = 0,
+                   last_error = NULL""",
+            (record_id, now, prompt_hash),
+        )
+        con.commit()
+        return True
+
     def claim_next_queued_dispatch(self):
         """Atomically claim the oldest queued dispatch row.
 

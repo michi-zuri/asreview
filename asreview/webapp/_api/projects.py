@@ -2308,6 +2308,28 @@ def api_get_record_llm(project, record_id):  # noqa: F401
     return jsonify(meta)
 
 
+@bp.route("/projects/<project_id>/record/<record_id>/reprocess",
+          methods=["POST"])
+@login_required
+@project_authorization
+def api_reprocess_record(project, record_id):  # noqa: F401
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        db.force_requeue(int(record_id), prompt_hash)
+    return jsonify({"success": True})
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/recheck_pdf",
+          methods=["POST"])
+@login_required
+@project_authorization
+def api_recheck_pdf(project, record_id):  # noqa: F401
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        db.force_requeue(int(record_id), prompt_hash)
+    return jsonify({"success": True})
+
+
 @bp.route("/projects/<project_id>/llm_settings", methods=["GET"])
 @login_required
 @project_authorization
@@ -2327,7 +2349,13 @@ def api_update_llm_settings(project):  # noqa: F401
     merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
     merged["stale_timeout"] = max(1, int(merged["stale_timeout"]))
     merged["criteria_text"] = str(merged["criteria_text"])
+    old_hash = _current_prompt_hash(project)
     project.update_config(llm=merged)
+    new_hash = _current_prompt_hash(project)
+    if new_hash != old_hash:
+        with project.db as db:
+            n = db.requeue_for_prompt_change(new_hash)
+        logging.info("prompt changed; re-queued %s records", n)
     return jsonify(_llm_settings(project))
 
 

@@ -1,8 +1,10 @@
 import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import PictureAsPdfOffIcon from "@mui/icons-material/PictureAsPdf";
+import RefreshIcon from "@mui/icons-material/Refresh";
 import {
   Box,
+  Button,
   Card,
   CardContent,
   CircularProgress,
@@ -10,11 +12,13 @@ import {
   Typography,
 } from "@mui/material";
 import React from "react";
-import { useQuery } from "react-query";
+import { useQuery, useQueryClient } from "react-query";
 
 import { ProjectAPI } from "api";
 
 const LlmResultCard = ({ project_id, record_id, llm }) => {
+  const queryClient = useQueryClient();
+
   const isTerminal =
     llm &&
     (llm.status === "ready" ||
@@ -31,6 +35,30 @@ const LlmResultCard = ({ project_id, record_id, llm }) => {
       refetchOnWindowFocus: false,
     },
   );
+
+  const [busy, setBusy] = React.useState(false);
+
+  const handleReprocess = () => {
+    setBusy(true);
+    ProjectAPI.reprocessRecord({ project_id, record_id })
+      .then(() => {
+        queryClient.invalidateQueries({
+          queryKey: ["fetchLlmMeta", { project_id, record_id }],
+        });
+      })
+      .finally(() => setBusy(false));
+  };
+
+  const handleRecheckPdf = () => {
+    setBusy(true);
+    ProjectAPI.recheckPdf({ project_id, record_id })
+      .then(() => {
+        queryClient.invalidateQueries({
+          queryKey: ["fetchLlmMeta", { project_id, record_id }],
+        });
+      })
+      .finally(() => setBusy(false));
+  };
 
   if (!llm) return null;
 
@@ -65,40 +93,79 @@ const LlmResultCard = ({ project_id, record_id, llm }) => {
                 Full-text screening complete
               </Typography>
             </Stack>
-            <Typography variant="caption" color="text.secondary">
-              {meta.model}
-              {latency !== null && ` · ${latency}s`}
-              {meta.input_tokens != null &&
-                ` · ${meta.input_tokens} in / ${meta.output_tokens} out tokens`}
-              {dispatchedTime && ` · dispatched ${dispatchedTime}`}
-            </Typography>
+            <Stack
+              direction="row"
+              spacing={1}
+              alignItems="center"
+              justifyContent="space-between"
+            >
+              <Typography variant="caption" color="text.secondary">
+                {meta.model}
+                {latency !== null && ` · ${latency}s`}
+                {meta.input_tokens != null &&
+                  ` · ${meta.input_tokens} in / ${meta.output_tokens} out tokens`}
+                {dispatchedTime && ` · dispatched ${dispatchedTime}`}
+              </Typography>
+              <Button
+                size="small"
+                startIcon={<RefreshIcon />}
+                disabled={busy}
+                onClick={handleReprocess}
+              >
+                Re-screen
+              </Button>
+            </Stack>
           </Stack>
         );
 
       case "failed":
         return (
-          <Stack direction="row" spacing={1} alignItems="flex-start">
-            <ErrorOutlineIcon fontSize="small" color="error" />
-            <Box>
-              <Typography variant="body2" fontWeight="medium">
-                Full-text screening failed
-              </Typography>
-              {meta.last_error && (
-                <Typography variant="caption" color="text.secondary">
-                  {meta.last_error}
+          <Stack spacing={0.5}>
+            <Stack direction="row" spacing={1} alignItems="flex-start">
+              <ErrorOutlineIcon fontSize="small" color="error" />
+              <Box>
+                <Typography variant="body2" fontWeight="medium">
+                  Full-text screening failed
                 </Typography>
-              )}
-            </Box>
+                {meta.last_error && (
+                  <Typography variant="caption" color="text.secondary">
+                    {meta.last_error}
+                  </Typography>
+                )}
+              </Box>
+            </Stack>
+            <Stack direction="row" justifyContent="flex-end">
+              <Button
+                size="small"
+                startIcon={<RefreshIcon />}
+                disabled={busy}
+                onClick={handleReprocess}
+              >
+                Re-screen
+              </Button>
+            </Stack>
           </Stack>
         );
 
       case "missing_pdf":
         return (
-          <Stack direction="row" spacing={1} alignItems="center">
-            <PictureAsPdfOffIcon fontSize="small" color="disabled" />
-            <Typography variant="body2" color="text.secondary">
-              No PDF available for this record.
-            </Typography>
+          <Stack spacing={0.5}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <PictureAsPdfOffIcon fontSize="small" color="disabled" />
+              <Typography variant="body2" color="text.secondary">
+                No PDF available for this record.
+              </Typography>
+            </Stack>
+            <Stack direction="row" justifyContent="flex-end">
+              <Button
+                size="small"
+                startIcon={<RefreshIcon />}
+                disabled={busy}
+                onClick={handleRecheckPdf}
+              >
+                Recheck PDF
+              </Button>
+            </Stack>
           </Stack>
         );
 
