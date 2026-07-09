@@ -2330,6 +2330,26 @@ def api_recheck_pdf(project, record_id):  # noqa: F401
     return jsonify({"success": True})
 
 
+@bp.route("/projects/<project_id>/record/<record_id>/apply_llm",
+          methods=["POST"])
+@login_required
+@project_authorization
+def api_apply_llm(project, record_id):  # noqa: F401
+    """Return LLM pre-filled tags and lists for a record, forcing overwrite."""
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        payload_json = db.get_llm_payload(int(record_id), prompt_hash)
+    if not payload_json:
+        return jsonify({"error": "No LLM result available"}), 404
+
+    tags_form = read_tags_data(project.db) or []
+    lists_form = read_lists_data(project)
+    prefill = build_prefill_state(
+        json.loads(payload_json), tags_form, lists_form,
+        uuid_fn=lambda: uuid7())
+    return jsonify({"tags": prefill["tags"], "lists": prefill["lists"]})
+
+
 @bp.route("/projects/<project_id>/llm_settings", methods=["GET"])
 @login_required
 @project_authorization

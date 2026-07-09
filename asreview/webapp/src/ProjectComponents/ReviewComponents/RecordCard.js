@@ -321,6 +321,31 @@ const RecordCard = ({
   const [open, setOpen] = React.useState(true);
   const theme = useTheme();
   const [highlightOn, toggleHighlight] = useHighlightToggle();
+  const [isDirty, setIsDirty] = React.useState(false);
+  const [resetKey, setResetKey] = React.useState(0);
+  const [llmTagValues, setLlmTagValues] = React.useState(null);
+  const [llmListValues, setLlmListValues] = React.useState(null);
+
+  const handleApplyLlm = () => {
+    ProjectAPI.applyLlm({ project_id, record_id: record.record_id }).then(
+      (data) => {
+        setLlmTagValues(data.tags);
+        setLlmListValues(data.lists);
+        setResetKey((k) => k + 1);
+      },
+    );
+  };
+
+  // Reset LLM-applied state when the record changes.
+  React.useEffect(() => {
+    setLlmTagValues(null);
+    setLlmListValues(null);
+    setResetKey(0);
+    setIsDirty(false);
+  }, [record.record_id]);
+
+  const displayTagValues = llmTagValues || record.state?.tags;
+  const displayListValues = llmListValues || record.state?.lists;
 
   const { data: highlightConfig } = useQuery(
     ["fetchHighlights", { project_id }],
@@ -361,11 +386,6 @@ const RecordCard = ({
           borderRadius: !showBorder ? 0 : undefined,
         })}
       >
-        <LlmResultCard
-          project_id={project_id}
-          record_id={record.record_id}
-          llm={record.llm}
-        />
         <Grid
           container
           columns={5}
@@ -382,6 +402,13 @@ const RecordCard = ({
               highlightEntries={highlightEntries}
               highlightOn={highlightOn && highlightAvailable}
               paletteMode={theme.palette.mode}
+            />
+            <LlmResultCard
+              project_id={project_id}
+              record_id={record.record_id}
+              llm={record.llm}
+              isDirty={isDirty}
+              onApplyLlm={handleApplyLlm}
             />
           </Grid>
           <Grid size={landscape ? 2 : 5}>
@@ -403,15 +430,17 @@ const RecordCard = ({
               user={record.state?.user}
               showNotes={showNotes}
               tagsForm={record.tags_form}
-              tagValues={record.state?.tags}
+              tagValues={displayTagValues}
               listsForm={record.lists_form}
-              listValues={record.state?.lists}
+              listValues={displayListValues}
               landscape={landscape}
               hotkeys={hotkeys}
               changeDecision={changeDecision}
               highlightAvailable={highlightAvailable}
               highlightOn={highlightOn}
               onToggleHighlight={toggleHighlight}
+              resetKey={resetKey}
+              onDirtyChange={setIsDirty}
             />
           </Grid>
         </Grid>

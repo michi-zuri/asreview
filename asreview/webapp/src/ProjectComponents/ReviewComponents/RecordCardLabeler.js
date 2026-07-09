@@ -950,17 +950,38 @@ const RecordCardLabeler = ({
   highlightAvailable = false,
   highlightOn = false,
   onToggleHighlight = null,
+  resetKey = 0,
+  onDirtyChange = null,
 }) => {
   const [editState] = useToggle(!(label === 1 || label === 0));
   const [showNotesDialog, toggleShowNotesDialog] = useToggle(false);
   const [showTagsDialog, toggleShowTagsDialog] = useToggle(false);
   const [showListsDialog, toggleShowListsDialog] = useToggle(false);
-  const [tagValuesState, setTagValuesState] = React.useState(
-    mergeTagValues(tagsForm, tagValues),
+  const [isDirty, setIsDirty] = React.useState(false);
+
+  const initTags = React.useCallback(
+    () => mergeTagValues(tagsForm, tagValues),
+    [tagsForm, tagValues],
   );
-  const [listValuesState, setListValuesState] = React.useState(
-    withTrailingEmptyItems(structuredClone(listValues || []), listsForm),
+  const initLists = React.useCallback(
+    () => withTrailingEmptyItems(structuredClone(listValues || []), listsForm),
+    [listValues, listsForm],
   );
+
+  const [tagValuesState, setTagValuesState] = React.useState(initTags);
+  const [listValuesState, setListValuesState] = React.useState(initLists);
+
+  // Reset state when LLM pre-fill is applied (resetKey changes).
+  React.useEffect(() => {
+    setTagValuesState(initTags());
+    setListValuesState(initLists());
+    setIsDirty(false);
+  }, [resetKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Notify parent when dirty state changes.
+  React.useEffect(() => {
+    if (onDirtyChange) onDirtyChange(isDirty);
+  }, [isDirty, onDirtyChange]);
 
   // `listsForm` can arrive after this component first mounts (e.g. the record
   // query resolves before the form config). The one-time `useState` initializer
@@ -1000,6 +1021,7 @@ const RecordCardLabeler = ({
     let tagValuesCopy = structuredClone(tagValuesState);
     tagValuesCopy[groupI].values[tagI]["checked"] = isChecked;
 
+    setIsDirty(true);
     setTagValuesState(tagValuesCopy);
   };
 
@@ -1013,6 +1035,7 @@ const RecordCardLabeler = ({
       checked: tag.id === tagId,
     }));
 
+    setIsDirty(true);
     setTagValuesState(tagValuesCopy);
   };
 
@@ -1027,16 +1050,19 @@ const RecordCardLabeler = ({
     let tagValuesCopy = structuredClone(tagValuesState);
     tagValuesCopy[groupI].values[tagI]["text"] = text;
 
+    setIsDirty(true);
     setTagValuesState(tagValuesCopy);
   };
 
   const handleChangeListItem = (itemId, name) => {
+    setIsDirty(true);
     setListValuesState((prev) =>
       withTrailingEmptyItems(applyListItemName(prev, itemId, name), listsForm),
     );
   };
 
   const handleRemoveListItem = (itemId) => {
+    setIsDirty(true);
     setListValuesState((prev) =>
       withTrailingEmptyItems(
         prev.filter((item) => item.item_id !== itemId),
