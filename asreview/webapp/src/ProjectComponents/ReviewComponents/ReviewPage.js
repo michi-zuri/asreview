@@ -63,15 +63,13 @@ const ReviewPage = () => {
         .then((res) => {
           if (!res.active) {
             setNotice("This article was reassigned; loading the next one.");
-            queryClient.invalidateQueries({
-              queryKey: ["fetchRecord", { project_id }],
-            });
+            refetch();
           }
         })
         .catch(() => {}); // Silently ignore heartbeat failures
-    }, 60000);
+    }, 10000);
     return () => clearInterval(id);
-  }, [project_id, recordId, queryClient]);
+  }, [project_id, recordId, refetch]);
 
   const [showStoppingDialog, setShowStoppingDialog] = React.useState(false);
   const [dismissedThresholdValue, setDismissedThresholdValue] =
@@ -236,7 +234,11 @@ const ReviewPage = () => {
         onClose={() => setNotice(null)}
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
       >
-        <Alert severity="info" onClose={() => setNotice(null)}>
+        <Alert
+          variant="filled"
+          severity="warning"
+          onClose={() => setNotice(null)}
+        >
           {notice}
         </Alert>
       </Snackbar>

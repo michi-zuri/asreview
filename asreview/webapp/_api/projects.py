@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import secrets
 import shutil
 import socket
@@ -2074,18 +2075,19 @@ def api_label_record(project, record_id):  # noqa: F401
     )
 
     with project.db as db:
-        status = db.get_result_status(record_id)
-        if (status is not None and status["label"] is not None
-                and status["user_id"] != user_id):
-            logging.warning(
-                "Discarding late label for record %s from user %s "
-                "(already decided by user %s)",
-                record_id, user_id, status["user_id"])
-            return jsonify({
-                "discarded": True,
-                "message": ("This article was reassigned and has already been "
-                            "decided; your input was not saved."),
-            }), 200
+        if request.method == "POST":
+            status = db.get_result_status(record_id)
+            if (status is not None and status["label"] is not None
+                    and status["user_id"] != user_id):
+                logging.warning(
+                    "Discarding late label for record %s from user %s "
+                    "(already decided by user %s)",
+                    record_id, user_id, status["user_id"])
+                return jsonify({
+                    "discarded": True,
+                    "message": ("This article was reassigned and has already been "
+                                "decided; your input was not saved."),
+                }), 200
 
         if request.method == "PUT":
             db.update_result(record_id, label=label, tags=tags, user_id=user_id)
@@ -2248,7 +2250,8 @@ def api_get_record(project):  # noqa: F401
             pending = db.reassign_stale(
                 user_id=user_id, older_than=settings["stale_timeout"])
         if pending.empty:
-            pending = db.checkout_oldest_dispatched(user_id=user_id)
+            pending = db.checkout_oldest_dispatched(
+                user_id=user_id, stale_timeout=settings["stale_timeout"])
         if pending.empty:
             try:
                 pending = db.query_top_ranked(user_id=user_id)
@@ -2276,7 +2279,13 @@ def api_get_record(project):  # noqa: F401
 
     # Server-side pre-fill: only when a result exists for the current prompt
     # and the human has no saved input yet.
-    if payload_json and not item["state"].get("tags") and not record_lists:
+    state_tags = item["state"].get("tags")
+    has_tags = (
+        state_tags is not None
+        and not (isinstance(state_tags, float) and math.isnan(state_tags))
+        and state_tags
+    )
+    if payload_json and not has_tags and not record_lists:
         try:
             prefill = build_prefill_state(
                 json.loads(payload_json), tags_form, item["lists_form"],

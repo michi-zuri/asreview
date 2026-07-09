@@ -310,7 +310,7 @@ class ProjectAPI {
           withCredentials: true,
         })
         .then((result) => {
-          resolve(result.data);
+          resolve(result["data"]);
         })
         .catch((error) => {
           reject(axiosErrorHandler(error));

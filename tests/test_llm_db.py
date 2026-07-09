@@ -190,7 +190,7 @@ def test_top_up_cache_hit_ready(db_pool):
 
 
 def test_top_up_checked_out_not_re_dispatched(db_pool):
-    """Checked-out records are excluded from active count; deficit refill works."""
+    """Checked-out but unlabeled records stay in the buffer; no top-up needed."""
     db_pool.top_up_dispatch(3, "H")
     cur = db_pool._conn.cursor()
     cur.execute(
@@ -198,12 +198,13 @@ def test_top_up_checked_out_not_re_dispatched(db_pool):
     )
     db_pool._conn.commit()
 
+    # Record 0 is checked out but still unlabeled, so it counts as active.
+    # The buffer is already at capacity — no new dispatches.
     n = db_pool.top_up_dispatch(3, "H")
-    assert n == 1
+    assert n == 0
     rows = _dispatch_rows(db_pool)
     dispatched_ids = [r[0] for r in rows]
-    assert 0 in dispatched_ids  # still in dispatch table
-    assert 3 in dispatched_ids  # the new top-up record
+    assert dispatched_ids == [0, 1, 2]  # unchanged
 
 
 def _results_row(db, record_id):
@@ -231,8 +232,8 @@ def test_checkout_oldest(db_pool):
 def test_checkout_two_users_get_distinct(db_pool):
     """Two users check out different records, not the same one."""
     db_pool.top_up_dispatch(3, "H")
-    pending_1 = db_pool.checkout_oldest_dispatched(user_id=1)
-    pending_2 = db_pool.checkout_oldest_dispatched(user_id=2)
+    pending_1 = db_pool.checkout_oldest_dispatched(user_id=1, stale_timeout=3600)
+    pending_2 = db_pool.checkout_oldest_dispatched(user_id=2, stale_timeout=3600)
     assert not pending_1.empty
     assert not pending_2.empty
     ids_1 = set(pending_1["record_id"].values)
@@ -245,8 +246,8 @@ def test_checkout_two_users_get_distinct(db_pool):
 def test_checkout_no_steal(db_pool):
     """Record 0 stays assigned to user 1 after user 2 checks out."""
     db_pool.top_up_dispatch(3, "H")
-    db_pool.checkout_oldest_dispatched(user_id=1)
-    db_pool.checkout_oldest_dispatched(user_id=2)
+    db_pool.checkout_oldest_dispatched(user_id=1, stale_timeout=3600)
+    db_pool.checkout_oldest_dispatched(user_id=2, stale_timeout=3600)
     row = _results_row(db_pool, 0)
     assert row[0] == 1  # still user 1
 
@@ -316,8 +317,8 @@ def test_reassign_oldest_first(db_pool):
     """Oldest stale checkout is reassigned first."""
     db_pool.top_up_dispatch(3, "H")
     # user 2 gets record 0, user 3 gets record 1
-    db_pool.checkout_oldest_dispatched(user_id=2)
-    db_pool.checkout_oldest_dispatched(user_id=3)
+    db_pool.checkout_oldest_dispatched(user_id=2, stale_timeout=3600)
+    db_pool.checkout_oldest_dispatched(user_id=3, stale_timeout=3600)
     # backdate both: record 0 is older than record 1
     _set_last_active(db_pool, 0, time_module.time() - 100000)
     _set_last_active(db_pool, 1, time_module.time() - 50000)

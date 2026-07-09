@@ -1166,7 +1166,7 @@ class Database:
         ).fetchone()
         return None if row is None else {"user_id": row[0], "label": row[1]}
 
-    def checkout_oldest_dispatched(self, user_id):
+    def checkout_oldest_dispatched(self, user_id, stale_timeout=None):
         """Check out the oldest ready (or queued) dispatched record.
 
         Selects a dispatch row with status in (ready, queued, in_flight) whose
@@ -1174,6 +1174,11 @@ class Database:
         (label IS NULL).  "ready" records are served first so that LLM-screened
         records reach the user ahead of unscreened ones.  Within a status tier
         the oldest dispatched_at wins.
+
+        When *stale_timeout* is given, records that are currently assigned to a
+        different user and whose last_active is fresher than the timeout are
+        skipped — this prevents the cascade from immediately bouncing a record
+        back that was just reassigned.
 
         Creates or reassigns ``results`` rows for the whole group to
         ``user_id``.
@@ -1188,6 +1193,25 @@ class Database:
         model_string = ", ".join(MODEL_COLUMNS)
         top_cols = ", ".join(f"top_record.{c}" for c in MODEL_COLUMNS)
 
+        # Build the staleness guard: when stale_timeout is given, skip records
+        # that were recently assigned to another user so we don't bounce the
+        # same record straight back.
+        if stale_timeout is not None:
+            cutoff = now - stale_timeout
+            candidate_filter = """
+                AND (
+                    results.record_id IS NULL
+                    OR (results.label IS NULL AND results.user_id = :user_id)
+                    OR (results.label IS NULL AND results.last_active < :cutoff)
+                )
+            """
+            params = {"user_id": user_id, "now": now, "cutoff": cutoff}
+        else:
+            candidate_filter = """
+                AND (results.record_id IS NULL OR results.label IS NULL)
+            """
+            params = {"user_id": user_id, "now": now}
+
         con = self._conn
         cur = con.cursor()
         result = cur.execute(
@@ -1198,7 +1222,7 @@ class Database:
                 JOIN last_ranking USING (record_id)
                 LEFT JOIN results ON results.record_id = llm_dispatch.record_id
                 WHERE llm_dispatch.status IN ('queued', 'in_flight', 'ready')
-                  AND (results.record_id IS NULL OR results.label IS NULL)
+                  {candidate_filter}
                 ORDER BY CASE WHEN llm_dispatch.status = 'ready' THEN 0 ELSE 1 END,
                          llm_dispatch.dispatched_at ASC
                 LIMIT 1
@@ -1223,7 +1247,7 @@ class Database:
                 last_active = excluded.last_active
             RETURNING record_id
             """,
-            {"user_id": user_id, "now": now},
+            params,
         ).fetchone()
         con.commit()
 
