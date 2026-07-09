@@ -214,22 +214,37 @@ def process_with_retry(db, resolver, client, record, prompt, prompt_hash,
             sleep(delay)
 
 
-def run_worker_once(project, client, model, criteria_text="",
-                    max_concurrent=3, max_attempts=5,
+def run_worker_once(project, model, max_concurrent=3, max_attempts=5,
                     db_factory=None, resolver_factory=None,
                     executor=None):
     """Claim and process all currently-queued dispatch rows once.
 
-    Returns the number of records processed. Builds the current system
-    prompt from the project's tags/lists + criteria_text. Each pooled
-    job opens its own Database (db_factory) so sqlite is never shared
-    across threads.
+    Returns the number of records processed.  Builds the current system
+    prompt from the project's tags/lists + stored criteria text.  Each
+    pooled job opens its own Database (db_factory) so sqlite is never
+    shared across threads.
 
     When *executor* is given it is used to schedule jobs (caller owns the
     pool lifetime); otherwise a fresh ThreadPoolExecutor is created.
     """
-    # criteria_text has no project-level storage yet (planned for Phase 5);
-    # it defaults to "".
+    from asreview.webapp._api.projects import _llm_settings
+
+    settings = _llm_settings(project)
+
+    # Resolve API key: per-project setting first, env var as fallback.
+    api_key = settings.get("api_key", "") or os.environ.get(
+        "ANTHROPIC_API_KEY", ""
+    )
+    if not api_key:
+        logging.warning(
+            "LLM worker: skipping project %s — no API key configured "
+            "(set ANTHROPIC_API_KEY env var or configure per project)",
+            project.project_path,
+        )
+        return 0
+    client = anthropic.Anthropic(api_key=api_key)
+
+    criteria_text = settings.get("criteria_text", "")
     tags = read_tags_data(project.db)
     lists = read_lists_data(project)
     prompt, prompt_hash = build_system_prompt(tags, lists, criteria_text)
@@ -268,19 +283,18 @@ def run_worker_once(project, client, model, criteria_text="",
     return len(claimed)
 
 
-def run_worker(project_path, model=None, criteria_text="",
-               max_concurrent=None, poll_interval=5.0):
-    """Continuously drain a project's LLM queue using the real client."""
+def run_worker(project_path, model=None, max_concurrent=None,
+               poll_interval=5.0):
+    """Continuously drain a project's LLM queue (single-project mode)."""
     model = model or os.environ.get("ASREVIEW_LLM_MODEL", "claude-opus-4-8")
     if max_concurrent is None:
         max_concurrent = int(
             os.environ.get("ASREVIEW_LLM_MAX_CONCURRENT", "3")
         )
-    client = anthropic.Anthropic()
     with asr.Project(project_path) as project:
         while True:
             n = run_worker_once(
-                project, client, model, criteria_text=criteria_text,
+                project, model,
                 max_concurrent=max_concurrent,
             )
             if n == 0:
@@ -307,20 +321,26 @@ if __name__ == "__main__":
 
 
 def discover_project_paths():
-    """Return sorted project directories under asreview_path().
+    """Return sorted v4 project directories under asreview_path().
 
-    A project directory is any subdirectory containing a project.json.
+    A project directory is any subdirectory containing a project.json whose
+    ``project_file_version`` (or detected version) equals the current
+    ``Project.VERSION``. Older formats are silently skipped — they need to
+    be upgraded first with ``asreview migrate --projects``.
     """
     base = asreview_path()
     paths = []
     for p in sorted(base.glob("*")):
         if p.is_dir() and (p / asr.Project.PATH_CONFIG).exists():
-            paths.append(p)
+            if asr.is_project(p):
+                paths.append(p)
+            else:
+                logging.debug("LLM worker: skipping %s — not a v%s project",
+                              p.name, asr.Project.VERSION)
     return paths
 
 
-def run_worker_all(client, model, executor=None, criteria_text="",
-                   max_concurrent=3, max_attempts=5):
+def run_worker_all(model, executor=None, max_concurrent=3, max_attempts=5):
     """Drain the queued dispatch rows of every project once.
 
     Returns the total number of records processed across all projects. A
@@ -332,8 +352,7 @@ def run_worker_all(client, model, executor=None, criteria_text="",
         try:
             with asr.Project(path) as project:
                 total += run_worker_once(
-                    project, client, model,
-                    criteria_text=criteria_text,
+                    project, model,
                     max_concurrent=max_concurrent,
                     max_attempts=max_attempts,
                     executor=executor,
@@ -343,20 +362,20 @@ def run_worker_all(client, model, executor=None, criteria_text="",
     return total
 
 
-def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0,
-                       criteria_text=""):
+def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0):
     """Run the all-projects worker forever with a single global pool.
 
     The one ThreadPoolExecutor(max_concurrent) shared across all projects
     is what makes ``max_concurrent`` a GLOBAL cap. Only drains; never tops
-    up. criteria_text has no storage yet (Phase 5 setting); defaults "".
+    up. Each project's Anthropic API key and screening criteria are read
+    from its stored LLM settings (per-project config), falling back to the
+    ``ANTHROPIC_API_KEY`` environment variable when no key is configured.
     """
     model = model or os.environ.get("ASREVIEW_LLM_MODEL", "claude-opus-4-8")
     if max_concurrent is None:
         max_concurrent = int(
             os.environ.get("ASREVIEW_LLM_MAX_CONCURRENT", "3")
         )
-    client = anthropic.Anthropic()
     logging.info(
         "ASReview LLM worker starting (model=%s, max_concurrent=%s)",
         model, max_concurrent,
@@ -364,8 +383,8 @@ def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0,
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
         while True:
             n = run_worker_all(
-                client, model, executor=executor,
-                criteria_text=criteria_text, max_concurrent=max_concurrent,
+                model, executor=executor,
+                max_concurrent=max_concurrent,
             )
             if n == 0:
                 time.sleep(poll_interval)

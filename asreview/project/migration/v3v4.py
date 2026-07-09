@@ -344,8 +344,8 @@ def _migrate(project):
             tag_cols = [
                 row[1] for row in cur.execute("PRAGMA table_info(tags)")
             ]
-            # Only drop if it's the old schema (has group_id column)
-            if "group_id" in tag_cols:
+            # Only swap if the old table doesn't already have the v4 schema
+            if "option_id" not in tag_cols:
                 cur.execute("DROP TABLE tags")
                 cur.execute("ALTER TABLE tags_new RENAME TO tags")
             else:

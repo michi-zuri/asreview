@@ -550,6 +550,7 @@ class Database:
             self._fix_tag_options_schema(cur)
             self._fix_list_containers_schema(cur)
             self._fix_tag_groups_schema(cur)
+            self._fix_tags_schema(cur)
             self._ensure_results_indexes()
             self._ensure_lists_table()
             self._ensure_list_containers_table()
@@ -636,6 +637,27 @@ class Database:
             cur.execute(
                 "ALTER TABLE tag_groups ADD COLUMN sorted_at FLOAT NOT NULL DEFAULT 0"
             )
+            self._conn.commit()
+
+    def _fix_tags_schema(self, cur):
+        """Ensure the ``tags`` table has the v4 schema (``option_id`` column).
+
+        Some projects migrated from v3 may have an old-format ``tags`` table
+        that lacks ``option_id`` because the v3→v4 migration step 9 skipped
+        the swap when the old table had no ``group_id`` column.  When this is
+        detected the old table is dropped and recreated with the correct
+        schema (per-record tag selections were originally stored in
+        ``results.tags`` JSON so the migration step 8 should already have
+        extracted them into the new table).
+        """
+        exists = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tags'"
+        ).fetchone()
+        if not exists:
+            return
+        columns = [row[1] for row in cur.execute("PRAGMA table_info(tags)")]
+        if "option_id" not in columns:
+            cur.execute("DROP TABLE tags")
             self._conn.commit()
 
     def _fix_decision_changes_schema(self, cur):
@@ -907,7 +929,9 @@ class Database:
         active = cur.execute(
             """SELECT COUNT(*) FROM llm_dispatch
                WHERE status IN ('queued', 'in_flight', 'ready')
-                 AND record_id NOT IN (SELECT record_id FROM results)"""
+                 AND record_id NOT IN (
+                     SELECT record_id FROM results WHERE label IS NOT NULL
+                 )"""
         ).fetchone()[0]
 
         deficit = buffer_size - active
@@ -919,7 +943,7 @@ class Database:
                 FROM last_ranking lr
                 JOIN {self.record_table_name} rec ON rec.record_id = lr.record_id
                 LEFT JOIN results r ON r.record_id = lr.record_id
-                WHERE r.record_id IS NULL
+                WHERE (r.record_id IS NULL OR r.label IS NULL)
                   AND (rec.included IS NULL OR rec.included != 0)
                   AND lr.record_id IN (
                       SELECT group_id FROM {self.record_table_name}
@@ -1143,16 +1167,16 @@ class Database:
         return None if row is None else {"user_id": row[0], "label": row[1]}
 
     def checkout_oldest_dispatched(self, user_id):
-        """Check out the oldest dispatched, not-yet-assigned record.
+        """Check out the oldest ready (or queued) dispatched record.
 
-        Selects the record with the smallest ``dispatched_at`` among
-        ``llm_dispatch`` rows with status in (queued, in_flight, ready) that
-        have no ``results`` row yet, and creates ``results`` rows for its
-        whole group assigned to ``user_id`` with ``assigned_at`` and
-        ``last_active`` set to now. Concurrency-safe: the INSERT ... ON
-        CONFLICT DO NOTHING guard means two callers cannot claim the same
-        record (SQLite serializes writers; the second caller sees the first's
-        committed row and picks the next record, or gets nothing).
+        Selects a dispatch row with status in (ready, queued, in_flight) whose
+        corresponding results row either does not exist or is still unlabeled
+        (label IS NULL).  "ready" records are served first so that LLM-screened
+        records reach the user ahead of unscreened ones.  Within a status tier
+        the oldest dispatched_at wins.
+
+        Creates or reassigns ``results`` rows for the whole group to
+        ``user_id``.
 
         Returns
         -------
@@ -1174,8 +1198,9 @@ class Database:
                 JOIN last_ranking USING (record_id)
                 LEFT JOIN results ON results.record_id = llm_dispatch.record_id
                 WHERE llm_dispatch.status IN ('queued', 'in_flight', 'ready')
-                  AND results.record_id IS NULL
-                ORDER BY llm_dispatch.dispatched_at ASC
+                  AND (results.record_id IS NULL OR results.label IS NULL)
+                ORDER BY CASE WHEN llm_dispatch.status = 'ready' THEN 0 ELSE 1 END,
+                         llm_dispatch.dispatched_at ASC
                 LIMIT 1
             ),
             group_records AS (
@@ -1192,7 +1217,10 @@ class Database:
             SELECT group_records.record_id, :user_id, :now, :now, {top_cols}
             FROM group_records
             CROSS JOIN top_record ON TRUE
-            ON CONFLICT(record_id) DO NOTHING
+            ON CONFLICT(record_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                assigned_at = excluded.assigned_at,
+                last_active = excluded.last_active
             RETURNING record_id
             """,
             {"user_id": user_id, "now": now},

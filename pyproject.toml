@@ -66,7 +66,6 @@ requires-python = ">=3.10"
 
 [project.scripts]
 asreview = "asreview.__main__:main"
-asreview-llm-worker = "asreview.webapp._entry_points.llm_worker:main"
 
 [project.entry-points."asreview.entry_points"]
 lab = "asreview.webapp._entry_points.lab:lab_entry_point"
@@ -77,6 +76,7 @@ migrate = "asreview.webapp._entry_points.migrate:MigrationTool"
 
 [project.entry-points."asreview.entry_points_internal"]
 task-manager = "asreview.webapp._entry_points.task_manager:main"
+llm-worker = "asreview.webapp._entry_points.llm_worker:main"
 
 [project.entry-points."asreview.readers"]
 ".csv" = "asreview.data:CSVReader"

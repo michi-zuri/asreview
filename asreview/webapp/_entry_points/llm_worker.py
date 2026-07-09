@@ -21,7 +21,9 @@ from asreview.webapp._api.llm_worker import run_worker_service
 description = """\
 Launches the ASReview LLM screening worker: one long-lived process that
 scans all projects under ASREVIEW_PATH and drains their LLM queues, with a
-global concurrency cap. Requires ANTHROPIC_API_KEY in the environment.
+global concurrency cap. Each project's Anthropic API key and screening
+criteria are read from its stored LLM settings; the ANTHROPIC_API_KEY
+environment variable is used as a fallback when no per-project key is set.
 
 Example NixOS systemd service:
   systemd.services.asreview-llm-worker = {
@@ -34,8 +36,8 @@ Example NixOS systemd service:
       ASREVIEW_LLM_MAX_CONCURRENT = "3";
     };
     serviceConfig = {
-      ExecStart = "\${pkg}/bin/asreview-llm-worker";
-      EnvironmentFile = config.age.secrets.anthropic.path; # ANTHROPIC_API_KEY=...
+      ExecStart = "${pkg}/bin/asreview-llm-worker";
+      EnvironmentFile = config.age.secrets.anthropic.path; # fallback ANTHROPIC_API_KEY
       Restart = "always";
       User = "asreview";
     };
@@ -43,7 +45,7 @@ Example NixOS systemd service:
 """
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description=textwrap.dedent(description).strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -53,7 +55,7 @@ def main():
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-concurrent", type=int, default=None)
     parser.add_argument("--poll-interval", type=float, default=5.0)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO
     )

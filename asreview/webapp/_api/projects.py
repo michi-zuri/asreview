@@ -112,6 +112,7 @@ DEFAULT_LLM_SETTINGS = {
     "max_concurrent_llm": 3,
     "stale_timeout": 86400,   # 24h, seconds
     "criteria_text": "",
+    "api_key": "",
 }
 
 
@@ -2241,6 +2242,7 @@ def api_get_record(project):  # noqa: F401
     prompt_hash = _current_prompt_hash(project)
 
     with project.db as db:
+        db.top_up_dispatch(settings["buffer_size"], prompt_hash)
         pending = db.get_pending(user_id=user_id)
         if pending.empty:
             pending = db.reassign_stale(
@@ -2253,7 +2255,6 @@ def api_get_record(project):  # noqa: F401
             except ValueError:
                 ranking = db.get_last_ranking_table()
                 pool = db.get_pool()
-                db.top_up_dispatch(settings["buffer_size"], prompt_hash)
                 if not ranking.empty and pool.empty:
                     return jsonify({"result": None, "status": "review"})
                 return jsonify({"result": None, "status": "setup"})
@@ -2264,7 +2265,6 @@ def api_get_record(project):  # noqa: F401
         tags_form = read_tags_data(db) or []
         llm_meta = db.get_llm_meta(record_id, prompt_hash)
         payload_json = db.get_llm_payload(record_id, prompt_hash)
-        db.top_up_dispatch(settings["buffer_size"], prompt_hash)
 
     item["state"] = pending.iloc[0].to_dict()
     item["state"]["lists"] = record_lists
@@ -2349,6 +2349,7 @@ def api_update_llm_settings(project):  # noqa: F401
     merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
     merged["stale_timeout"] = max(1, int(merged["stale_timeout"]))
     merged["criteria_text"] = str(merged["criteria_text"])
+    merged["api_key"] = str(merged.get("api_key", ""))
     old_hash = _current_prompt_hash(project)
     project.update_config(llm=merged)
     new_hash = _current_prompt_hash(project)

@@ -4,16 +4,129 @@ import {
   Card,
   CardContent,
   CardHeader,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
   Skeleton,
   Stack,
   TextField,
+  Typography,
 } from "@mui/material";
+import EditIcon from "@mui/icons-material/Edit";
 import React, { useContext } from "react";
 import { useMutation, useQuery, useQueryClient } from "react-query";
 
 import { ProjectAPI } from "api";
 import { ProjectContext } from "context/ProjectContext";
+
+const EMPTY_SETTINGS = {
+  buffer_size: 20,
+  max_concurrent_llm: 3,
+  stale_timeout: 86400,
+  criteria_text: "",
+  api_key: "",
+};
+
+const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
+  const [state, setState] = React.useState(EMPTY_SETTINGS);
+
+  React.useEffect(() => {
+    if (open && initialSettings) {
+      setState({
+        buffer_size: initialSettings.buffer_size ?? 20,
+        max_concurrent_llm: initialSettings.max_concurrent_llm ?? 3,
+        stale_hours: Math.round(
+          (initialSettings.stale_timeout ?? 86400) / 3600,
+        ),
+        criteria_text: initialSettings.criteria_text ?? "",
+        api_key: initialSettings.api_key ?? "",
+      });
+    }
+  }, [open, initialSettings]);
+
+  const handleNumberChange = (field) => (e) => {
+    setState((prev) => ({
+      ...prev,
+      [field]: Math.max(1, parseInt(e.target.value, 10) || 1),
+    }));
+  };
+
+  const handleTextChange = (field) => (e) => {
+    setState((prev) => ({ ...prev, [field]: e.target.value }));
+  };
+
+  const handleSave = () => {
+    onSave({
+      buffer_size: state.buffer_size,
+      max_concurrent_llm: state.max_concurrent_llm,
+      stale_timeout: state.stale_hours * 3600,
+      criteria_text: state.criteria_text,
+      api_key: state.api_key.trim(),
+    });
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+      <DialogTitle>LLM screening settings</DialogTitle>
+      <DialogContent>
+        <Stack spacing={3} sx={{ pt: 1 }}>
+          <TextField
+            label="Buffer size"
+            type="number"
+            value={state.buffer_size}
+            onChange={handleNumberChange("buffer_size")}
+            helperText="Number of records to keep pre-screened in the dispatch queue"
+            inputProps={{ min: 1 }}
+            fullWidth
+          />
+          <TextField
+            label="Max concurrent LLM workers"
+            type="number"
+            value={state.max_concurrent_llm}
+            onChange={handleNumberChange("max_concurrent_llm")}
+            helperText="Maximum parallel AI screening requests"
+            inputProps={{ min: 1 }}
+            fullWidth
+          />
+          <TextField
+            label="Stale timeout (hours)"
+            type="number"
+            value={state.stale_hours}
+            onChange={handleNumberChange("stale_hours")}
+            helperText="Hours before a checked-out record is reassigned"
+            inputProps={{ min: 1 }}
+            fullWidth
+          />
+          <TextField
+            label="Screening criteria"
+            multiline
+            minRows={4}
+            value={state.criteria_text}
+            onChange={handleTextChange("criteria_text")}
+            helperText="Changing this will cause not-yet-labeled records to be re-screened."
+            fullWidth
+          />
+          <TextField
+            label="Anthropic API key"
+            type="password"
+            value={state.api_key}
+            onChange={handleTextChange("api_key")}
+            helperText="Leave blank to use the ANTHROPIC_API_KEY environment variable"
+            fullWidth
+          />
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>Cancel</Button>
+        <Button onClick={handleSave} variant="contained">
+          Save
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+};
 
 const LlmSettingsCard = () => {
   const projectId = useContext(ProjectContext);
@@ -37,36 +150,7 @@ const LlmSettingsCard = () => {
     },
   );
 
-  const [bufferSize, setBufferSize] = React.useState(20);
-  const [maxConcurrent, setMaxConcurrent] = React.useState(3);
-  const [staleHours, setStaleHours] = React.useState(24);
-  const [criteriaText, setCriteriaText] = React.useState("");
-
-  React.useEffect(() => {
-    if (settings) {
-      setBufferSize(settings.buffer_size ?? 20);
-      setMaxConcurrent(settings.max_concurrent_llm ?? 3);
-      setStaleHours(Math.round((settings.stale_timeout ?? 86400) / 3600));
-      setCriteriaText(settings.criteria_text ?? "");
-    }
-  }, [settings]);
-
-  const isPristine =
-    settings &&
-    bufferSize === (settings.buffer_size ?? 20) &&
-    maxConcurrent === (settings.max_concurrent_llm ?? 3) &&
-    staleHours === Math.round((settings.stale_timeout ?? 86400) / 3600) &&
-    criteriaText === (settings.criteria_text ?? "");
-
-  const handleSave = () => {
-    mutate({
-      project_id: projectId,
-      buffer_size: bufferSize,
-      max_concurrent_llm: maxConcurrent,
-      stale_timeout: staleHours * 3600,
-      criteria_text: criteriaText,
-    });
-  };
+  const [editDialogOpen, setEditDialogOpen] = React.useState(false);
 
   return (
     <Card>
@@ -84,50 +168,47 @@ const LlmSettingsCard = () => {
             <Skeleton variant="rectangular" height={120} />
           </Stack>
         ) : (
-          <Stack spacing={3}>
-            <TextField
-              label="Buffer size"
-              type="number"
-              value={bufferSize}
-              onChange={(e) =>
-                setBufferSize(Math.max(1, parseInt(e.target.value, 10) || 1))
-              }
-              helperText="Number of records to keep pre-screened in the dispatch queue"
-              inputProps={{ min: 1 }}
-              fullWidth
-            />
-            <TextField
-              label="Max concurrent LLM workers"
-              type="number"
-              value={maxConcurrent}
-              onChange={(e) =>
-                setMaxConcurrent(Math.max(1, parseInt(e.target.value, 10) || 1))
-              }
-              helperText="Maximum parallel AI screening requests"
-              inputProps={{ min: 1 }}
-              fullWidth
-            />
-            <TextField
-              label="Stale timeout (hours)"
-              type="number"
-              value={staleHours}
-              onChange={(e) =>
-                setStaleHours(Math.max(1, parseInt(e.target.value, 10) || 1))
-              }
-              helperText="Hours before a checked-out record is reassigned"
-              inputProps={{ min: 1 }}
-              fullWidth
-            />
+          <Stack spacing={2}>
             <Box>
-              <TextField
-                label="Screening criteria"
-                multiline
-                minRows={4}
-                value={criteriaText}
-                onChange={(e) => setCriteriaText(e.target.value)}
-                helperText="Edit with care — changing this changes the prompt and will cause not-yet-labeled records to be re-screened."
-                fullWidth
-              />
+              <Typography variant="subtitle2">Buffer size</Typography>
+              <Typography variant="body2" color="text.secondary">
+                {settings?.buffer_size ?? 20} — records kept pre-screened in the
+                dispatch queue
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="subtitle2">
+                Max concurrent LLM workers
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                {settings?.max_concurrent_llm ?? 3} — maximum parallel AI
+                screening requests
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="subtitle2">Stale timeout</Typography>
+              <Typography variant="body2" color="text.secondary">
+                {Math.round((settings?.stale_timeout ?? 86400) / 3600)} hours
+                before a checked-out record is reassigned
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="subtitle2">Screening criteria</Typography>
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ whiteSpace: "pre-wrap" }}
+              >
+                {settings?.criteria_text || "(none set)"}
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="subtitle2">Anthropic API key</Typography>
+              <Typography variant="body2" color="text.secondary">
+                {settings?.api_key
+                  ? "********"
+                  : "(using ANTHROPIC_API_KEY env var)"}
+              </Typography>
             </Box>
           </Stack>
         )}
@@ -136,12 +217,22 @@ const LlmSettingsCard = () => {
       <Box sx={{ display: "flex", justifyContent: "flex-end", p: 2 }}>
         <Button
           variant="contained"
-          onClick={handleSave}
-          disabled={isLoading || isPristine || isSaving}
+          startIcon={<EditIcon />}
+          onClick={() => setEditDialogOpen(true)}
+          disabled={isLoading || isSaving}
         >
-          {isSaving ? "Saving…" : "Save"}
+          Edit settings
         </Button>
       </Box>
+      <LlmSettingsEditDialog
+        open={editDialogOpen}
+        onClose={() => setEditDialogOpen(false)}
+        initialSettings={settings}
+        onSave={(newSettings) => {
+          mutate({ project_id: projectId, ...newSettings });
+          setEditDialogOpen(false);
+        }}
+      />
     </Card>
   );
 };
