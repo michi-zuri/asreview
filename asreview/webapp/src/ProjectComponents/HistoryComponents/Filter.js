@@ -39,6 +39,14 @@ const STATIC_FILTER_DEFS = [
       { value: "pdf=false", label: "False", symbol: "\u20E0" },
     ],
   },
+  {
+    key: "abstract",
+    label: "Has abstract",
+    options: [
+      { value: "abstract", label: "True", symbol: "✓" },
+      { value: "abstract=false", label: "False", symbol: "\u20E0" },
+    ],
+  },
 ];
 
 /**

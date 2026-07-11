@@ -15,13 +15,16 @@ import {
   Stack,
   Switch,
   TextField,
+  Tooltip,
   Typography,
 } from "@mui/material";
 import * as React from "react";
 import { useContext } from "react";
 import { useMutation, useQuery, useQueryClient } from "react-query";
 
+import DeleteIcon from "@mui/icons-material/Delete";
 import EditIcon from "@mui/icons-material/Edit";
+import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
 import { ProjectAPI } from "api";
 import { ProjectContext } from "context/ProjectContext";
 import { LoadingCardHeader } from "StyledComponents/LoadingCardheader";
@@ -33,33 +36,78 @@ const EMPTY_ZOTERO_CONFIG = {
   group_slug: "",
 };
 
-const ZoteroEditDialog = ({ open, onClose, initialConfig, onSave }) => {
+const ZoteroEditDialog = ({
+  open,
+  onClose,
+  initialConfig,
+  onSave,
+  onDelete,
+  projectId,
+}) => {
   const [state, setState] = React.useState(EMPTY_ZOTERO_CONFIG);
+  const [apiKeyTouched, setApiKeyTouched] = React.useState(false);
+  const [validating, setValidating] = React.useState(false);
+  const [validationError, setValidationError] = React.useState("");
 
   React.useEffect(() => {
     if (open) {
-      setState(
-        initialConfig
-          ? {
-              api_key: initialConfig.api_key || "",
-              group_id: initialConfig.group_id || "",
-              group_slug: initialConfig.group_slug || "",
-            }
-          : structuredClone(EMPTY_ZOTERO_CONFIG),
-      );
+      if (initialConfig) {
+        // If api_key is true (masked), we know a key exists but not its
+        // value — show an empty password field.
+        const rawKey = initialConfig.api_key;
+        setState({
+          api_key: typeof rawKey === "string" ? rawKey : "",
+          group_id: initialConfig.group_id || "",
+        });
+      } else {
+        setState(structuredClone(EMPTY_ZOTERO_CONFIG));
+      }
+      setApiKeyTouched(false);
+      setValidationError("");
     }
   }, [open, initialConfig]);
 
   const handleChange = (field) => (e) => {
     setState((prev) => ({ ...prev, [field]: e.target.value }));
+    setValidationError("");
   };
 
-  const handleSave = () => {
-    onSave({
-      api_key: state.api_key.trim(),
-      group_id: state.group_id.trim(),
-      group_slug: state.group_slug.trim(),
-    });
+  const handleSave = async () => {
+    const apiKey = state.api_key.trim();
+    const groupId = state.group_id.trim();
+
+    let slug = initialConfig?.group_slug || "";
+
+    // If the user provided a new API key, validate it against Zotero.
+    // The group name from the API becomes the slug.
+    if (apiKeyTouched && apiKey && groupId) {
+      setValidating(true);
+      setValidationError("");
+      try {
+        const result = await ProjectAPI.validateZotero({
+          project_id: projectId,
+          group_id: groupId,
+          api_key: apiKey,
+        });
+        slug = result.name || "";
+      } catch (err) {
+        setValidationError(
+          err?.message || "Could not validate Zotero credentials.",
+        );
+        setValidating(false);
+        return;
+      }
+      setValidating(false);
+    }
+
+    const payload = {
+      group_id: groupId,
+      group_slug: slug,
+    };
+    // Send true (masked sentinel) to preserve the existing key unless the
+    // user actually edited the field.
+    payload.api_key = apiKeyTouched ? apiKey : true;
+    onSave(payload);
   };
 
   return (
@@ -73,7 +121,10 @@ const ZoteroEditDialog = ({ open, onClose, initialConfig, onSave }) => {
             label="API Key"
             type="password"
             value={state.api_key}
-            onChange={handleChange("api_key")}
+            onChange={(e) => {
+              setApiKeyTouched(true);
+              handleChange("api_key")(e);
+            }}
             helperText="Zotero API key with read access to the group library"
           />
           <TextField
@@ -84,20 +135,30 @@ const ZoteroEditDialog = ({ open, onClose, initialConfig, onSave }) => {
             onChange={handleChange("group_id")}
             helperText="Numeric ID of the Zotero group library"
           />
-          <TextField
-            fullWidth
-            id="zotero-group-slug"
-            label="Group Slug"
-            value={state.group_slug}
-            onChange={handleChange("group_slug")}
-            helperText="URL slug of the group (optional, used for reader links)"
-          />
+          {validationError && (
+            <Typography variant="body2" color="error">
+              {validationError}
+            </Typography>
+          )}
         </Stack>
       </DialogContent>
       <DialogActions>
+        {onDelete && (
+          <Button
+            onClick={() => {
+              onDelete();
+              onClose();
+            }}
+            color="error"
+            startIcon={<DeleteIcon />}
+            sx={{ mr: "auto" }}
+          >
+            Delete credentials
+          </Button>
+        )}
         <Button onClick={onClose}>Cancel</Button>
-        <Button onClick={handleSave} variant="contained">
-          Save
+        <Button onClick={handleSave} variant="contained" disabled={validating}>
+          {validating ? "Validating..." : "Save"}
         </Button>
       </DialogActions>
     </Dialog>
@@ -289,9 +350,59 @@ const ScreeningCard = () => {
 
       <CardContent>
         <Stack spacing={1}>
-          <Typography variant="subtitle1">
-            Config for Zotero PDF links
-          </Typography>
+          <Stack
+            direction="row"
+            spacing={1}
+            alignItems="center"
+            justifyContent="space-between"
+          >
+            <Typography variant="subtitle1">
+              Config for Zotero PDF links
+            </Typography>
+            <Tooltip
+              title={
+                <Stack spacing={1} sx={{ p: 0.5 }}>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <PictureAsPdfIcon fontSize="small" />
+                    <Typography variant="caption">
+                      Full text available — opens in Zotero reader
+                    </Typography>
+                  </Stack>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <Box
+                      sx={{
+                        position: "relative",
+                        display: "inline-flex",
+                        color: "text.disabled",
+                      }}
+                    >
+                      <PictureAsPdfIcon fontSize="small" />
+                      <Box
+                        sx={{
+                          position: "absolute",
+                          top: "50%",
+                          left: "10%",
+                          width: "80%",
+                          height: "2px",
+                          bgcolor: "currentColor",
+                          borderRadius: 1,
+                          transform: "translateY(-50%) rotate(-45deg)",
+                        }}
+                      />
+                    </Box>
+                    <Typography variant="caption">
+                      No full text available
+                    </Typography>
+                  </Stack>
+                </Stack>
+              }
+              arrow
+            >
+              <IconButton size="small">
+                <StyledLightBulb />
+              </IconButton>
+            </Tooltip>
+          </Stack>
           <Typography variant="body2" color="text.secondary">
             {zoteroConfigured
               ? `Configured for group ${zoteroConfig.group_id}${zoteroConfig.group_slug ? ` (${zoteroConfig.group_slug})` : ""}.`
@@ -300,15 +411,13 @@ const ScreeningCard = () => {
           {zoteroLoading ? (
             <Skeleton variant="rounded" height={36} width={80} />
           ) : (
-            <Box>
-              <Button
-                size="small"
-                onClick={() => setZoteroEditOpen(true)}
-                startIcon={<EditIcon />}
-              >
-                {zoteroConfigured ? "Edit credentials" : "Add credentials"}
-              </Button>
-            </Box>
+            <Button
+              size="small"
+              onClick={() => setZoteroEditOpen(true)}
+              startIcon={<EditIcon />}
+            >
+              {zoteroConfigured ? "Edit Zotero credentials" : "Add credentials"}
+            </Button>
           )}
         </Stack>
       </CardContent>
@@ -317,10 +426,20 @@ const ScreeningCard = () => {
         open={zoteroEditOpen}
         onClose={() => setZoteroEditOpen(false)}
         initialConfig={zoteroConfig}
+        projectId={project_id}
         onSave={(newConfig) => {
           saveZotero({ project_id, config: newConfig });
           setZoteroEditOpen(false);
         }}
+        onDelete={
+          zoteroConfigured
+            ? () =>
+                saveZotero({
+                  project_id,
+                  config: { api_key: "", group_id: "", group_slug: "" },
+                })
+            : undefined
+        }
       />
     </Card>
   );

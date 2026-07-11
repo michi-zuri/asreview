@@ -37,6 +37,7 @@ __all__ = [
     "fetch_pdf_attachment_key",
     "download_attachment_file",
     "build_reader_url",
+    "validate_zotero_credentials",
 ]
 
 
@@ -233,3 +234,56 @@ def build_reader_url(config, item_key, attachment_key):
         f"{ZOTERO_WEB_BASE}/groups/{group_segment}"
         f"/items/{item_key}/attachment/{attachment_key}/reader"
     )
+
+
+def validate_zotero_credentials(group_id, api_key, timeout=10):
+    """Validate Zotero credentials and return the group name.
+
+    Queries the Zotero API for the group metadata. A successful response
+    proves the API key has read access to the group.
+
+    Parameters
+    ----------
+    group_id : str
+        Numeric Zotero group ID.
+    api_key : str
+        Zotero API key with read access to the group.
+    timeout : float
+        Request timeout in seconds.
+
+    Returns
+    -------
+    str
+        The group name from ``.data.name`` in the API response.
+
+    Raises
+    ------
+    ZoteroLookupError
+        If the request fails (network error, HTTP error, invalid key, etc.).
+    """
+    url = f"{ZOTERO_API_BASE}/groups/{group_id}"
+    headers = {
+        "Zotero-API-Version": ZOTERO_API_VERSION,
+        "Zotero-API-Key": api_key,
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as err:
+        raise ZoteroLookupError(
+            f"Could not reach Zotero: {err}"
+        ) from err
+    except ValueError as err:
+        raise ZoteroLookupError(
+            f"Invalid Zotero response: {err}"
+        ) from err
+
+    name = data.get("data", {}).get("name", "")
+    if not name:
+        raise ZoteroLookupError(
+            "Zotero returned a response but no group name was found. "
+            "Check the group ID and API key."
+        )
+    return name

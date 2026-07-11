@@ -85,6 +85,7 @@ from asreview.webapp._api.zotero import ZoteroLookupError
 from asreview.webapp._api.zotero import build_reader_url
 from asreview.webapp._api.zotero import fetch_pdf_attachment_key
 from asreview.webapp._api.zotero import get_zotero_config
+from asreview.webapp._api.zotero import validate_zotero_credentials
 from asreview.webapp._api.zotero import is_attachment_key
 from asreview.webapp._authentication.decorators import current_user_projects
 from asreview.webapp._authentication.decorators import login_required
@@ -777,9 +778,13 @@ def api_get_labeled(project):  # noqa: F401
 
     invalid_filter = parsed_filters.get("invalid_tags")
     filter_pdf = parsed_filters.get("pdf")
+    filter_abstract = parsed_filters.get("abstract")
 
     post_scan = (
-        filter_pdf is not None or bool(tag_filters) or invalid_filter is not None
+        filter_pdf is not None
+        or filter_abstract is not None
+        or bool(tag_filters)
+        or invalid_filter is not None
     )
 
     # ---- Decode / validate cursor ----
@@ -821,10 +826,28 @@ def api_get_labeled(project):  # noqa: F401
                 ]
             )
 
+        # Abstract availability set, computed once.
+        abstract_ids = None
+        if filter_abstract is not None:
+            abstracts = db.input[["record_id", "abstract"]]
+            # A record "has abstract" when the field is non-null and non-empty.
+            abstract_ids = set(
+                abstracts.loc[
+                    abstracts["abstract"].apply(
+                        lambda v: isinstance(v, str) and bool(v.strip())
+                    ),
+                    "record_id",
+                ]
+            )
+
         def passes(saved_tags, record_id, label):
             if pdf_ids is not None:
                 in_pdf = record_id in pdf_ids
                 if filter_pdf != in_pdf:
+                    return False
+            if abstract_ids is not None:
+                in_abstract = record_id in abstract_ids
+                if filter_abstract != in_abstract:
                     return False
             for group_export, tag_export, want in tag_filters:
                 if _tag_is_checked(saved_tags, group_export, tag_export) != want:
@@ -1668,17 +1691,24 @@ def get_zotero(project):
     """Return the Zotero configuration for the project.
 
     If the file is missing, an empty config is returned without creating the file.
+    The API key is never exposed — a boolean indicates whether one is set.
     """
     zotero_path = Path(project.project_path, "zotero.json")
+    empty = {"api_key": False, "group_id": "", "group_slug": ""}
 
     try:
         with open(zotero_path, "r") as f:
-            return jsonify(json.load(f))
+            config = json.load(f)
     except FileNotFoundError:
-        return jsonify({"api_key": "", "group_id": "", "group_slug": ""})
+        return jsonify(empty)
     except Exception as err:
         logging.exception(err)
-        return jsonify({"api_key": "", "group_id": "", "group_slug": ""}), 500
+        return jsonify(empty), 500
+
+    # Mask the API key — never expose it to the frontend.
+    if config.get("api_key"):
+        config["api_key"] = True
+    return jsonify(config)
 
 
 @bp.route("/projects/<project_id>/zotero", methods=["PUT"])
@@ -1696,8 +1726,18 @@ def update_zotero(project):
     if not isinstance(config, dict):
         return jsonify(message="Zotero config must be an object."), 400
 
+    # If the frontend sends api_key: true (masked), preserve the existing key.
+    api_key = config.get("api_key", "")
+    if api_key is True:
+        try:
+            with open(zotero_path, "r") as f:
+                existing = json.load(f)
+            api_key = existing.get("api_key", "")
+        except (FileNotFoundError, json.JSONDecodeError):
+            api_key = ""
+
     cleaned = {
-        "api_key": str(config.get("api_key", "")).strip(),
+        "api_key": str(api_key).strip(),
         "group_id": str(config.get("group_id", "")).strip(),
         "group_slug": str(config.get("group_slug", "")).strip(),
     }
@@ -1705,10 +1745,46 @@ def update_zotero(project):
     try:
         with open(zotero_path, "w") as f:
             json.dump(cleaned, f)
-        return jsonify(cleaned)
+        # Mask the API key in the response.
+        response_config = {**cleaned, "api_key": bool(cleaned["api_key"])}
+        return jsonify(response_config)
     except Exception as err:
         logging.exception(err)
         return jsonify(message="Failed to save zotero config."), 500
+
+
+@bp.route("/projects/<project_id>/zotero/validate", methods=["POST"])
+@login_required
+@project_authorization
+def validate_zotero(project):
+    """Validate Zotero credentials and return the group name."""
+    body = request.get_json(silent=True) or {}
+    group_id = str(body.get("group_id", "")).strip()
+    api_key = str(body.get("api_key", "")).strip()
+
+    if not group_id or not api_key:
+        return jsonify(message="Group ID and API key are required."), 400
+
+    try:
+        name = validate_zotero_credentials(group_id, api_key)
+    except ZoteroLookupError as err:
+        return jsonify(message=str(err)), 400
+
+    return jsonify({"name": name})
+
+
+@bp.route("/projects/<project_id>/zotero", methods=["DELETE"])
+@login_required
+@project_authorization
+def delete_zotero(project):
+    """Delete the Zotero configuration for the project."""
+    zotero_path = Path(project.project_path, "zotero.json")
+    try:
+        zotero_path.unlink(missing_ok=True)
+    except OSError as err:
+        logging.exception(err)
+        return jsonify(message="Failed to delete zotero config."), 500
+    return jsonify({"api_key": False, "group_id": "", "group_slug": ""})
 
 
 def _flatten_tags(results, tags_config):

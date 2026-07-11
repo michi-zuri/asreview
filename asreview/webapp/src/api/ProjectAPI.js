@@ -913,6 +913,41 @@ class ProjectAPI {
     });
   }
 
+  static validateZotero({ project_id, group_id, api_key }) {
+    const url = api_url + `projects/${project_id}/zotero/validate`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        data: { group_id, api_key },
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static deleteZoteroConfig({ project_id }) {
+    const url = api_url + `projects/${project_id}/zotero`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "delete",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
   static fetchGenericData({ queryKey }) {
     const { project_id, includePrior } = queryKey[1];
     const url = api_url + `projects/${project_id}/progress_data`;
