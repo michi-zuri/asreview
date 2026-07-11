@@ -1415,7 +1415,7 @@ def update_tag_group(project, group_id):
                        (option_id, group_id, export_name, label_name,
                         free_text_enabled, free_text_required, sorted_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(option_id, group_id) DO UPDATE SET
+                       ON CONFLICT(option_id) DO UPDATE SET
                        export_name=excluded.export_name,
                        label_name=excluded.label_name,
                        free_text_enabled=excluded.free_text_enabled,
@@ -2269,6 +2269,20 @@ def api_get_record(project):  # noqa: F401
         llm_meta = db.get_llm_meta(record_id, prompt_hash)
         payload_json = db.get_llm_payload(record_id, prompt_hash)
 
+        # When the dispatch status is "ready" but no payload exists for the
+        # current prompt hash, the LLM settings must have changed. Re-queue
+        # every stale dispatch row so the buffer isn't clogged by records
+        # with results that are invisible to the current prompt.
+        if (
+            llm_meta is not None
+            and llm_meta.get("status") == "ready"
+            and payload_json is None
+        ):
+            count = db.requeue_for_prompt_change(prompt_hash)
+            logging.info(
+                "Prompt change detected — re-queued %d records.", count)
+            llm_meta["status"] = "queued"
+
     item["state"] = pending.iloc[0].to_dict()
     item["state"]["lists"] = record_lists
     item["tags_form"] = tags_form
@@ -2349,7 +2363,7 @@ def api_apply_llm(project, record_id):  # noqa: F401
     with project.db as db:
         payload_json = db.get_llm_payload(int(record_id), prompt_hash)
     if not payload_json:
-        return jsonify({"error": "No LLM result available"}), 404
+        return jsonify({"message": "No LLM result available"}), 404
 
     tags_form = read_tags_data(project.db) or []
     lists_form = read_lists_data(project)

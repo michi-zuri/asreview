@@ -221,14 +221,6 @@ def _map_lists(payload, list_lookup):
                 )
                 continue
 
-            if "," in name or ";" in name:
-                logging.warning(
-                    "Item name contains ',' or ';' in list '%s': %r; dropping.",
-                    list_name,
-                    name,
-                )
-                continue
-
             if name in seen_names:
                 logging.warning(
                     "Duplicate item '%s' in list '%s'; keeping first.",

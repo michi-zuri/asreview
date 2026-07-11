@@ -245,7 +245,7 @@ class Database:
 
         cur.execute(
             """CREATE TABLE results
-                            (record_id INTEGER UNIQUE,
+                            (record_id INTEGER PRIMARY KEY,
                             label INTEGER,
                             classifier TEXT,
                             querier TEXT,
@@ -261,7 +261,7 @@ class Database:
 
         cur.execute(
             """CREATE TABLE last_ranking
-                            (record_id INTEGER UNIQUE,
+                            (record_id INTEGER PRIMARY KEY,
                             ranking INT,
                             classifier TEXT,
                             querier TEXT,
@@ -273,7 +273,7 @@ class Database:
 
         cur.execute(
             """CREATE TABLE decision_changes
-                            (record_id INTEGER,
+                            (record_id INTEGER PRIMARY KEY,
                             label INTEGER,
                             time FLOAT,
                             user_id INTEGER)"""
@@ -309,13 +309,16 @@ class Database:
         """
         cur = self._conn.cursor()
         cur.execute(
-            """CREATE TABLE IF NOT EXISTS lists
-                (record_id INTEGER NOT NULL,
+            """CREATE TABLE IF NOT EXISTS lists (
+                record_id INTEGER NOT NULL,
                 list_id TEXT NOT NULL,
                 item_id TEXT NOT NULL PRIMARY KEY,
                 name TEXT NOT NULL,
                 sorted_at FLOAT NOT NULL,
-                UNIQUE (record_id, list_id, name))"""
+                UNIQUE (record_id, list_id, name),
+                FOREIGN KEY (record_id) REFERENCES record(record_id),
+                FOREIGN KEY (list_id) REFERENCES list_containers(list_id)
+            )"""
         )
         self._conn.commit()
 
@@ -380,14 +383,14 @@ class Database:
         cur = self._conn.cursor()
         cur.execute(
             """CREATE TABLE IF NOT EXISTS tag_options (
-                option_id TEXT NOT NULL,
+                option_id TEXT PRIMARY KEY,
                 group_id TEXT NOT NULL,
                 export_name TEXT NOT NULL,
                 label_name TEXT NOT NULL,
                 free_text_enabled INTEGER NOT NULL DEFAULT 0,
                 free_text_required INTEGER NOT NULL DEFAULT 0,
                 sorted_at FLOAT NOT NULL DEFAULT 0,
-                UNIQUE (option_id, group_id),
+                UNIQUE (export_name, group_id),
                 FOREIGN KEY (group_id) REFERENCES tag_groups(group_id)
             )"""
         )
@@ -425,8 +428,8 @@ class Database:
             ON tags(record_id)"""
         )
         cur.execute(
-            """CREATE INDEX IF NOT EXISTS idx_tags_record_option
-            ON tags(record_id, option_id)"""
+            """CREATE INDEX IF NOT EXISTS idx_tags_option
+            ON tags(option_id)"""
         )
         self._conn.commit()
 
@@ -451,7 +454,8 @@ class Database:
                 status TEXT NOT NULL,
                 prompt_hash TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT
+                last_error TEXT,
+                FOREIGN KEY (record_id) REFERENCES record(record_id)
             )"""
         )
         cur.execute(
@@ -481,7 +485,8 @@ class Database:
                 input_tokens INTEGER,
                 output_tokens INTEGER,
                 created_at REAL,
-                PRIMARY KEY (record_id, prompt_hash)
+                PRIMARY KEY (record_id, prompt_hash),
+                FOREIGN KEY (record_id) REFERENCES record(record_id)
             )"""
         )
         self._conn.commit()
@@ -1008,6 +1013,22 @@ class Database:
         con.commit()
         return len(rows)
 
+    def requeue_record(self, record_id, prompt_hash):
+        """Re-queue a single record under a new prompt hash.
+
+        Resets status to 'queued', updates prompt_hash, zeroes attempts and
+        clears last_error. The dispatched_at timestamp is preserved so the
+        record keeps its relative ordering.
+        """
+        con = self._conn
+        cur = con.cursor()
+        cur.execute(
+            "UPDATE llm_dispatch SET status='queued', prompt_hash=?, "
+            "attempts=0, last_error=NULL WHERE record_id=?",
+            (prompt_hash, record_id),
+        )
+        con.commit()
+
     def force_requeue(self, record_id, prompt_hash):
         """Force one record back into llm_dispatch (bypass cache-skip).
 
@@ -1501,8 +1522,6 @@ class Database:
         rows = []
         for item in items or []:
             name = item["name"]
-            if "," in name or ";" in name:
-                raise ValueError("List item names may not contain ',' or ';'.")
             sorted_at = item.get("sorted_at")
             if sorted_at is None:
                 sorted_at = time.time()

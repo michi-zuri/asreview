@@ -327,13 +327,13 @@ const RecordCard = ({
   const [llmListValues, setLlmListValues] = React.useState(null);
 
   const handleApplyLlm = () => {
-    ProjectAPI.applyLlm({ project_id, record_id: record.record_id }).then(
-      (data) => {
+    ProjectAPI.applyLlm({ project_id, record_id: record.record_id })
+      .then((data) => {
         setLlmTagValues(data.tags);
         setLlmListValues(data.lists);
         setResetKey((k) => k + 1);
-      },
-    );
+      })
+      .catch(() => {}); // Silently ignore — backend pre-fill already covers this
   };
 
   // Reset LLM-applied state when the record changes.

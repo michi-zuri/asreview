@@ -87,16 +87,16 @@ def _migrate(project):
 
         # 2. Create tag_options table
         cur.execute(
-            """CREATE TABLE IF NOT EXISTS tag_options (
-                option_id TEXT NOT NULL,
+             """CREATE TABLE IF NOT EXISTS tag_options (
+                option_id TEXT PRIMARY KEY,
                 group_id TEXT NOT NULL,
                 export_name TEXT NOT NULL,
                 label_name TEXT NOT NULL,
                 free_text_enabled INTEGER NOT NULL DEFAULT 0,
                 free_text_required INTEGER NOT NULL DEFAULT 0,
                 sorted_at FLOAT NOT NULL DEFAULT 0,
-                UNIQUE (option_id, group_id),
-                FOREIGN KEY (group_id) REFERENCES tag_groups_new(group_id)
+                UNIQUE (export_name, group_id),
+                FOREIGN KEY (group_id) REFERENCES tag_groups(group_id)
             )"""
         )
         cur.execute(
@@ -123,7 +123,7 @@ def _migrate(project):
         )
         cur.execute(
             """CREATE INDEX IF NOT EXISTS idx_tags_record_option
-            ON tags_new(record_id, option_id)"""
+            ON tags_new(option_id)"""
         )
 
         # 4. Create list_containers table

@@ -107,6 +107,24 @@ const LlmResultCard = ({
     }
   }, [meta, isDirty, onApplyLlm]);
 
+  // Auto-apply for records that are already ready when first mounted.
+  const didAutoApply = React.useRef(false);
+  React.useEffect(() => {
+    didAutoApply.current = false;
+  }, [record_id]);
+
+  React.useEffect(() => {
+    if (
+      meta?.status === "ready" &&
+      !isDirty &&
+      !didAutoApply.current &&
+      onApplyLlm
+    ) {
+      didAutoApply.current = true;
+      onApplyLlm();
+    }
+  }, [meta?.status, isDirty, onApplyLlm]);
+
   if (!llm) return null;
 
   const renderContent = () => {

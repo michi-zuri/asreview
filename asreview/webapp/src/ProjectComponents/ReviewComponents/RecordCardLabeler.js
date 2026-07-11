@@ -321,8 +321,7 @@ const TagGroupInput = ({
   );
 };
 
-/** Remove characters that are not allowed in a list item name. */
-const sanitizeListItemName = (name) => (name || "").replace(/[,;]/g, "");
+const sanitizeListItemName = (name) => name || "";
 
 /** Generate a uuid_v4 for a new list item. */
 const newItemId = () => {
