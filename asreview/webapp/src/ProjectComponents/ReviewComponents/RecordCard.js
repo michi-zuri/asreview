@@ -7,6 +7,7 @@ import {
   Button,
   Card,
   CardContent,
+  CircularProgress,
   Collapse,
   Divider,
   Fade,
@@ -16,7 +17,7 @@ import {
   Typography,
 } from "@mui/material";
 import React from "react";
-import { useQuery } from "react-query";
+import { useQuery, useQueryClient } from "react-query";
 import { useInView } from "react-intersection-observer";
 
 import { ProjectAPI } from "api";
@@ -59,6 +60,33 @@ const ZoteroFullTextButton = ({ project_id, record }) => {
     },
   );
 
+  const uploadInputRef = React.useRef(null);
+  const [uploading, setUploading] = React.useState(false);
+  const queryClient = useQueryClient();
+
+  const handleUpload = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    ProjectAPI.uploadRecordPdf({
+      project_id,
+      record_id: record?.record_id,
+      file,
+    })
+      .then(() => {
+        queryClient.invalidateQueries([
+          "fetchRecordAttachment",
+          { project_id, record_id: record?.record_id },
+        ]);
+      })
+      .catch(() => {})
+      .finally(() => {
+        setUploading(false);
+        // Clear the input so re-selecting the same file triggers another upload.
+        event.target.value = "";
+      });
+  };
+
   // A diagonal line drawn across the PDF icon to mark "no full text available".
   const strikethrough = (
     <Box
@@ -91,15 +119,32 @@ const ZoteroFullTextButton = ({ project_id, record }) => {
   }
 
   // Zotero is configured and confirmed there is no full text for this record: show a
-  // struck-through PDF icon.
+  // struck-through PDF icon that opens a file picker for uploading a PDF.
   if (data?.configured && data?.available === false) {
     return (
-      <Tooltip title="No full text available in Zotero">
+      <Tooltip title="Upload full text PDF">
         <span ref={ref}>
-          <StyledIconButton className="record-card-icon" disabled>
+          <input
+            ref={uploadInputRef}
+            type="file"
+            accept=".pdf"
+            style={{ display: "none" }}
+            onChange={handleUpload}
+          />
+          <StyledIconButton
+            className="record-card-icon"
+            disabled={uploading}
+            onClick={() => uploadInputRef.current?.click()}
+          >
             <Box sx={{ position: "relative", display: "inline-flex" }}>
-              <PictureAsPdfIcon />
-              {strikethrough}
+              {uploading ? (
+                <CircularProgress size={24} />
+              ) : (
+                <>
+                  <PictureAsPdfIcon />
+                  {strikethrough}
+                </>
+              )}
             </Box>
           </StyledIconButton>
         </span>

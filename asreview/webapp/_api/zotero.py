@@ -22,9 +22,13 @@ Zotero credentials are stored per project in a ``zotero.json`` file inside the
 project directory.
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
+import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -32,11 +36,13 @@ import requests
 __all__ = [
     "ZoteroConfig",
     "ZoteroLookupError",
+    "ZoteroUploadError",
     "get_zotero_config",
     "is_attachment_key",
     "fetch_pdf_attachment_key",
     "download_attachment_file",
     "build_reader_url",
+    "upload_pdf_to_zotero",
     "validate_zotero_credentials",
 ]
 
@@ -48,6 +54,19 @@ class ZoteroLookupError(Exception):
     told us this item has no PDF attachment". Only the latter should be cached as a
     negative result; transient failures should be retried on the next request.
     """
+
+
+class ZoteroUploadError(Exception):
+    """Raised when uploading a PDF attachment to Zotero fails.
+
+    This covers permanent failures (permissions, quota) and transient failures
+    (network, library locked). The caller should distinguish using the HTTP status
+    code attached to the exception.
+    """
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
 
 # A Zotero object key is exactly 8 characters from the set [A-Z0-9].
 # See https://www.zotero.org/support/dev/web_api/v3/basics#zotero_web_api_item_typefield_requests
@@ -234,6 +253,195 @@ def build_reader_url(config, item_key, attachment_key):
         f"{ZOTERO_WEB_BASE}/groups/{group_segment}"
         f"/items/{item_key}/attachment/{attachment_key}/reader"
     )
+
+
+def _zotero_upload_handshake(config, attachment_key, name, blob, md5_hex, mtime_ms):
+    """Run the three-step Zotero file upload handshake (authorize → upload → register).
+
+    Returns the attachment key on success (it may be immediately usable if Zotero
+    deduplicates via ``exists``). Raises ``ZoteroUploadError`` on any failure.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "Zotero-API-Version": ZOTERO_API_VERSION,
+        "Authorization": f"Bearer {config.api_key}",
+    })
+    prefix = f"{ZOTERO_API_BASE}/groups/{config.group_id}"
+
+    # Step 2a — request upload authorization
+    try:
+        r = s.post(
+            f"{prefix}/items/{attachment_key}/file",
+            data={
+                "md5": md5_hex,
+                "filename": name,
+                "filesize": len(blob),
+                "mtime": mtime_ms,
+            },
+            headers={"If-None-Match": "*"},
+            timeout=30,
+        )
+        r.raise_for_status()
+    except requests.RequestException as err:
+        raise ZoteroUploadError(
+            f"Upload authorization failed: {err}",
+            status_code=getattr(err.response, "status_code", None),
+        ) from err
+
+    auth = r.json()
+
+    # Zotero already holds a file with this hash — done.
+    if auth.get("exists"):
+        return attachment_key
+
+    # Step 2b — upload bytes to the S3 endpoint (no Zotero auth headers)
+    payload = auth["prefix"].encode() + blob + auth["suffix"].encode()
+    try:
+        r2 = requests.post(
+            auth["url"],
+            data=payload,
+            headers={"Content-Type": auth["contentType"]},
+            timeout=120,
+        )
+        r2.raise_for_status()
+    except requests.RequestException as err:
+        raise ZoteroUploadError(
+            f"File upload to storage failed: {err}",
+            status_code=getattr(err.response, "status_code", None),
+        ) from err
+
+    # Step 2c — register the upload
+    try:
+        r = s.post(
+            f"{prefix}/items/{attachment_key}/file",
+            data={"upload": auth["uploadKey"]},
+            headers={"If-None-Match": "*"},
+            timeout=30,
+        )
+        if r.status_code == 412:
+            raise ZoteroUploadError(
+                "File already exists on attachment (concurrent upload)",
+                status_code=412,
+            )
+        if r.status_code != 204:
+            raise ZoteroUploadError(
+                f"Upload registration failed: {r.status_code} {r.text}",
+                status_code=r.status_code,
+            )
+    except requests.RequestException as err:
+        raise ZoteroUploadError(
+            f"Upload registration failed: {err}",
+            status_code=getattr(err.response, "status_code", None),
+        ) from err
+
+    # Cheap verification
+    try:
+        r = s.get(f"{prefix}/items/{attachment_key}", timeout=10)
+        r.raise_for_status()
+        if r.json()["data"].get("md5") != md5_hex:
+            raise ZoteroUploadError("MD5 mismatch after registration")
+    except (requests.RequestException, ValueError, KeyError) as err:
+        raise ZoteroUploadError(
+            f"Upload verification failed: {err}",
+            status_code=getattr(err.response, "status_code", None) if hasattr(err, "response") else None,
+        ) from err
+
+    return attachment_key
+
+
+def upload_pdf_to_zotero(config, parent_item_key, pdf_path):
+    """Upload a PDF to Zotero as a child attachment of a parent item.
+
+    Creates a new child attachment item (``linkMode: imported_file``) and uploads
+    the file through Zotero's three-step authorization handshake. On success,
+    returns the new attachment key.
+
+    Parameters
+    ----------
+    config : ZoteroConfig
+        Resolved Zotero configuration. Must have ``enabled == True``.
+    parent_item_key : str
+        The Zotero item key of the parent article.
+    pdf_path : str or Path
+        Local path to the PDF file to upload.
+
+    Returns
+    -------
+    str
+        The Zotero attachment key of the newly created attachment.
+
+    Raises
+    ------
+    ZoteroUploadError
+        If any part of the process fails. The exception carries a ``status_code``
+        attribute for distinguishing permanent (403, 413) from transient (409, 5xx)
+        failures.
+    """
+    pdf_path = Path(pdf_path)
+    with open(pdf_path, "rb") as f:
+        blob = f.read()
+
+    md5_hex = hashlib.md5(blob).hexdigest()
+    mtime_ms = int(os.path.getmtime(pdf_path) * 1000)
+    name = pdf_path.name
+
+    s = requests.Session()
+    s.headers.update({
+        "Zotero-API-Version": ZOTERO_API_VERSION,
+        "Authorization": f"Bearer {config.api_key}",
+    })
+    api_prefix = f"{ZOTERO_API_BASE}/groups/{config.group_id}"
+
+    # Phase 1 — create child attachment item
+    try:
+        r = s.post(
+            f"{api_prefix}/items",
+            json=[{
+                "itemType": "attachment",
+                "linkMode": "imported_file",
+                "parentItem": parent_item_key,
+                "title": "Full Text PDF",
+                "contentType": "application/pdf",
+                "filename": name,
+                "tags": [],
+                "relations": {},
+                "md5": None,
+                "mtime": None,
+            }],
+            headers={"Zotero-Write-Token": uuid.uuid4().hex},
+            timeout=30,
+        )
+        r.raise_for_status()
+    except requests.RequestException as err:
+        raise ZoteroUploadError(
+            f"Attachment item creation failed: {err}",
+            status_code=getattr(err.response, "status_code", None),
+        ) from err
+
+    body = r.json()
+    if body.get("failed"):
+        failed_entry = body["failed"].get("0", {})
+        raise ZoteroUploadError(
+            f"Attachment item creation failed: {failed_entry}",
+            status_code=r.status_code,
+        )
+
+    try:
+        att_key = body["successful"]["0"]["key"]
+    except (KeyError, IndexError):
+        raise ZoteroUploadError(
+            "Unexpected response creating attachment item",
+            status_code=r.status_code,
+        )
+
+    # Phase 2 — three-step handshake
+    _zotero_upload_handshake(config, att_key, name, blob, md5_hex, mtime_ms)
+
+    logging.info(
+        "Uploaded PDF '%s' to Zotero parent %s → attachment %s",
+        name, parent_item_key, att_key,
+    )
+    return att_key
 
 
 def validate_zotero_credentials(group_id, api_key, timeout=10):

@@ -18,6 +18,7 @@ import hmac
 import json
 import logging
 import math
+import os
 import secrets
 import shutil
 import socket
@@ -82,11 +83,13 @@ from asreview.webapp._api.utils import get_all_model_components
 from asreview.webapp._api.utils import read_lists_data
 from asreview.webapp._api.utils import read_tags_data
 from asreview.webapp._api.zotero import ZoteroLookupError
+from asreview.webapp._api.zotero import ZoteroUploadError
 from asreview.webapp._api.zotero import build_reader_url
 from asreview.webapp._api.zotero import fetch_pdf_attachment_key
 from asreview.webapp._api.zotero import get_zotero_config
 from asreview.webapp._api.zotero import validate_zotero_credentials
 from asreview.webapp._api.zotero import is_attachment_key
+from asreview.webapp._api.zotero import upload_pdf_to_zotero
 from asreview.webapp._authentication.decorators import current_user_projects
 from asreview.webapp._authentication.decorators import login_required
 from asreview.webapp._authentication.decorators import project_authorization
@@ -2308,6 +2311,68 @@ def api_get_record_attachment(project, record_id):  # noqa: F401
         checked_at = datetime.now(timezone.utc).isoformat()
         db.input.set_attachment(record_id, checked_at)
         return payload(False, checked_at=checked_at)
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/upload_pdf", methods=["POST"])
+@login_required
+@project_authorization
+def api_upload_pdf(project, record_id):  # noqa: F401
+    """Upload a PDF file to Zotero for a record.
+
+    Creates a child attachment item on the record's Zotero parent item and
+    uploads the selected PDF file through Zotero's file storage handshake.
+    On success stores the attachment key so the existing full-text link and
+    LLM screening flows pick it up automatically.
+    """
+    record_id = int(record_id)
+
+    config = get_zotero_config(project.project_path)
+    if not config.enabled:
+        return jsonify({"message": "Zotero is not configured"}), 400
+
+    if "file" not in request.files:
+        return jsonify({"message": "No file provided"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"message": "No file selected"}), 400
+
+    with project.db as db:
+        record = db.input.get_records(record_id)
+        if record is None:
+            return abort(404)
+        original_id = record.original_id
+        if not original_id:
+            return jsonify({"message": "Record has no Zotero item key"}), 400
+
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        file.save(tmp_path)
+
+        # Preserve the original filename for the Zotero attachment title.
+        safe_name = Path(file.filename).name or "upload.pdf"
+        renamed = Path(tmp_path).with_name(safe_name)
+        Path(tmp_path).rename(renamed)
+        tmp_path = str(renamed)
+
+        attachment_key = upload_pdf_to_zotero(config, original_id, tmp_path)
+    except ZoteroUploadError as err:
+        status = err.status_code if err.status_code else 500
+        return jsonify({"message": str(err)}), status
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            Path(tmp_path).unlink(missing_ok=True)
+
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        db.input.set_attachment(record_id, attachment_key)
+        db.force_requeue(record_id, prompt_hash)
+
+    return jsonify({
+        "attachment_key": attachment_key,
+        "url": build_reader_url(config, original_id, attachment_key),
+    })
 
 
 @bp.route("/projects/<project_id>/get_record", methods=["GET"])
