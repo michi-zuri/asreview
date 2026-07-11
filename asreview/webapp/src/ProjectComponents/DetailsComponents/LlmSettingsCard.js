@@ -24,25 +24,26 @@ import { ProjectContext } from "context/ProjectContext";
 const EMPTY_SETTINGS = {
   buffer_size: 20,
   max_concurrent_llm: 3,
-  stale_timeout: 86400,
   criteria_text: "",
   api_key: "",
 };
 
 const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
   const [state, setState] = React.useState(EMPTY_SETTINGS);
+  const [apiKeyTouched, setApiKeyTouched] = React.useState(false);
 
   React.useEffect(() => {
     if (open && initialSettings) {
+      // If api_key is true (masked boolean), the backend has a key but we
+      // don't know its value — show an empty field.
+      const rawKey = initialSettings.api_key;
       setState({
         buffer_size: initialSettings.buffer_size ?? 20,
         max_concurrent_llm: initialSettings.max_concurrent_llm ?? 3,
-        stale_hours: Math.round(
-          (initialSettings.stale_timeout ?? 86400) / 3600,
-        ),
         criteria_text: initialSettings.criteria_text ?? "",
-        api_key: initialSettings.api_key ?? "",
+        api_key: typeof rawKey === "string" ? rawKey : "",
       });
+      setApiKeyTouched(false);
     }
   }, [open, initialSettings]);
 
@@ -58,13 +59,16 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
   };
 
   const handleSave = () => {
-    onSave({
+    const payload = {
       buffer_size: state.buffer_size,
       max_concurrent_llm: state.max_concurrent_llm,
-      stale_timeout: state.stale_hours * 3600,
       criteria_text: state.criteria_text,
-      api_key: state.api_key.trim(),
-    });
+    };
+    // Only send the API key if the user actually touched the field.
+    if (apiKeyTouched) {
+      payload.api_key = state.api_key.trim();
+    }
+    onSave(payload);
   };
 
   return (
@@ -91,15 +95,6 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
             fullWidth
           />
           <TextField
-            label="Stale timeout (hours)"
-            type="number"
-            value={state.stale_hours}
-            onChange={handleNumberChange("stale_hours")}
-            helperText="Hours before a checked-out record is reassigned"
-            inputProps={{ min: 1 }}
-            fullWidth
-          />
-          <TextField
             label="Screening criteria"
             multiline
             minRows={4}
@@ -112,7 +107,10 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
             label="Anthropic API key"
             type="password"
             value={state.api_key}
-            onChange={handleTextChange("api_key")}
+            onChange={(e) => {
+              setApiKeyTouched(true);
+              handleTextChange("api_key")(e);
+            }}
             helperText="Leave blank to use the ANTHROPIC_API_KEY environment variable"
             fullWidth
           />
@@ -183,13 +181,6 @@ const LlmSettingsCard = () => {
               <Typography variant="body2" color="text.secondary">
                 {settings?.max_concurrent_llm ?? 3} — maximum parallel AI
                 screening requests
-              </Typography>
-            </Box>
-            <Box>
-              <Typography variant="subtitle2">Stale timeout</Typography>
-              <Typography variant="body2" color="text.secondary">
-                {Math.round((settings?.stale_timeout ?? 86400) / 3600)} hours
-                before a checked-out record is reassigned
               </Typography>
             </Box>
             <Box>

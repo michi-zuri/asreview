@@ -111,7 +111,6 @@ bp = Blueprint("api", __name__, url_prefix="/api")
 DEFAULT_LLM_SETTINGS = {
     "buffer_size": 20,
     "max_concurrent_llm": 3,
-    "stale_timeout": 86400,   # 24h, seconds
     "criteria_text": "",
     "api_key": "",
 }
@@ -403,6 +402,11 @@ def api_get_project_info(project):  # noqa: F401
     """"""
     project_config = project.config
 
+    # Mask the API key — never expose it to the frontend.
+    llm = project_config.get("llm")
+    if isinstance(llm, dict) and llm.get("api_key"):
+        project_config = {**project_config, "llm": {**llm, "api_key": True}}
+
     if current_app.config.get("AUTHENTICATION", True):
         # find project
         db_project = Project.query.filter(
@@ -432,6 +436,9 @@ def api_update_project_info(project):  # noqa: F401
 
     if "hide_links" in update_dict:
         update_dict["hide_links"] = update_dict["hide_links"] == "true"
+
+    if "reassign_stale" in update_dict:
+        update_dict["reassign_stale"] = update_dict["reassign_stale"] == "true"
 
     project.update_config(**update_dict)
 
@@ -2242,16 +2249,17 @@ def api_get_record(project):  # noqa: F401
 
     settings = _llm_settings(project)
     prompt_hash = _current_prompt_hash(project)
+    stale_timeout = 86400 if project.config.get("reassign_stale") else 0
 
     with project.db as db:
         db.top_up_dispatch(settings["buffer_size"], prompt_hash)
         pending = db.get_pending(user_id=user_id)
-        if pending.empty:
+        if pending.empty and stale_timeout:
             pending = db.reassign_stale(
-                user_id=user_id, older_than=settings["stale_timeout"])
+                user_id=user_id, older_than=stale_timeout)
         if pending.empty:
             pending = db.checkout_oldest_dispatched(
-                user_id=user_id, stale_timeout=settings["stale_timeout"])
+                user_id=user_id, stale_timeout=stale_timeout or None)
         if pending.empty:
             try:
                 pending = db.query_top_ranked(user_id=user_id)
@@ -2377,7 +2385,11 @@ def api_apply_llm(project, record_id):  # noqa: F401
 @login_required
 @project_authorization
 def api_get_llm_settings(project):  # noqa: F401
-    return jsonify(_llm_settings(project))
+    settings = _llm_settings(project)
+    # Mask the API key — never expose it to the frontend.
+    if settings.get("api_key"):
+        settings["api_key"] = True
+    return jsonify(settings)
 
 
 @bp.route("/projects/<project_id>/llm_settings", methods=["PUT"])
@@ -2390,7 +2402,6 @@ def api_update_llm_settings(project):  # noqa: F401
                             if k in body}}
     merged["buffer_size"] = max(1, int(merged["buffer_size"]))
     merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
-    merged["stale_timeout"] = max(1, int(merged["stale_timeout"]))
     merged["criteria_text"] = str(merged["criteria_text"])
     merged["api_key"] = str(merged.get("api_key", ""))
     old_hash = _current_prompt_hash(project)

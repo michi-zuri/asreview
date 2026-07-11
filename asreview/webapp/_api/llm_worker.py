@@ -21,6 +21,7 @@ import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import anthropic
 
@@ -29,7 +30,11 @@ from asreview.database.database import open_db
 from asreview.webapp._api.llm_prompt import build_system_prompt
 from asreview.webapp._api.pdf_resolver import PdfResolver
 from asreview.webapp._api.utils import read_tags_data, read_lists_data
-from asreview.webapp._api.zotero import ZoteroLookupError
+from asreview.webapp._api.zotero import (
+    ZoteroLookupError,
+    fetch_pdf_attachment_key,
+    is_attachment_key,
+)
 from asreview.webapp.utils import asreview_path
 
 
@@ -68,6 +73,54 @@ def _parse_json(text):
         raise ValueError(str(err)) from err
 
 
+def _ensure_attachment(db, resolver, record):
+    """Try to look up and cache a Zotero attachment key before screening.
+
+    When a record hasn't been through the attachment lookup yet (or had a
+    previous failed lookup that is now stale), this queries Zotero and
+    caches the result so ``resolver.resolve()`` can proceed.
+
+    Mirrors the logic in ``api_get_record_attachment``.
+    """
+    cached = getattr(record, "attachment", None)
+
+    # Already a valid attachment key — nothing to do.
+    if is_attachment_key(cached):
+        return
+
+    # Zotero not configured or no original_id — can't look it up.
+    if not resolver.config.enabled or not getattr(record, "original_id", None):
+        return
+
+    # If there is a recent failure timestamp, don't retry yet.
+    if cached is not None:
+        try:
+            last_checked = datetime.fromisoformat(cached)
+        except ValueError:
+            last_checked = None
+        if last_checked is not None:
+            age = (datetime.now(timezone.utc) - last_checked).total_seconds()
+            if age < resolver.config.recheck_interval:
+                return
+
+    try:
+        attachment_key = fetch_pdf_attachment_key(
+            resolver.config, record.original_id)
+    except ZoteroLookupError:
+        # Transient failure — don't cache anything, retry next time.
+        return
+
+    record_id = record.record_id
+    if attachment_key:
+        db.input.set_attachment(record_id, attachment_key)
+        logging.info("record %s: attachment key resolved via Zotero", record_id)
+    else:
+        checked_at = datetime.now(timezone.utc).isoformat()
+        db.input.set_attachment(record_id, checked_at)
+        logging.info(
+            "record %s: no PDF attachment found in Zotero", record_id)
+
+
 def screen_record(db, resolver, client, record, prompt, prompt_hash,
                   model, max_tokens=2048):
     """Run ONE LLM screening attempt for a record and record the result.
@@ -97,7 +150,14 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
     """
     record_id = record.record_id
 
-    # 1. Resolve PDF. Missing key OR failed download -> missing_pdf, no retry.
+    # 1. Ensure the Zotero attachment key is cached. If the record has never
+    #    been looked up (or the last lookup failed long enough ago), query
+    #    Zotero now and store the result so the resolver can proceed.
+    _ensure_attachment(db, resolver, record)
+    # Re-read the record so resolver.resolve() sees the updated attachment.
+    record = db.input.get_records(record_id)
+
+    # 2. Resolve PDF. Missing key OR failed download -> missing_pdf, no retry.
     try:
         pdf_path = resolver.resolve(record)
     except ZoteroLookupError as err:
@@ -115,7 +175,7 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
          "text": "Screen this article. Respond with JSON only."},
     ]
 
-    # 2. First call (transient errors propagate to the caller).
+    # 3. First call (transient errors propagate to the caller).
     resp = client.messages.create(
         model=model, max_tokens=max_tokens, system=prompt,
         messages=[{"role": "user", "content": user_content}],
@@ -125,7 +185,7 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
     in_tok = getattr(usage, "input_tokens", None)
     out_tok = getattr(usage, "output_tokens", None)
 
-    # 3. Parse; on failure do ONE repair call (reformat only, no PDF).
+    # 4. Parse; on failure do ONE repair call (reformat only, no PDF).
     try:
         payload = _parse_json(text)
     except ValueError:
@@ -149,7 +209,7 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
             db.mark_dispatch_failed(record_id, f"invalid JSON: {err}")
             return "failed"
 
-    # 4. Success -> store and mark ready.
+    # 5. Success -> store and mark ready.
     db.store_llm_result(
         record_id, prompt_hash, model, json.dumps(payload),
         input_tokens=in_tok, output_tokens=out_tok,

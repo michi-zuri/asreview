@@ -160,6 +160,16 @@ const InfoPopover = ({ anchorEl, handlePopoverClose }) => {
           </Box>
           <Box>
             <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+              Reassign stale records
+            </Typography>
+            <Typography variant="body2" color="text.secondary" align="justify">
+              When enabled, records that have been checked out by a reviewer for
+              more than 24 hours are automatically reassigned to the dispatch
+              queue so another reviewer can screen them.
+            </Typography>
+          </Box>
+          <Box>
+            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
               Hide DOI and URL links
             </Typography>
             <Typography variant="body2" color="text.secondary" align="justify">
@@ -213,6 +223,7 @@ const ScreeningCard = () => {
   });
 
   const hideLinks = data?.hide_links ?? false;
+  const reassignStale = data?.reassign_stale ?? false;
   const zoteroConfig = zoteroData || EMPTY_ZOTERO_CONFIG;
   const zoteroConfigured = Boolean(
     zoteroConfig.api_key && zoteroConfig.group_id,
@@ -246,6 +257,21 @@ const ScreeningCard = () => {
         <FormControlLabel
           control={
             <Switch
+              checked={reassignStale}
+              onChange={(e) => {
+                mutate({
+                  project_id: project_id,
+                  reassign_stale: e.target.checked,
+                });
+              }}
+            />
+          }
+          label="Reassign stale records after 24 hours"
+        />
+        <br />
+        <FormControlLabel
+          control={
+            <Switch
               checked={hideLinks}
               onChange={(e) => {
                 mutate({
@@ -263,7 +289,9 @@ const ScreeningCard = () => {
 
       <CardContent>
         <Stack spacing={1}>
-          <Typography variant="subtitle1">Zotero full text</Typography>
+          <Typography variant="subtitle1">
+            Config for Zotero PDF links
+          </Typography>
           <Typography variant="body2" color="text.secondary">
             {zoteroConfigured
               ? `Configured for group ${zoteroConfig.group_id}${zoteroConfig.group_slug ? ` (${zoteroConfig.group_slug})` : ""}.`
