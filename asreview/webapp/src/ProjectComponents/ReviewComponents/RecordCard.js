@@ -1,14 +1,21 @@
+import CachedIcon from "@mui/icons-material/Cached";
 import { Link as LinkIcon } from "@mui/icons-material";
 import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import {
+  Alert,
   Box,
   Button,
   Card,
   CardContent,
   CircularProgress,
   Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
   Divider,
   Fade,
   Grid2 as Grid,
@@ -36,7 +43,12 @@ import {
 
 import { fontSizeOptions } from "globals.js";
 
-const ZoteroFullTextButton = ({ project_id, record }) => {
+const ZoteroFullTextButton = ({
+  project_id,
+  record,
+  isOwner,
+  allowMemberReplace,
+}) => {
   // Resolving the Zotero attachment requires a live API call per record. To avoid
   // firing one blocking request for every card at once (which monopolizes the server
   // threads and trips Zotero's rate limit), only check once the card scrolls into
@@ -55,14 +67,34 @@ const ZoteroFullTextButton = ({ project_id, record }) => {
         record?.original_id
       ),
       refetchOnWindowFocus: false,
+      refetchOnMount: false,
+      refetchOnReconnect: false,
       staleTime: 5 * 60 * 1000,
+      cacheTime: 5 * 60 * 1000,
       retry: false,
     },
   );
 
   const uploadInputRef = React.useRef(null);
+  const replaceFileInputRef = React.useRef(null);
   const [uploading, setUploading] = React.useState(false);
+  const [replacing, setReplacing] = React.useState(false);
   const queryClient = useQueryClient();
+
+  // Replace confirmation dialog state
+  const [replaceDialogOpen, setReplaceDialogOpen] = React.useState(false);
+  const [replaceError, setReplaceError] = React.useState(null);
+
+  const invalidateAttachment = () => {
+    queryClient.invalidateQueries([
+      "fetchRecordAttachment",
+      { project_id, record_id: record?.record_id },
+    ]);
+    queryClient.invalidateQueries([
+      "fetchRecordLlm",
+      { project_id, record_id: record?.record_id },
+    ]);
+  };
 
   const handleUpload = (event) => {
     const file = event.target.files?.[0];
@@ -73,19 +105,54 @@ const ZoteroFullTextButton = ({ project_id, record }) => {
       record_id: record?.record_id,
       file,
     })
-      .then(() => {
-        queryClient.invalidateQueries([
-          "fetchRecordAttachment",
-          { project_id, record_id: record?.record_id },
-        ]);
-      })
+      .then(invalidateAttachment)
       .catch(() => {})
       .finally(() => {
         setUploading(false);
-        // Clear the input so re-selecting the same file triggers another upload.
         event.target.value = "";
       });
   };
+
+  // Replace flow: confirmation dialog → file picker → upload
+  const handleOpenReplace = () => {
+    setReplaceError(null);
+    setReplaceDialogOpen(true);
+  };
+
+  const handleCloseReplace = () => {
+    if (replacing) return;
+    setReplaceDialogOpen(false);
+  };
+
+  const handleConfirmReplace = () => {
+    setReplaceDialogOpen(false);
+    replaceFileInputRef.current?.click();
+  };
+
+  const handleReplaceFile = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setReplacing(true);
+    setReplaceError(null);
+    ProjectAPI.replaceRecordPdf({
+      project_id,
+      record_id: record?.record_id,
+      file,
+    })
+      .then(invalidateAttachment)
+      .catch((err) => {
+        setReplaceError(
+          err?.data?.message || err?.message || "Failed to replace PDF",
+        );
+        setReplaceDialogOpen(true);
+      })
+      .finally(() => {
+        setReplacing(false);
+        event.target.value = "";
+      });
+  };
+
+  const inFlight = record?.llm?.status === "in_flight";
 
   // A diagonal line drawn across the PDF icon to mark "no full text available".
   const strikethrough = (
@@ -103,18 +170,86 @@ const ZoteroFullTextButton = ({ project_id, record }) => {
     />
   );
 
+  const originalId = record?.original_id;
+
   if (data?.available && data?.url) {
     return (
-      <Tooltip title="Open full text in Zotero">
-        <StyledIconButton
-          ref={ref}
-          className="record-card-icon"
-          href={data.url}
-          target="pdfreader"
+      <>
+        <span ref={ref}>
+          <Tooltip title={`Open full text of ${originalId} in Zotero`}>
+            <StyledIconButton
+              className="record-card-icon"
+              href={data.url}
+              target="pdfreader"
+            >
+              <PictureAsPdfIcon />
+            </StyledIconButton>
+          </Tooltip>
+        </span>
+        {(isOwner || allowMemberReplace) && (
+          <Box sx={{ marginLeft: "auto !important" }}>
+            <input
+              ref={replaceFileInputRef}
+              type="file"
+              accept=".pdf"
+              style={{ display: "none" }}
+              onChange={handleReplaceFile}
+            />
+            <Tooltip
+              title={
+                inFlight
+                  ? "Cannot replace while AI screening is in progress"
+                  : `Replace PDF for ${originalId}`
+              }
+            >
+              <span>
+                <StyledIconButton
+                  className="record-card-icon"
+                  onClick={handleOpenReplace}
+                  disabled={replacing || inFlight}
+                >
+                  <CachedIcon fontSize="small" />
+                </StyledIconButton>
+              </span>
+            </Tooltip>
+          </Box>
+        )}
+        <Dialog
+          open={replaceDialogOpen}
+          onClose={handleCloseReplace}
+          aria-labelledby="replace-pdf-dialog-title"
         >
-          <PictureAsPdfIcon />
-        </StyledIconButton>
-      </Tooltip>
+          <DialogTitle id="replace-pdf-dialog-title">
+            Replace PDF attachment?
+          </DialogTitle>
+          <DialogContent>
+            <Stack spacing={2} sx={{ pt: 1 }}>
+              {replaceError && <Alert severity="error">{replaceError}</Alert>}
+              <DialogContentText>
+                The previous PDF will be permanently deleted from your Zotero
+                library and <strong>cannot be recovered</strong>. You will be
+                prompted to choose a replacement file.
+              </DialogContentText>
+              <DialogContentText>
+                The AI analysis for this article will be discarded and re-run
+                with the new PDF.
+              </DialogContentText>
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={handleCloseReplace} disabled={replacing}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleConfirmReplace}
+              color="error"
+              disabled={replacing}
+            >
+              Choose replacement file
+            </Button>
+          </DialogActions>
+        </Dialog>
+      </>
     );
   }
 
@@ -122,7 +257,7 @@ const ZoteroFullTextButton = ({ project_id, record }) => {
   // struck-through PDF icon that opens a file picker for uploading a PDF.
   if (data?.configured && data?.available === false) {
     return (
-      <Tooltip title="Upload full text PDF">
+      <Tooltip title={`Upload full text PDF for ${originalId}`}>
         <span ref={ref}>
           <input
             ref={uploadInputRef}
@@ -163,6 +298,8 @@ const RecordCardContent = ({
   fontSize,
   collapseAbstract,
   hideLinks = false,
+  isOwner = false,
+  allowMemberReplace = false,
   highlightEntries,
   highlightOn,
   paletteMode,
@@ -233,18 +370,12 @@ const RecordCardContent = ({
             {!(
               record.original_id === undefined || record.original_id === null
             ) && (
-              <ZoteroFullTextButton project_id={project_id} record={record} />
-            )}
-
-            {!(
-              record.original_id === undefined || record.original_id === null
-            ) && (
-              <Typography
-                variant="body2"
-                sx={{ color: "text.secondary", alignSelf: "center" }}
-              >
-                ID: {record.original_id}
-              </Typography>
+              <ZoteroFullTextButton
+                project_id={project_id}
+                record={record}
+                isOwner={isOwner}
+                allowMemberReplace={allowMemberReplace}
+              />
             )}
           </Stack>
         )}
@@ -357,6 +488,8 @@ const RecordCard = ({
   showNotes = true,
   collapseAbstract = false,
   hideLinks = false,
+  isOwner = false,
+  allowMemberReplace = false,
   hotkeys = false,
   transitionType = "fade",
   transitionSpeed = { enter: 500, exit: 100 },
@@ -444,6 +577,8 @@ const RecordCard = ({
               fontSize={fontSize}
               collapseAbstract={collapseAbstract}
               hideLinks={hideLinks}
+              isOwner={isOwner}
+              allowMemberReplace={allowMemberReplace}
               highlightEntries={highlightEntries}
               highlightOn={highlightOn && highlightAvailable}
               paletteMode={theme.palette.mode}

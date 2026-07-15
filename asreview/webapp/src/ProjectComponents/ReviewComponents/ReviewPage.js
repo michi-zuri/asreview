@@ -173,6 +173,8 @@ const ReviewPage = () => {
               collapseAbstract={false}
               hotkeys={true}
               hideLinks={projectInfo?.hide_links === true}
+              isOwner={projectInfo?.roles?.owner === true}
+              allowMemberReplace={projectInfo?.allow_member_replace === true}
               landscape={orientation === "landscape" && !landscapeDisabled}
             />
           )}

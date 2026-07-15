@@ -422,6 +422,25 @@ const ScreeningCard = () => {
         </Stack>
       </CardContent>
 
+      <Divider />
+
+      <CardContent>
+        <FormControlLabel
+          control={
+            <Switch
+              checked={data?.allow_member_replace ?? false}
+              onChange={(e) => {
+                mutate({
+                  project_id: project_id,
+                  allow_member_replace: e.target.checked,
+                });
+              }}
+            />
+          }
+          label="Allow team members to replace PDFs"
+        />
+      </CardContent>
+
       <ZoteroEditDialog
         open={zoteroEditOpen}
         onClose={() => setZoteroEditOpen(false)}

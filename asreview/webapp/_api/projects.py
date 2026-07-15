@@ -83,8 +83,10 @@ from asreview.webapp._api.utils import get_all_model_components
 from asreview.webapp._api.utils import read_lists_data
 from asreview.webapp._api.utils import read_tags_data
 from asreview.webapp._api.zotero import ZoteroLookupError
+from asreview.webapp._api.zotero import ZoteroDeleteError
 from asreview.webapp._api.zotero import ZoteroUploadError
 from asreview.webapp._api.zotero import build_reader_url
+from asreview.webapp._api.zotero import delete_pdf as delete_zotero_pdf
 from asreview.webapp._api.zotero import fetch_pdf_attachment_key
 from asreview.webapp._api.zotero import get_zotero_config
 from asreview.webapp._api.zotero import validate_zotero_credentials
@@ -443,6 +445,9 @@ def api_update_project_info(project):  # noqa: F401
 
     if "reassign_stale" in update_dict:
         update_dict["reassign_stale"] = update_dict["reassign_stale"] == "true"
+
+    if "allow_member_replace" in update_dict:
+        update_dict["allow_member_replace"] = update_dict["allow_member_replace"] == "true"
 
     project.update_config(**update_dict)
 
@@ -2372,6 +2377,176 @@ def api_upload_pdf(project, record_id):  # noqa: F401
     return jsonify({
         "attachment_key": attachment_key,
         "url": build_reader_url(config, original_id, attachment_key),
+    })
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/pdf", methods=["DELETE"])
+@login_required
+@project_authorization
+def api_delete_record_pdf(project, record_id):  # noqa: F401
+    """Delete a record's PDF attachment from Zotero and clean up local state.
+
+    Restricted to project owners (and admins). The Zotero attachment item is
+    permanently deleted, then the record's attachment cache, LLM dispatch, and
+    LLM results are reset so the UI reflects the new state.
+    """
+    record_id = int(record_id)
+
+    # Owner check
+    if current_app.config.get("AUTHENTICATION", True):
+        project_db = Project.query.filter(
+            Project.project_id == project.project_id,
+        ).one_or_none()
+        if project_db is None:
+            return jsonify({"message": "Project not found"}), 404
+        if not current_user.is_admin and project_db.owner_id != current_user.id:
+            return jsonify({"message": "Only the project owner can delete PDF attachments"}), 403
+
+    config = get_zotero_config(project.project_path)
+    if not config.enabled:
+        return jsonify({"message": "Zotero is not configured"}), 400
+
+    with project.db as db:
+        record = db.input.get_records(record_id)
+        if record is None:
+            return abort(404)
+
+        attachment_key = record.attachment
+        if not is_attachment_key(attachment_key):
+            return jsonify({"message": "No PDF attachment to delete"}), 404
+
+        # Reject if an LLM call is currently in-flight for this record —
+        # deleting the file out from under an active call would waste it.
+        meta = db.get_llm_meta(record_id, _current_prompt_hash(project))
+        if meta and meta.get("status") == "in_flight":
+            return jsonify({
+                "message": "Cannot delete PDF while LLM screening is in progress"
+            }), 409
+
+    # Zotero I/O outside the SQLite transaction
+    try:
+        delete_zotero_pdf(config, attachment_key)
+    except ZoteroDeleteError as err:
+        status = err.status_code if err.status_code else 500
+        return jsonify({"message": str(err)}), status
+
+    # Local cleanup
+    with project.db as db:
+        db.input.set_attachment(record_id, None)
+        db.mark_dispatch_missing_pdf(record_id)
+        db.delete_llm_results(record_id)
+
+    logging.info(
+        "User %s deleted PDF attachment %s for record %s (project %s)",
+        current_user.id if hasattr(current_user, "id") else "anonymous",
+        attachment_key,
+        record_id,
+        project.project_id,
+    )
+
+    return jsonify({"success": True})
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/pdf", methods=["PUT"])
+@login_required
+@project_authorization
+def api_replace_record_pdf(project, record_id):  # noqa: F401
+    """Replace a record's PDF attachment in Zotero.
+
+    Uploads a new PDF to Zotero, then deletes the old attachment (best effort).
+    Updates the record's attachment cache, clears stale LLM results, and
+    re-queues for screening with the new PDF.
+
+    Restricted to project owners (and admins).
+    """
+    record_id = int(record_id)
+
+    # Owner check
+    if current_app.config.get("AUTHENTICATION", True):
+        project_db = Project.query.filter(
+            Project.project_id == project.project_id,
+        ).one_or_none()
+        if project_db is None:
+            return jsonify({"message": "Project not found"}), 404
+        if not current_user.is_admin and project_db.owner_id != current_user.id:
+            return jsonify(
+                {"message": "Only the project owner can replace PDF attachments"}
+            ), 403
+
+    config = get_zotero_config(project.project_path)
+    if not config.enabled:
+        return jsonify({"message": "Zotero is not configured"}), 400
+
+    if "file" not in request.files:
+        return jsonify({"message": "No file provided"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"message": "No file selected"}), 400
+
+    with project.db as db:
+        record = db.input.get_records(record_id)
+        if record is None:
+            return abort(404)
+        original_id = record.original_id
+        if not original_id:
+            return jsonify({"message": "Record has no Zotero item key"}), 400
+        old_attachment_key = record.attachment
+
+        meta = db.get_llm_meta(record_id, _current_prompt_hash(project))
+        if meta and meta.get("status") == "in_flight":
+            return jsonify({
+                "message": "Cannot replace PDF while LLM screening is in progress"
+            }), 409
+
+    # Upload the new PDF first so we never lose the record's PDF reference.
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        file.save(tmp_path)
+
+        safe_name = Path(file.filename).name or "upload.pdf"
+        renamed = Path(tmp_path).with_name(safe_name)
+        Path(tmp_path).rename(renamed)
+        tmp_path = str(renamed)
+
+        new_attachment_key = upload_pdf_to_zotero(config, original_id, tmp_path)
+    except ZoteroUploadError as err:
+        status = err.status_code if err.status_code else 500
+        return jsonify({"message": str(err)}), status
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            Path(tmp_path).unlink(missing_ok=True)
+
+    # Delete the old attachment (best effort — don't fail if this errors).
+    if is_attachment_key(old_attachment_key):
+        try:
+            delete_zotero_pdf(config, old_attachment_key)
+        except ZoteroDeleteError as err:
+            logging.warning(
+                "Failed to delete old attachment %s during replace: %s",
+                old_attachment_key, err,
+            )
+
+    # Local cleanup — store new key, clear stale results, re-queue.
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        db.input.set_attachment(record_id, new_attachment_key)
+        db.delete_llm_results(record_id)
+        db.force_requeue(record_id, prompt_hash)
+
+    logging.info(
+        "User %s replaced PDF for record %s: %s → %s (project %s)",
+        current_user.id if hasattr(current_user, "id") else "anonymous",
+        record_id,
+        old_attachment_key,
+        new_attachment_key,
+        project.project_id,
+    )
+
+    return jsonify({
+        "attachment_key": new_attachment_key,
+        "url": build_reader_url(config, original_id, new_attachment_key),
     })
 
 

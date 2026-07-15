@@ -224,6 +224,13 @@ SCHEMA = {
             "description": "When true, DOI and URL buttons are hidden during screening to prevent full-text access.",
             "default": False,
         },
+        "allow_member_replace": {
+            "$id": "#/properties/allow_member_replace",
+            "type": "boolean",
+            "title": "Allow team members to replace PDFs",
+            "description": "When true, team members (not just the project owner) can replace PDF attachments in Zotero.",
+            "default": False,
+        },
         "datasets": {
             "$id": "#/properties/datasets",
             "type": "array",

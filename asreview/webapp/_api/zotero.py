@@ -37,12 +37,14 @@ __all__ = [
     "ZoteroConfig",
     "ZoteroLookupError",
     "ZoteroUploadError",
+    "ZoteroDeleteError",
     "get_zotero_config",
     "is_attachment_key",
     "fetch_pdf_attachment_key",
     "download_attachment_file",
     "build_reader_url",
     "upload_pdf_to_zotero",
+    "delete_pdf",
     "validate_zotero_credentials",
 ]
 
@@ -62,6 +64,19 @@ class ZoteroUploadError(Exception):
     This covers permanent failures (permissions, quota) and transient failures
     (network, library locked). The caller should distinguish using the HTTP status
     code attached to the exception.
+    """
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class ZoteroDeleteError(Exception):
+    """Raised when deleting a Zotero attachment fails.
+
+    Covers permanent failures (permissions), conflicts (concurrent modification),
+    and transient failures (network, library locked). The caller should distinguish
+    using the HTTP status code attached to the exception.
     """
 
     def __init__(self, message, status_code=None):
@@ -442,6 +457,87 @@ def upload_pdf_to_zotero(config, parent_item_key, pdf_path):
         name, parent_item_key, att_key,
     )
     return att_key
+
+
+def delete_pdf(config, attachment_key):
+    """Permanently delete a Zotero attachment item and its stored file.
+
+    Idempotent: a missing or already-deleted attachment is treated as success.
+    Includes one automatic retry on version conflict (HTTP 412).
+
+    Parameters
+    ----------
+    config : ZoteroConfig
+        Resolved Zotero configuration. Must have ``enabled == True``.
+    attachment_key : str
+        The Zotero attachment key to delete.
+
+    Raises
+    ------
+    ZoteroDeleteError
+        If the delete fails after retries. The exception carries a
+        ``status_code`` attribute for programmatic handling (403, 409, 412).
+    """
+    s = requests.Session()
+    s.headers.update({
+        "Zotero-API-Version": ZOTERO_API_VERSION,
+        "Authorization": f"Bearer {config.api_key}",
+    })
+    base = f"{ZOTERO_API_BASE}/groups/{config.group_id}/items/{attachment_key}"
+
+    for attempt in range(2):
+        # Step 0 — fetch the current version for optimistic concurrency
+        try:
+            r = s.get(base, timeout=10)
+        except requests.RequestException as err:
+            raise ZoteroDeleteError(
+                f"Failed to fetch attachment version: {err}",
+                status_code=getattr(err.response, "status_code", None),
+            ) from err
+
+        if r.status_code == 404:
+            return  # already gone — idempotent success
+
+        try:
+            r.raise_for_status()
+        except requests.RequestException as err:
+            raise ZoteroDeleteError(
+                f"Failed to fetch attachment version: {err}",
+                status_code=r.status_code,
+            ) from err
+
+        version = r.headers["Last-Modified-Version"]
+
+        # Delete
+        try:
+            resp = s.delete(
+                base,
+                headers={"If-Unmodified-Since-Version": version},
+                timeout=30,
+            )
+        except requests.RequestException as err:
+            raise ZoteroDeleteError(
+                f"Delete request failed: {err}",
+                status_code=getattr(err.response, "status_code", None),
+            ) from err
+
+        if resp.status_code in (204, 404):
+            logging.info(
+                "Deleted Zotero attachment %s (group %s)", attachment_key, config.group_id,
+            )
+            return
+
+        if resp.status_code == 412 and attempt == 0:
+            continue  # version raced — retry once
+
+        raise ZoteroDeleteError(
+            f"Delete failed with status {resp.status_code}: {resp.text}",
+            status_code=resp.status_code,
+        )
+
+    raise ZoteroDeleteError(
+        "Version conflict persisted after retry", status_code=412,
+    )
 
 
 def validate_zotero_credentials(group_id, api_key, timeout=10):

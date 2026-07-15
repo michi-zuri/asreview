@@ -1130,6 +1130,20 @@ class Database:
         )
         con.commit()
 
+    def delete_llm_results(self, record_id):
+        """Delete all cached LLM results for a record.
+
+        Called when the PDF the results were derived from is deleted, so that
+        stale pre-fill data does not linger in the UI.
+        """
+        con = self._conn
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM llm_results WHERE record_id = ?",
+            (record_id,),
+        )
+        con.commit()
+
     def increment_dispatch_attempts(self, record_id):
         """Increment attempts on a dispatch row; return the new count."""
         con = self._conn

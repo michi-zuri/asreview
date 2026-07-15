@@ -166,6 +166,12 @@ class ProjectAPI {
     if (variables.reassign_stale !== undefined) {
       body.set("reassign_stale", variables.reassign_stale ? "true" : "false");
     }
+    if (variables.allow_member_replace !== undefined) {
+      body.set(
+        "allow_member_replace",
+        variables.allow_member_replace ? "true" : "false",
+      );
+    }
 
     const url = api_url + `projects/${variables.project_id}/info`;
     return new Promise((resolve, reject) => {
@@ -241,6 +247,22 @@ class ProjectAPI {
     return new Promise((resolve, reject) => {
       axios
         .post(url, formData, { withCredentials: true })
+        .then((result) => {
+          resolve(result.data);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static replaceRecordPdf({ project_id, record_id, file }) {
+    const url = api_url + `projects/${project_id}/record/${record_id}/pdf`;
+    const formData = new FormData();
+    formData.append("file", file);
+    return new Promise((resolve, reject) => {
+      axios
+        .put(url, formData, { withCredentials: true })
         .then((result) => {
           resolve(result.data);
         })

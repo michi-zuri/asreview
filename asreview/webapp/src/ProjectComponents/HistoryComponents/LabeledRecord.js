@@ -2,7 +2,7 @@ import { Box, ButtonBase, Fade, Stack, Typography } from "@mui/material";
 import { grey } from "@mui/material/colors";
 import React from "react";
 import { InView } from "react-intersection-observer";
-import { useInfiniteQuery } from "react-query";
+import { useInfiniteQuery, useQuery } from "react-query";
 
 import { InlineErrorHandler } from "Components";
 import { RecordCard } from "ProjectComponents/ReviewComponents";
@@ -13,6 +13,15 @@ import { useReviewSettings } from "context/ReviewSettingsContext";
 
 const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
   const { orientation, modelLogLevel, expandAbstract } = useReviewSettings();
+
+  const { data: projectInfo } = useQuery(
+    ["fetchProject", { project_id }],
+    ProjectAPI.fetchInfo,
+    {
+      refetchOnWindowFocus: false,
+    },
+  );
+  const isOwner = projectInfo?.roles?.owner === true;
 
   let landscapeDisabled = useMediaQuery(
     (theme) => theme.breakpoints.down("md"),
@@ -75,6 +84,10 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
                     record={record}
                     collapseAbstract={!expandAbstract}
                     disabled={true}
+                    isOwner={isOwner}
+                    allowMemberReplace={
+                      projectInfo?.allow_member_replace === true
+                    }
                     transitionType="collapse"
                     transitionSpeed={{ enter: 500, exit: 800 }}
                     landscape={
