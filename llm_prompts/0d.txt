@@ -1,0 +1,194 @@
+========================================================================
+TASK 0d — Map LLM JSON payload -> ASReview tag/list shapes (export -> id)
+========================================================================
+(The SHARED CONTEXT block was prepended above. Follow its HARD RULES.)
+
+GOAL
+  Add ONE pure function, map_llm_payload_to_asreview, that converts the LLM's
+  export-name-based JSON (the shape defined by build_system_prompt in task 0c)
+  into the id-based structures ASReview's database layer already consumes.
+  It must be DEFENSIVE: the input comes from a language model, so never crash
+  on malformed data — drop bad parts, log a warning, and return best effort.
+
+  This is the correctness-critical chunk. Write thorough tests.
+
+  SCOPE: pure mapping/validation ONLY. No db, no Flask, no network, no JSON
+  parsing (assume the payload is already a parsed Python object), no item_id
+  generation (that is the persistence caller's job — see OUTPUT below).
+
+BEFORE WRITING ANYTHING — confirm the exact target shapes
+  Open and read (do not import from them, just confirm the shapes):
+    - asreview/database/database.py
+        * method _save_tags: confirm it consumes tags in this nested shape:
+              [{"id": group_id,
+                "values": [{"id": option_id, "checked": bool, "text": str|None}]}]
+          where group_id == tag_groups.group_id and option_id ==
+          tag_options.option_id.
+        * method replace_lists: confirm each list item is a dict and that
+          item NAMES may NOT contain ',' or ';' (it raises ValueError).
+    - asreview/webapp/_api/utils.py (read_tags_data / read_lists_data) to
+      confirm the CONTRACT input shapes described next.
+  If any shape differs from below, STOP and report it.
+
+INPUT SHAPES (trust these)
+  payload : the parsed LLM JSON. EXPECTED shape (from task 0c's contract):
+      {
+        "labels": [
+          {"group": "<group_export>",
+           "values": [{"checked": "<option_export>"},
+                      {"checked": "<option_export>", "text": "<free text>"}]}
+        ],
+        "lists": [
+          {"list": "<list_name>", "items": ["<string>", ...]}
+        ]
+      }
+    BUT it may be anything (wrong types, missing keys, extra junk). Treat it
+    as untrusted.
+
+  tags_form : list[dict] | None  (read_tags_data shape). Each group:
+      {"id": group_id, "export": "<group_export>", "single_select": bool,
+       "values": [{"id": option_id, "export": "<option_export>",
+                   "free_text": bool, ...}], ...}
+    This is the AUTHORITATIVE contract: only exports present here are valid,
+    and it provides the export->id mapping and free_text/single_select flags.
+
+  lists_form : list[dict] | None  (read_lists_data shape). Each:
+      {"id": <list_id>, "name": "<list_name>", ...}
+    Authoritative name->list_id mapping.
+
+WHAT TO IMPLEMENT
+  Create a NEW file: asreview/webapp/_api/llm_mapping.py
+  (Apache license header + numpy-style docstring. Imports: stdlib only —
+   `logging`. Do NOT import the database or utils modules.)
+
+  Signature:
+      def map_llm_payload_to_asreview(payload, tags_form, lists_form):
+          """Map an LLM screening payload to ASReview tag/list structures.
+
+          Returns
+          -------
+          dict
+              {"tags": [...], "lists": [...]} always. On unusable input the
+              lists are empty. Never raises.
+          """
+
+  OUTPUT shape (exactly this):
+      {
+        "tags": [
+          {"id": <group_id:int>, "values": [
+             {"id": <option_id:int>, "checked": True, "text": <str|None>}
+          ]}
+        ],
+        "lists": [
+          {"list_id": <list_id>, "name": <item_str>, "sorted_at": <float>}
+        ]
+      }
+    Notes on the output:
+      - Only CHECKED options are emitted (checked is always True in output;
+        unchecked options are simply absent — matches _save_tags semantics).
+      - "text" is None unless the option's contract free_text is True AND the
+        payload provided a non-empty string, in which case it is that string.
+      - Emit a group only if it has at least one valid checked value.
+      - The list items intentionally OMIT item_id (a uuid) and use a numeric
+        sorted_at; the persistence caller (a later task) adds item_id via the
+        project's uuid7() right before calling replace_lists.
+
+  MAPPING & VALIDATION RULES (all "drop" cases must logging.warning):
+    Setup:
+      - tags_form/lists_form: treat None as [].
+      - Build group_lookup: group_export -> {
+            "id": group_id, "single_select": bool,
+            "options": {option_export -> {"id": option_id, "free_text": bool}}}
+      - Build list_lookup: list_name -> list_id.
+    Labels:
+      - If payload is not a dict, or payload.get("labels") is not a list:
+        produce no tags (do not crash).
+      - For each group entry:
+          * skip if not a dict, or "group" missing/not a known export (log).
+          * gather checked values from entry.get("values"); if not a list, skip.
+          * for each value dict (skip non-dicts, or missing "checked"):
+              - option export = value["checked"]; must exist in this group's
+                options, else drop+log.
+              - dedupe by option_id within the group (keep first; log dupes).
+              - text: if option free_text is True and value.get("text") is a
+                non-empty string -> use it; else None.
+          * single_select enforcement: if the group is single_select and more
+            than one distinct valid option was checked, keep only the FIRST and
+            drop the rest (log).
+          * emit {"id": group_id, "values": [...]} only if >=1 value remains.
+    Lists:
+      - If payload.get("lists") is not a list: produce no lists.
+      - For each list entry:
+          * skip if not a dict, or "list" missing/not a known name (log).
+          * items = entry.get("items"); if not a list, skip (log).
+          * for each item, in order:
+              - coerce to string via str(item).strip(); drop if empty (log).
+              - drop if it contains ',' or ';' (replace_lists forbids) (log).
+              - dedupe within this list by exact name (keep first).
+              - emit {"list_id": list_id, "name": name,
+                      "sorted_at": float(<running index within this list>)}
+                where the index starts at 0 for each list's first kept item.
+      - Two different list containers are independent; a name may repeat across
+        different lists.
+    General:
+      - Never raise. Any unexpected structure -> log and skip that piece.
+
+TEST (write this, then run it)
+  Create a NEW file: asreview/webapp/tests/test_api/test_llm_mapping.py
+  Pure unit test. Use pytest's caplog to assert warnings where relevant.
+
+  Provide fixtures resembling read_tags_data / read_lists_data, e.g.:
+      TAGS = [
+        {"id": 10, "export": "study_type", "single_select": True,
+         "values": [
+           {"id": 100, "export": "case_report", "free_text": False},
+           {"id": 101, "export": "case_series", "free_text": False},
+           {"id": 102, "export": "other", "free_text": True},
+         ]},
+        {"id": 20, "export": "inclusion_criteria", "single_select": False,
+         "values": [
+           {"id": 200, "export": "infectious_agent", "free_text": False},
+           {"id": 201, "export": "mutation", "free_text": False},
+         ]},
+      ]
+      LISTS = [
+        {"id": "L1", "name": "case_identifiers"},
+        {"id": "L2", "name": "issues"},
+      ]
+
+  Cover AT LEAST these cases (assert exact output structures):
+    1. Happy path: labels with one single_select pick (case_report) and two
+       inclusion_criteria (infectious_agent, mutation), plus a case_identifiers
+       list ["Patient 1", "Case A"] -> exact tags + lists output, with
+       list sorted_at 0.0 and 1.0.
+    2. Free text: "other" (free_text True) with text "HIV" -> text == "HIV";
+       a non-free_text option (case_report) that carries a bogus "text" ->
+       output text is None (text ignored for non-free_text options).
+    3. Unknown group export -> dropped + warning logged (caplog).
+    4. Unknown option export within a known group -> dropped + warning.
+    5. single_select group with two checked options -> only the FIRST kept +
+       warning.
+    6. Duplicate option (same export twice in one group) -> deduped to one.
+    7. Group with zero valid checked values -> group omitted entirely.
+    8. Unknown list name -> dropped + warning.
+    9. List item dedupe: ["A", "A", "B"] -> ["A", "B"].
+   10. List item cleaning: "", "   ", and non-strings -> dropped; a name with
+       "," or ";" -> dropped + warning.
+   11. Malformed payloads never crash and return {"tags": [], "lists": []}:
+       payload = None; payload = "nonsense"; payload = {}; payload =
+       {"labels": "x", "lists": 5}; a group entry that is a list not a dict;
+       a value that is a string not a dict.
+
+  Import the function from asreview.webapp._api.llm_mapping.
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/webapp/tests/test_api/test_llm_mapping.py -q
+  Paste the full pytest output. Do not report done until it is green.
+
+DONE WHEN
+  - asreview/webapp/_api/llm_mapping.py exists with
+    map_llm_payload_to_asreview as specified, uses only stdlib, and changes
+    no other file.
+  - All listed test cases pass, including the malformed-input cases.
+========================================================================

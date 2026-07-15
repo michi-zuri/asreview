@@ -163,6 +163,15 @@ class ProjectAPI {
     if (variables.hide_links !== undefined) {
       body.set("hide_links", variables.hide_links ? "true" : "false");
     }
+    if (variables.reassign_stale !== undefined) {
+      body.set("reassign_stale", variables.reassign_stale ? "true" : "false");
+    }
+    if (variables.allow_member_replace !== undefined) {
+      body.set(
+        "allow_member_replace",
+        variables.allow_member_replace ? "true" : "false",
+      );
+    }
 
     const url = api_url + `projects/${variables.project_id}/info`;
     return new Promise((resolve, reject) => {
@@ -223,6 +232,39 @@ class ProjectAPI {
         .get(url, { withCredentials: true })
         .then((result) => {
           resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static uploadRecordPdf({ project_id, record_id, file }) {
+    const url =
+      api_url + `projects/${project_id}/record/${record_id}/upload_pdf`;
+    const formData = new FormData();
+    formData.append("file", file);
+    return new Promise((resolve, reject) => {
+      axios
+        .post(url, formData, { withCredentials: true })
+        .then((result) => {
+          resolve(result.data);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static replaceRecordPdf({ project_id, record_id, file }) {
+    const url = api_url + `projects/${project_id}/record/${record_id}/pdf`;
+    const formData = new FormData();
+    formData.append("file", file);
+    return new Promise((resolve, reject) => {
+      axios
+        .put(url, formData, { withCredentials: true })
+        .then((result) => {
+          resolve(result.data);
         })
         .catch((error) => {
           reject(axiosErrorHandler(error));
@@ -310,7 +352,7 @@ class ProjectAPI {
           withCredentials: true,
         })
         .then((result) => {
-          resolve(result.data);
+          resolve(result["data"]);
         })
         .catch((error) => {
           reject(axiosErrorHandler(error));
@@ -783,6 +825,61 @@ class ProjectAPI {
     });
   }
 
+  static deleteList(variables) {
+    const url =
+      api_url + `projects/${variables.project_id}/lists/${variables.list_id}`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "delete",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static deleteTagGroup(variables) {
+    const url =
+      api_url + `projects/${variables.project_id}/tags/${variables.group_id}`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "delete",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static deleteTagOption(variables) {
+    const url =
+      api_url +
+      `projects/${variables.project_id}/tags/${variables.group_id}/options/${variables.option_id}`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "delete",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
   static fetchHighlights({ queryKey }) {
     const { project_id } = queryKey[1];
     const url = api_url + `projects/${project_id}/highlights`;
@@ -844,6 +941,41 @@ class ProjectAPI {
         method: "put",
         url: url,
         data: body,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static validateZotero({ project_id, group_id, api_key }) {
+    const url = api_url + `projects/${project_id}/zotero/validate`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        data: { group_id, api_key },
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static deleteZoteroConfig({ project_id }) {
+    const url = api_url + `projects/${project_id}/zotero`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "delete",
+        url: url,
         withCredentials: true,
       })
         .then((result) => {
@@ -966,6 +1098,128 @@ class ProjectAPI {
         .delete(url, { withCredentials: true })
         .then((result) => {
           resolve(result);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static fetchLlmMeta({ queryKey }) {
+    const { project_id, record_id } = queryKey[1];
+    const url = api_url + `projects/${project_id}/record/${record_id}/llm`;
+    return new Promise((resolve, reject) => {
+      axios
+        .get(url, { withCredentials: true })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static sendHeartbeat(variables) {
+    const url =
+      api_url +
+      `projects/${variables.project_id}/record/${variables.record_id}/heartbeat`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static fetchLlmSettings({ queryKey }) {
+    const { project_id } = queryKey[1];
+    const url = api_url + `projects/${project_id}/llm_settings`;
+    return new Promise((resolve, reject) => {
+      axios
+        .get(url, { withCredentials: true })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static mutateLlmSettings(variables) {
+    const { project_id, ...settings } = variables;
+    const url = api_url + `projects/${project_id}/llm_settings`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "put",
+        url: url,
+        data: settings,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static reprocessRecord({ project_id, record_id }) {
+    const url =
+      api_url + `projects/${project_id}/record/${record_id}/reprocess`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static recheckPdf({ project_id, record_id }) {
+    const url =
+      api_url + `projects/${project_id}/record/${record_id}/recheck_pdf`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static applyLlm({ project_id, record_id }) {
+    const url =
+      api_url + `projects/${project_id}/record/${record_id}/apply_llm`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]);
         })
         .catch((error) => {
           reject(axiosErrorHandler(error));

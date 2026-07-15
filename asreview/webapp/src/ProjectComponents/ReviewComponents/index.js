@@ -1,3 +1,4 @@
+export { default as LlmResultCard } from "./LlmResultCard";
 export { default as RecordCardLabeler } from "./RecordCardLabeler";
 export { default as RecordCard } from "./RecordCard";
 export { default as ReviewPage } from "./ReviewPage";

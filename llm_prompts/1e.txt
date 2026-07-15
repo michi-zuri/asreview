@@ -1,0 +1,137 @@
+========================================================================
+TASK 1e — DAO: reassign_stale(user_id, older_than)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: tasks 1a, 1b, 1c, 1d already merged.
+
+GOAL
+  Add ONE method, reassign_stale, to the Database class in
+  asreview/database/database.py. It transfers the OLDEST stale checkout that
+  belongs to ANOTHER user to the requesting user, resetting its timestamps. A
+  checkout is stale when its ``last_active`` is older than ``older_than``
+  seconds. Concurrency-safe via an UPDATE ... WHERE guard.
+
+BACKGROUND
+  A "checkout" is a pending ``results`` row (label IS NULL) with a user_id set
+  and (from task 1d) ``last_active`` stamped. Reassigning transfers ownership
+  of the whole group to the new user and bumps assigned_at + last_active to now.
+  There are no drafts to transfer; any tags/lists already saved for the record
+  live in their own tables keyed by record_id and simply carry over.
+
+  NOTE (scope): rows whose ``last_active`` is NULL (e.g. cold-start checkouts
+  created by query_top_ranked, which does not set it) are treated as NOT stale
+  and are never auto-reassigned here. That is acceptable for this task.
+
+WHAT TO IMPLEMENT
+  Add this method (place it near query_top_ranked / checkout_oldest_dispatched):
+
+      def reassign_stale(self, user_id, older_than):
+          """Reassign the oldest stale checkout to ``user_id``.
+
+          A checkout is stale when it is pending (label IS NULL), owned by a
+          DIFFERENT user, and its ``last_active`` is older than ``older_than``
+          seconds. The oldest such checkout (smallest last_active) has its whole
+          group transferred to ``user_id`` with assigned_at and last_active
+          reset to now.
+
+          Parameters
+          ----------
+          user_id : int
+              The requesting user who should receive the reassigned checkout.
+          older_than : float
+              Staleness threshold in seconds.
+
+          Returns
+          -------
+          pandas.DataFrame
+              The user's pending row(s) (same shape as get_pending). Empty when
+              nothing stale was available.
+          """
+          now = time.time()
+          cutoff = now - older_than
+
+          con = self._conn
+          cur = con.cursor()
+          result = cur.execute(
+              f"""
+              WITH stale AS (
+                  SELECT record_id
+                  FROM results
+                  WHERE label IS NULL
+                    AND user_id IS NOT NULL
+                    AND user_id != :user_id
+                    AND last_active IS NOT NULL
+                    AND last_active < :cutoff
+                  ORDER BY last_active ASC
+                  LIMIT 1
+              ),
+              group_records AS (
+                  SELECT record.record_id
+                  FROM {self.record_table_name} AS record
+                  WHERE group_id = (
+                      SELECT group_id
+                      FROM {self.record_table_name}
+                      WHERE record_id = (SELECT record_id FROM stale)
+                  )
+              )
+              UPDATE results
+              SET user_id = :user_id, assigned_at = :now, last_active = :now
+              WHERE record_id IN (SELECT record_id FROM group_records)
+              RETURNING record_id
+              """,
+              {"user_id": user_id, "cutoff": cutoff, "now": now},
+          ).fetchone()
+          con.commit()
+
+          if result is None:
+              return self.get_pending(user_id=user_id).iloc[0:0]
+          return self.get_pending(user_id=user_id)
+
+  Change no other file.
+
+TEST (write this, then run it)
+  Append to asreview/tests/test_llm_db.py. Reuse the `db`, `db_pool`,
+  `_results_row` helpers. Add a helper to backdate a checkout:
+
+      def _set_last_active(db, record_id, value):
+          cur = db._conn.cursor()
+          cur.execute(
+              "UPDATE results SET last_active = ? WHERE record_id = ?",
+              (value, record_id),
+          )
+          db._conn.commit()
+
+  Use this setup pattern to create a checkout owned by a given user:
+      db_pool.top_up_dispatch(3, "H")
+      db_pool.checkout_oldest_dispatched(user_id=2)   # user 2 gets record 0
+  then backdate with _set_last_active(db_pool, 0, <old timestamp>).
+  Use `import time` in the test to compute old/new timestamps
+  (e.g. old = time.time() - 100000).
+
+  Cover:
+    1. Stale checkout reassigned: user 2 holds record 0, backdated to
+       time.time() - 100000. reassign_stale(user_id=1, older_than=3600) returns
+       a non-empty DataFrame; _results_row(db, 0) now shows user_id == 1 and a
+       fresh last_active (> cutoff, i.e. close to now).
+    2. Fresh checkout NOT reassigned: user 2 holds record 0 with last_active
+       ~ now (as set by checkout). reassign_stale(user_id=1, older_than=3600)
+       returns an EMPTY DataFrame and record 0 still belongs to user 2.
+    3. Own checkout not stolen: user 1 holds record 0, backdated to be old.
+       reassign_stale(user_id=1, older_than=3600) returns EMPTY (a user is not
+       reassigned their own checkout) and record 0 still belongs to user 1.
+    4. Oldest-first: user 2 holds record 0 (backdated to now-100000) and user 3
+       holds record 1 (backdated to now-50000); both are stale.
+       reassign_stale(user_id=1, older_than=3600) reassigns record 0 (the
+       oldest last_active) to user 1 and leaves record 1 with user 3.
+       (To set this up: top_up_dispatch(3,"H"); checkout user 2 -> record 0;
+        checkout user 3 -> record 1; backdate both.)
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/tests/test_llm_db.py -q
+  Paste the full pytest output. Do not report done until green.
+
+DONE WHEN
+  - reassign_stale exists as specified and changes no other file.
+  - All four test cases pass (and earlier LLM-db tests still pass).
+========================================================================

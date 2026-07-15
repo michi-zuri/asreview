@@ -17,6 +17,8 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+import os
 import secrets
 import shutil
 import socket
@@ -51,6 +53,7 @@ from werkzeug.exceptions import InternalServerError
 from werkzeug.utils import secure_filename
 
 import asreview as asr
+from asreview.database.database import uuid7
 from asreview.data import CSVWriter
 from asreview.data import ExcelWriter
 from asreview.data import RISReader
@@ -74,15 +77,21 @@ from asreview.project.migration import detect_version
 from asreview.project.migration import migrate_project
 from asreview.utils import _get_filename_from_url
 from asreview.webapp import DB
-from asreview.webapp._api.utils import add_id_to_tags
+from asreview.webapp._api.llm_mapping import build_prefill_state
+from asreview.webapp._api.llm_prompt import build_system_prompt
 from asreview.webapp._api.utils import get_all_model_components
 from asreview.webapp._api.utils import read_lists_data
 from asreview.webapp._api.utils import read_tags_data
 from asreview.webapp._api.zotero import ZoteroLookupError
+from asreview.webapp._api.zotero import ZoteroDeleteError
+from asreview.webapp._api.zotero import ZoteroUploadError
 from asreview.webapp._api.zotero import build_reader_url
+from asreview.webapp._api.zotero import delete_pdf as delete_zotero_pdf
 from asreview.webapp._api.zotero import fetch_pdf_attachment_key
 from asreview.webapp._api.zotero import get_zotero_config
+from asreview.webapp._api.zotero import validate_zotero_credentials
 from asreview.webapp._api.zotero import is_attachment_key
+from asreview.webapp._api.zotero import upload_pdf_to_zotero
 from asreview.webapp._authentication.decorators import current_user_projects
 from asreview.webapp._authentication.decorators import login_required
 from asreview.webapp._authentication.decorators import project_authorization
@@ -104,6 +113,31 @@ except importlib.metadata.PackageNotFoundError:
 
 
 bp = Blueprint("api", __name__, url_prefix="/api")
+
+DEFAULT_LLM_SETTINGS = {
+    "buffer_size": 20,
+    "max_concurrent_llm": 3,
+    "criteria_text": "",
+    "api_key": "",
+}
+
+
+def _llm_settings(project):
+    try:
+        cfg = project.config.get("llm", {}) or {}
+    except Exception:
+        cfg = {}
+    return {**DEFAULT_LLM_SETTINGS, **cfg}
+
+
+def _current_prompt_hash(project):
+    """Build the current system prompt hash from tags/lists/criteria."""
+    tags = read_tags_data(project.db)
+    lists = read_lists_data(project)
+    _, prompt_hash = build_system_prompt(
+        tags, lists, _llm_settings(project)["criteria_text"]
+    )
+    return prompt_hash
 
 
 def _fill_last_ranking(project, ranking):
@@ -374,6 +408,11 @@ def api_get_project_info(project):  # noqa: F401
     """"""
     project_config = project.config
 
+    # Mask the API key — never expose it to the frontend.
+    llm = project_config.get("llm")
+    if isinstance(llm, dict) and llm.get("api_key"):
+        project_config = {**project_config, "llm": {**llm, "api_key": True}}
+
     if current_app.config.get("AUTHENTICATION", True):
         # find project
         db_project = Project.query.filter(
@@ -403,6 +442,12 @@ def api_update_project_info(project):  # noqa: F401
 
     if "hide_links" in update_dict:
         update_dict["hide_links"] = update_dict["hide_links"] == "true"
+
+    if "reassign_stale" in update_dict:
+        update_dict["reassign_stale"] = update_dict["reassign_stale"] == "true"
+
+    if "allow_member_replace" in update_dict:
+        update_dict["allow_member_replace"] = update_dict["allow_member_replace"] == "true"
 
     project.update_config(**update_dict)
 
@@ -546,10 +591,12 @@ def api_search_data(project):  # noqa: F401
 
     result = []
     records = project.db.input.get_records(group_ids)
+    with project.db as tmp_db:
+        tags_form = read_tags_data(tmp_db) or []
     for record in records:
         record_d = asdict(record)
         record_d["state"] = None
-        record_d["tags_form"] = read_tags_data(project)
+        record_d["tags_form"] = tags_form
         record_d["lists_form"] = read_lists_data(project)
         result.append(record_d)
 
@@ -721,7 +768,8 @@ def api_get_labeled(project):  # noqa: F401
     exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
 
     # ---- Filters applied as a Python post-scan ----
-    tags_form = read_tags_data(project)
+    with project.db as tmp_db:
+        tags_form = read_tags_data(tmp_db) or []
 
     tag_col_map = {}
     for group in tags_form or []:
@@ -738,9 +786,13 @@ def api_get_labeled(project):  # noqa: F401
 
     invalid_filter = parsed_filters.get("invalid_tags")
     filter_pdf = parsed_filters.get("pdf")
+    filter_abstract = parsed_filters.get("abstract")
 
     post_scan = (
-        filter_pdf is not None or bool(tag_filters) or invalid_filter is not None
+        filter_pdf is not None
+        or filter_abstract is not None
+        or bool(tag_filters)
+        or invalid_filter is not None
     )
 
     # ---- Decode / validate cursor ----
@@ -782,10 +834,28 @@ def api_get_labeled(project):  # noqa: F401
                 ]
             )
 
+        # Abstract availability set, computed once.
+        abstract_ids = None
+        if filter_abstract is not None:
+            abstracts = db.input[["record_id", "abstract"]]
+            # A record "has abstract" when the field is non-null and non-empty.
+            abstract_ids = set(
+                abstracts.loc[
+                    abstracts["abstract"].apply(
+                        lambda v: isinstance(v, str) and bool(v.strip())
+                    ),
+                    "record_id",
+                ]
+            )
+
         def passes(saved_tags, record_id, label):
             if pdf_ids is not None:
                 in_pdf = record_id in pdf_ids
                 if filter_pdf != in_pdf:
+                    return False
+            if abstract_ids is not None:
+                in_abstract = record_id in abstract_ids
+                if filter_abstract != in_abstract:
                     return False
             for group_export, tag_export, want in tag_filters:
                 if _tag_is_checked(saved_tags, group_export, tag_export) != want:
@@ -1236,67 +1306,97 @@ def api_import_project():
 @login_required
 @project_authorization
 def get_tag_groups(project):
-    tags_path = Path(project.project_path, "tags.json")
-
-    try:
-        with open(tags_path, "r") as f:
-            return jsonify(json.load(f))
-    except FileNotFoundError:
-        return jsonify([])
-    except Exception as err:
-        logging.exception(err)
-        return jsonify([]), 500
+    with project.db as db:
+        tags_form = read_tags_data(db)
+        return jsonify(tags_form if tags_form is not None else [])
 
 
 @bp.route("/projects/<project_id>/tags", methods=["POST"])
 @login_required
 @project_authorization
 def create_tag_group(project):
-    tags_path = Path(project.project_path, "tags.json")
-
     new_tag_group = json.loads(request.form.get("group", "[]"))
 
     if not new_tag_group:
         return jsonify(message="No tag group found."), 400
 
-    def add_ids_to_group(group, group_id=0):
-        group["id"] = group_id
-        return add_id_to_tags(group)
+    group_id = uuid7()
+    group_sorted_at = new_tag_group.get("sorted_at", time.time())
 
-    try:
-        with open(tags_path, "r") as f:
-            tags = json.load(f)
-
-        tags.append(
-            add_ids_to_group(
-                new_tag_group, group_id=max([g["id"] for g in tags], default=0) + 1
-            )
+    with project.db as db:
+        db._ensure_tag_groups_table()
+        db._ensure_tag_options_table()
+        cur = db._conn.cursor()
+        cur.execute(
+            """INSERT INTO tag_groups
+               (group_id, export_name, label_name, required_for_relevant,
+                required_for_irrelevant, all_required, single,
+                input_helper_text, sorted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                group_id,
+                new_tag_group.get("export", ""),
+                new_tag_group.get("label", ""),
+                1 if new_tag_group.get("required_relevant") else 0,
+                1 if new_tag_group.get("required_irrelevant") else 0,
+                1 if new_tag_group.get("require_all") else 0,
+                1 if new_tag_group.get("single_select") else 0,
+                new_tag_group.get("input_helper_text", ""),
+                float(group_sorted_at),
+            ),
         )
 
-        with open(tags_path, "w") as f:
-            json.dump(tags, f)
+        # Insert tag options
+        for i, val in enumerate(new_tag_group.get("values", [])):
+            option_id = uuid7()
+            sorted_at = val.get("sorted_at", time.time())
+            cur.execute(
+                """INSERT INTO tag_options
+                   (option_id, group_id, export_name, label_name,
+                    free_text_enabled, free_text_required, sorted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    option_id,
+                    group_id,
+                    val.get("export", ""),
+                    val.get("label", ""),
+                    1 if val.get("free_text", False) else 0,
+                    1 if val.get("free_text_required", False) else 0,
+                    float(sorted_at),
+                ),
+            )
 
-        return jsonify(tags)
+        db._conn.commit()
 
-    except FileNotFoundError:
-        new_tag_group = add_ids_to_group(new_tag_group)
-
-        with open(tags_path, "w") as f:
-            json.dump([new_tag_group], f)
-
-        return jsonify([new_tag_group])
-    except Exception as err:
-        logging.exception(err)
-        return jsonify(message="Failed to create tag group."), 500
+    with project.db as db:
+        return jsonify(read_tags_data(db) or [])
 
 
-@bp.route("/projects/<project_id>/tags/<int:group_id>", methods=["PUT"])
+@bp.route(
+    "/projects/<project_id>/tags/<group_id>/options/<option_id>", methods=["DELETE"]
+)
+@login_required
+@project_authorization
+def delete_tag_option(project, group_id, option_id):
+    """Delete a single tag option from a group.
+
+    The option cannot be deleted if any record has a tag selection that
+    references it (FK constraint).
+    """
+    with project.db as db:
+        try:
+            db.delete_tag_option(option_id, group_id)
+        except ValueError as e:
+            return jsonify(message=str(e)), 409
+    with project.db as db:
+        return jsonify(read_tags_data(db) or [])
+
+
+@bp.route("/projects/<project_id>/tags/<group_id>", methods=["PUT"])
 @login_required
 @project_authorization
 def update_tag_group(project, group_id):
     """Update a single tag group by its ID."""
-    tags_path = Path(project.project_path, "tags.json")
-
     updated_tag_group = json.loads(request.form.get("group", "[]"))
 
     if not updated_tag_group:
@@ -1311,130 +1411,218 @@ def update_tag_group(project, group_id):
     if "values" not in updated_tag_group:
         return jsonify(message="No tag group values found."), 400
 
-    updated_tag_group = add_id_to_tags(updated_tag_group)
+    with project.db as db:
+        db._ensure_tag_options_table()
+        cur = db._conn.cursor()
 
-    try:
-        with open(tags_path, "r") as f:
-            groups = json.load(f)
+        group_sorted_at = updated_tag_group.get("sorted_at", time.time())
 
-        group_index = next(
-            (i for i, g in enumerate(groups) if g["id"] == group_id), None
+        # Update the group itself
+        result = cur.execute(
+            """UPDATE tag_groups SET
+               export_name=?, label_name=?, required_for_relevant=?,
+               required_for_irrelevant=?, all_required=?, single=?,
+               input_helper_text=?, sorted_at=?
+               WHERE group_id=?""",
+            (
+                updated_tag_group.get("export", ""),
+                updated_tag_group.get("label", ""),
+                1 if updated_tag_group.get("required_relevant") else 0,
+                1 if updated_tag_group.get("required_irrelevant") else 0,
+                1 if updated_tag_group.get("require_all") else 0,
+                1 if updated_tag_group.get("single_select") else 0,
+                updated_tag_group.get("input_helper_text", ""),
+                float(group_sorted_at),
+                group_id,
+            ),
         )
 
-        if group_index is None:
+        if result.rowcount == 0:
             return jsonify(message=f"Tag group '{group_id}' not found."), 404
 
-        groups[group_index] = updated_tag_group
+        # Sync tag_options: collect incoming option_ids
+        incoming_ids = set()
+        for val in updated_tag_group.get("values", []):
+            option_id = val.get("id")
+            sorted_at = val.get("sorted_at", time.time())
+            if option_id is not None:
+                incoming_ids.add(option_id)
+                # Upsert: UPDATE if exists, INSERT if new
+                cur.execute(
+                    """INSERT INTO tag_options
+                       (option_id, group_id, export_name, label_name,
+                        free_text_enabled, free_text_required, sorted_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(option_id) DO UPDATE SET
+                       export_name=excluded.export_name,
+                       label_name=excluded.label_name,
+                       free_text_enabled=excluded.free_text_enabled,
+                       free_text_required=excluded.free_text_required,
+                       sorted_at=excluded.sorted_at""",
+                    (
+                        option_id,
+                        group_id,
+                        val.get("export", ""),
+                        val.get("label", ""),
+                        1 if val.get("free_text", False) else 0,
+                        1 if val.get("free_text_required", False) else 0,
+                        float(sorted_at),
+                    ),
+                )
+            else:
+                # New value without an id: generate one
+                option_id = uuid7()
+                incoming_ids.add(option_id)
+                cur.execute(
+                    """INSERT INTO tag_options
+                       (option_id, group_id, export_name, label_name,
+                        free_text_enabled, free_text_required, sorted_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        option_id,
+                        group_id,
+                        val.get("export", ""),
+                        val.get("label", ""),
+                        1 if val.get("free_text", False) else 0,
+                        1 if val.get("free_text_required", False) else 0,
+                        float(sorted_at),
+                    ),
+                )
 
-        with open(tags_path, "w") as f:
-            json.dump(groups, f)
+        # Remove options no longer present (FK constraint from ``tags`` will
+        # block this if any record still references the option).
+        existing = cur.execute(
+            "SELECT option_id FROM tag_options WHERE group_id = ?",
+            (group_id,),
+        ).fetchall()
+        for (existing_id,) in existing:
+            if existing_id not in incoming_ids:
+                try:
+                    cur.execute(
+                        "DELETE FROM tag_options WHERE option_id = ? AND group_id = ?",
+                        (existing_id, group_id),
+                    )
+                except sqlite3.IntegrityError:
+                    pass  # FK constraint protects referenced options
 
-        return jsonify(updated_tag_group)
-    except FileNotFoundError:
-        return jsonify(message=f"Tag group '{group_id}' not found."), 404
-    except Exception as err:
-        logging.exception(err)
-        return jsonify(message="Failed to update tag group."), 500
+        db._conn.commit()
+
+    with project.db as db:
+        return jsonify(read_tags_data(db) or [])
+
+
+@bp.route("/projects/<project_id>/tags/<group_id>", methods=["DELETE"])
+@login_required
+@project_authorization
+def delete_tag_group(project, group_id):
+    """Delete a tag group and all its options.
+
+    The group can only be deleted when all options have been removed first
+    and no records reference any option in the group.
+    """
+    with project.db as db:
+        try:
+            db.delete_tag_group(group_id)
+        except ValueError as e:
+            return jsonify(message=str(e)), 409
+    with project.db as db:
+        return jsonify(read_tags_data(db) or [])
 
 
 @bp.route("/projects/<project_id>/lists", methods=["GET"])
 @login_required
 @project_authorization
 def get_lists(project):
-    """Get the list configuration (id -> name) for a project."""
-    lists_path = Path(project.project_path, "lists.json")
-
-    try:
-        with open(lists_path, "r") as f:
-            return jsonify(json.load(f))
-    except FileNotFoundError:
-        return jsonify([])
-    except Exception as err:
-        logging.exception(err)
-        return jsonify([]), 500
+    """Get the list configuration for a project."""
+    lists_data = read_lists_data(project)
+    return jsonify(lists_data if lists_data is not None else [])
 
 
 @bp.route("/projects/<project_id>/lists", methods=["POST"])
 @login_required
 @project_authorization
 def create_list(project):
-    """Create a new list. A list has a name and a required flag.
+    """Create a new list definition in the ``list_containers`` table.
 
-    The list id is a ``uuid4`` so that ids are stable and never collide.
+    The list id is a ``uuid7`` so that ids are time-ordered and never collide.
     """
-    lists_path = Path(project.project_path, "lists.json")
-
     new_list = json.loads(request.form.get("list", "{}"))
 
     if not new_list or not new_list.get("name"):
         return jsonify(message="No list name found."), 400
 
-    new_list = {
-        "id": str(uuid4()),
-        "name": new_list["name"],
-        "required_for_relevant": bool(new_list.get("required_for_relevant", False)),
-        "input_helper_text": new_list.get("input_helper_text", ""),
-    }
+    list_id = uuid7()
+    list_sorted_at = new_list.get("sorted_at", time.time())
 
-    try:
-        with open(lists_path, "r") as f:
-            lists = json.load(f)
+    with project.db as db:
+        db._ensure_list_containers_table()
+        cur = db._conn.cursor()
+        cur.execute(
+            """INSERT INTO list_containers
+               (list_id, name, required_for_relevant, description, sorted_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                list_id,
+                new_list["name"],
+                1 if new_list.get("required_for_relevant", False) else 0,
+                new_list.get("input_helper_text") or None,
+                float(list_sorted_at),
+            ),
+        )
+        db._conn.commit()
 
-        lists.append(new_list)
-
-        with open(lists_path, "w") as f:
-            json.dump(lists, f)
-
-        return jsonify(lists)
-    except FileNotFoundError:
-        with open(lists_path, "w") as f:
-            json.dump([new_list], f)
-
-        return jsonify([new_list])
-    except Exception as err:
-        logging.exception(err)
-        return jsonify(message="Failed to create list."), 500
+    return jsonify(read_lists_data(project) or [])
 
 
 @bp.route("/projects/<project_id>/lists/<list_id>", methods=["PUT"])
 @login_required
 @project_authorization
 def update_list(project, list_id):
-    """Update a single list by its ID."""
-    lists_path = Path(project.project_path, "lists.json")
-
+    """Update a single list definition by its ID."""
     updated_list = json.loads(request.form.get("list", "{}"))
 
     if not updated_list or not updated_list.get("name"):
         return jsonify(message="No list name found."), 400
 
-    updated_list = {
-        "id": list_id,
-        "name": updated_list["name"],
-        "required_for_relevant": bool(updated_list.get("required_for_relevant", False)),
-        "input_helper_text": updated_list.get("input_helper_text", ""),
-    }
+    list_sorted_at = updated_list.get("sorted_at", time.time())
 
-    try:
-        with open(lists_path, "r") as f:
-            lists = json.load(f)
+    with project.db as db:
+        db._ensure_list_containers_table()
+        cur = db._conn.cursor()
+        result = cur.execute(
+            """UPDATE list_containers SET
+               name=?, required_for_relevant=?, description=?, sorted_at=?
+               WHERE list_id=?""",
+            (
+                updated_list["name"],
+                1 if updated_list.get("required_for_relevant", False) else 0,
+                updated_list.get("input_helper_text") or None,
+                float(list_sorted_at),
+                list_id,
+            ),
+        )
+        db._conn.commit()
 
-        index = next((i for i, lst in enumerate(lists) if lst["id"] == list_id), None)
-
-        if index is None:
+        if result.rowcount == 0:
             return jsonify(message=f"List '{list_id}' not found."), 404
 
-        lists[index] = updated_list
+        return jsonify(read_lists_data(project) or [])
 
-        with open(lists_path, "w") as f:
-            json.dump(lists, f)
 
-        return jsonify(updated_list)
-    except FileNotFoundError:
-        return jsonify(message=f"List '{list_id}' not found."), 404
-    except Exception as err:
-        logging.exception(err)
-        return jsonify(message="Failed to update list."), 500
+@bp.route("/projects/<project_id>/lists/<list_id>", methods=["DELETE"])
+@login_required
+@project_authorization
+def delete_list(project, list_id):
+    """Delete a list container definition.
+
+    The list can only be deleted when no records have items referencing it.
+    """
+    with project.db as db:
+        try:
+            db.delete_list_container(list_id)
+        except ValueError as e:
+            return jsonify(message=str(e)), 409
+    return jsonify(read_lists_data(project) or [])
 
 
 @bp.route("/projects/<project_id>/highlights", methods=["GET"])
@@ -1511,17 +1699,24 @@ def get_zotero(project):
     """Return the Zotero configuration for the project.
 
     If the file is missing, an empty config is returned without creating the file.
+    The API key is never exposed — a boolean indicates whether one is set.
     """
     zotero_path = Path(project.project_path, "zotero.json")
+    empty = {"api_key": False, "group_id": "", "group_slug": ""}
 
     try:
         with open(zotero_path, "r") as f:
-            return jsonify(json.load(f))
+            config = json.load(f)
     except FileNotFoundError:
-        return jsonify({"api_key": "", "group_id": "", "group_slug": ""})
+        return jsonify(empty)
     except Exception as err:
         logging.exception(err)
-        return jsonify({"api_key": "", "group_id": "", "group_slug": ""}), 500
+        return jsonify(empty), 500
+
+    # Mask the API key — never expose it to the frontend.
+    if config.get("api_key"):
+        config["api_key"] = True
+    return jsonify(config)
 
 
 @bp.route("/projects/<project_id>/zotero", methods=["PUT"])
@@ -1539,8 +1734,18 @@ def update_zotero(project):
     if not isinstance(config, dict):
         return jsonify(message="Zotero config must be an object."), 400
 
+    # If the frontend sends api_key: true (masked), preserve the existing key.
+    api_key = config.get("api_key", "")
+    if api_key is True:
+        try:
+            with open(zotero_path, "r") as f:
+                existing = json.load(f)
+            api_key = existing.get("api_key", "")
+        except (FileNotFoundError, json.JSONDecodeError):
+            api_key = ""
+
     cleaned = {
-        "api_key": str(config.get("api_key", "")).strip(),
+        "api_key": str(api_key).strip(),
         "group_id": str(config.get("group_id", "")).strip(),
         "group_slug": str(config.get("group_slug", "")).strip(),
     }
@@ -1548,10 +1753,46 @@ def update_zotero(project):
     try:
         with open(zotero_path, "w") as f:
             json.dump(cleaned, f)
-        return jsonify(cleaned)
+        # Mask the API key in the response.
+        response_config = {**cleaned, "api_key": bool(cleaned["api_key"])}
+        return jsonify(response_config)
     except Exception as err:
         logging.exception(err)
         return jsonify(message="Failed to save zotero config."), 500
+
+
+@bp.route("/projects/<project_id>/zotero/validate", methods=["POST"])
+@login_required
+@project_authorization
+def validate_zotero(project):
+    """Validate Zotero credentials and return the group name."""
+    body = request.get_json(silent=True) or {}
+    group_id = str(body.get("group_id", "")).strip()
+    api_key = str(body.get("api_key", "")).strip()
+
+    if not group_id or not api_key:
+        return jsonify(message="Group ID and API key are required."), 400
+
+    try:
+        name = validate_zotero_credentials(group_id, api_key)
+    except ZoteroLookupError as err:
+        return jsonify(message=str(err)), 400
+
+    return jsonify({"name": name})
+
+
+@bp.route("/projects/<project_id>/zotero", methods=["DELETE"])
+@login_required
+@project_authorization
+def delete_zotero(project):
+    """Delete the Zotero configuration for the project."""
+    zotero_path = Path(project.project_path, "zotero.json")
+    try:
+        zotero_path.unlink(missing_ok=True)
+    except OSError as err:
+        logging.exception(err)
+        return jsonify(message="Failed to delete zotero config."), 500
+    return jsonify({"api_key": False, "group_id": "", "group_slug": ""})
 
 
 def _flatten_tags(results, tags_config):
@@ -1613,6 +1854,7 @@ def api_export_dataset(project):
         df_results = db.get_results_table(groups=export_groups).set_index("record_id")
         df_unlabeled = db.get_unlabeled(groups=export_groups)
         df_groups = db.input[["record_id", "group_id"]].set_index("record_id")
+        tags_config = read_tags_data(db)
 
     export_order = []
 
@@ -1627,7 +1869,7 @@ def api_export_dataset(project):
 
     df_results = _flatten_tags(
         df_results,
-        read_tags_data(project),
+        tags_config,
     )
     df_results["time"] = pd.to_datetime(df_results["time"], unit="s").dt.strftime(
         "%Y-%m-%d %H:%M:%S"
@@ -1924,6 +2166,20 @@ def api_label_record(project, record_id):  # noqa: F401
     )
 
     with project.db as db:
+        if request.method == "POST":
+            status = db.get_result_status(record_id)
+            if (status is not None and status["label"] is not None
+                    and status["user_id"] != user_id):
+                logging.warning(
+                    "Discarding late label for record %s from user %s "
+                    "(already decided by user %s)",
+                    record_id, user_id, status["user_id"])
+                return jsonify({
+                    "discarded": True,
+                    "message": ("This article was reassigned and has already been "
+                                "decided; your input was not saved."),
+                }), 200
+
         if request.method == "PUT":
             db.update_result(record_id, label=label, tags=tags, user_id=user_id)
         else:
@@ -1953,12 +2209,27 @@ def api_label_record(project, record_id):  # noqa: F401
             item = asdict(db.input.get_records(record_id))
             item["state"] = record.iloc[0].to_dict()
             item["state"]["lists"] = db.get_lists(record_id)
-        item["tags_form"] = read_tags_data(project)
+            item["tags_form"] = read_tags_data(db) or []
         item["lists_form"] = read_lists_data(project)
         item["state"]["user"] = None
         del item["state"]["user_id"]
 
         return jsonify({"result": item})
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/heartbeat",
+          methods=["POST"])
+@login_required
+@project_authorization
+def api_record_heartbeat(project, record_id):  # noqa: F401
+    """Liveness ping for an open record. Returns {"active": bool}."""
+    user_id = (
+        current_user.id
+        if current_app.config.get("AUTHENTICATION", True) else None
+    )
+    with project.db as db:
+        active = db.touch_last_active(int(record_id), user_id)
+    return jsonify({"active": active})
 
 
 @bp.route("/projects/<project_id>/record/<record_id>/note", methods=["PUT"])
@@ -2047,6 +2318,238 @@ def api_get_record_attachment(project, record_id):  # noqa: F401
         return payload(False, checked_at=checked_at)
 
 
+@bp.route("/projects/<project_id>/record/<record_id>/upload_pdf", methods=["POST"])
+@login_required
+@project_authorization
+def api_upload_pdf(project, record_id):  # noqa: F401
+    """Upload a PDF file to Zotero for a record.
+
+    Creates a child attachment item on the record's Zotero parent item and
+    uploads the selected PDF file through Zotero's file storage handshake.
+    On success stores the attachment key so the existing full-text link and
+    LLM screening flows pick it up automatically.
+    """
+    record_id = int(record_id)
+
+    config = get_zotero_config(project.project_path)
+    if not config.enabled:
+        return jsonify({"message": "Zotero is not configured"}), 400
+
+    if "file" not in request.files:
+        return jsonify({"message": "No file provided"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"message": "No file selected"}), 400
+
+    with project.db as db:
+        record = db.input.get_records(record_id)
+        if record is None:
+            return abort(404)
+        original_id = record.original_id
+        if not original_id:
+            return jsonify({"message": "Record has no Zotero item key"}), 400
+
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        file.save(tmp_path)
+
+        # Preserve the original filename for the Zotero attachment title.
+        safe_name = Path(file.filename).name or "upload.pdf"
+        renamed = Path(tmp_path).with_name(safe_name)
+        Path(tmp_path).rename(renamed)
+        tmp_path = str(renamed)
+
+        attachment_key = upload_pdf_to_zotero(config, original_id, tmp_path)
+    except ZoteroUploadError as err:
+        status = err.status_code if err.status_code else 500
+        return jsonify({"message": str(err)}), status
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            Path(tmp_path).unlink(missing_ok=True)
+
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        db.input.set_attachment(record_id, attachment_key)
+        db.force_requeue(record_id, prompt_hash)
+
+    return jsonify({
+        "attachment_key": attachment_key,
+        "url": build_reader_url(config, original_id, attachment_key),
+    })
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/pdf", methods=["DELETE"])
+@login_required
+@project_authorization
+def api_delete_record_pdf(project, record_id):  # noqa: F401
+    """Delete a record's PDF attachment from Zotero and clean up local state.
+
+    Restricted to project owners (and admins). The Zotero attachment item is
+    permanently deleted, then the record's attachment cache, LLM dispatch, and
+    LLM results are reset so the UI reflects the new state.
+    """
+    record_id = int(record_id)
+
+    # Owner check
+    if current_app.config.get("AUTHENTICATION", True):
+        project_db = Project.query.filter(
+            Project.project_id == project.project_id,
+        ).one_or_none()
+        if project_db is None:
+            return jsonify({"message": "Project not found"}), 404
+        if not current_user.is_admin and project_db.owner_id != current_user.id:
+            return jsonify({"message": "Only the project owner can delete PDF attachments"}), 403
+
+    config = get_zotero_config(project.project_path)
+    if not config.enabled:
+        return jsonify({"message": "Zotero is not configured"}), 400
+
+    with project.db as db:
+        record = db.input.get_records(record_id)
+        if record is None:
+            return abort(404)
+
+        attachment_key = record.attachment
+        if not is_attachment_key(attachment_key):
+            return jsonify({"message": "No PDF attachment to delete"}), 404
+
+        # Reject if an LLM call is currently in-flight for this record —
+        # deleting the file out from under an active call would waste it.
+        meta = db.get_llm_meta(record_id, _current_prompt_hash(project))
+        if meta and meta.get("status") == "in_flight":
+            return jsonify({
+                "message": "Cannot delete PDF while LLM screening is in progress"
+            }), 409
+
+    # Zotero I/O outside the SQLite transaction
+    try:
+        delete_zotero_pdf(config, attachment_key)
+    except ZoteroDeleteError as err:
+        status = err.status_code if err.status_code else 500
+        return jsonify({"message": str(err)}), status
+
+    # Local cleanup
+    with project.db as db:
+        db.input.set_attachment(record_id, None)
+        db.mark_dispatch_missing_pdf(record_id)
+        db.delete_llm_results(record_id)
+
+    logging.info(
+        "User %s deleted PDF attachment %s for record %s (project %s)",
+        current_user.id if hasattr(current_user, "id") else "anonymous",
+        attachment_key,
+        record_id,
+        project.project_id,
+    )
+
+    return jsonify({"success": True})
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/pdf", methods=["PUT"])
+@login_required
+@project_authorization
+def api_replace_record_pdf(project, record_id):  # noqa: F401
+    """Replace a record's PDF attachment in Zotero.
+
+    Uploads a new PDF to Zotero, then deletes the old attachment (best effort).
+    Updates the record's attachment cache, clears stale LLM results, and
+    re-queues for screening with the new PDF.
+
+    Restricted to project owners (and admins).
+    """
+    record_id = int(record_id)
+
+    # Owner check
+    if current_app.config.get("AUTHENTICATION", True):
+        project_db = Project.query.filter(
+            Project.project_id == project.project_id,
+        ).one_or_none()
+        if project_db is None:
+            return jsonify({"message": "Project not found"}), 404
+        if not current_user.is_admin and project_db.owner_id != current_user.id:
+            return jsonify(
+                {"message": "Only the project owner can replace PDF attachments"}
+            ), 403
+
+    config = get_zotero_config(project.project_path)
+    if not config.enabled:
+        return jsonify({"message": "Zotero is not configured"}), 400
+
+    if "file" not in request.files:
+        return jsonify({"message": "No file provided"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"message": "No file selected"}), 400
+
+    with project.db as db:
+        record = db.input.get_records(record_id)
+        if record is None:
+            return abort(404)
+        original_id = record.original_id
+        if not original_id:
+            return jsonify({"message": "Record has no Zotero item key"}), 400
+        old_attachment_key = record.attachment
+
+        meta = db.get_llm_meta(record_id, _current_prompt_hash(project))
+        if meta and meta.get("status") == "in_flight":
+            return jsonify({
+                "message": "Cannot replace PDF while LLM screening is in progress"
+            }), 409
+
+    # Upload the new PDF first so we never lose the record's PDF reference.
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        file.save(tmp_path)
+
+        safe_name = Path(file.filename).name or "upload.pdf"
+        renamed = Path(tmp_path).with_name(safe_name)
+        Path(tmp_path).rename(renamed)
+        tmp_path = str(renamed)
+
+        new_attachment_key = upload_pdf_to_zotero(config, original_id, tmp_path)
+    except ZoteroUploadError as err:
+        status = err.status_code if err.status_code else 500
+        return jsonify({"message": str(err)}), status
+    finally:
+        if tmp_path and Path(tmp_path).exists():
+            Path(tmp_path).unlink(missing_ok=True)
+
+    # Delete the old attachment (best effort — don't fail if this errors).
+    if is_attachment_key(old_attachment_key):
+        try:
+            delete_zotero_pdf(config, old_attachment_key)
+        except ZoteroDeleteError as err:
+            logging.warning(
+                "Failed to delete old attachment %s during replace: %s",
+                old_attachment_key, err,
+            )
+
+    # Local cleanup — store new key, clear stale results, re-queue.
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        db.input.set_attachment(record_id, new_attachment_key)
+        db.delete_llm_results(record_id)
+        db.force_requeue(record_id, prompt_hash)
+
+    logging.info(
+        "User %s replaced PDF for record %s: %s → %s (project %s)",
+        current_user.id if hasattr(current_user, "id") else "anonymous",
+        record_id,
+        old_attachment_key,
+        new_attachment_key,
+        project.project_id,
+    )
+
+    return jsonify({
+        "attachment_key": new_attachment_key,
+        "url": build_reader_url(config, original_id, new_attachment_key),
+    })
+
+
 @bp.route("/projects/<project_id>/get_record", methods=["GET"])
 @login_required
 @project_authorization
@@ -2060,31 +2563,79 @@ def api_get_record(project):  # noqa: F401
     if project.config["review"]["status"] == "finished":
         return jsonify({"result": None, "status": "finished"})
 
-    with project.db as db:
-        pending = db.get_pending(user_id=user_id)
+    settings = _llm_settings(project)
+    prompt_hash = _current_prompt_hash(project)
+    stale_timeout = 86400 if project.config.get("reassign_stale") else 0
 
+    with project.db as db:
+        db.top_up_dispatch(settings["buffer_size"], prompt_hash)
+        pending = db.get_pending(user_id=user_id)
+        if pending.empty and stale_timeout:
+            pending = db.reassign_stale(
+                user_id=user_id, older_than=stale_timeout)
+        if pending.empty:
+            pending = db.checkout_oldest_dispatched(
+                user_id=user_id, stale_timeout=stale_timeout or None)
         if pending.empty:
             try:
                 pending = db.query_top_ranked(user_id=user_id)
             except ValueError:
                 ranking = db.get_last_ranking_table()
                 pool = db.get_pool()
-
                 if not ranking.empty and pool.empty:
                     return jsonify({"result": None, "status": "review"})
-                else:
-                    return jsonify({"result": None, "status": "setup"})
+                return jsonify({"result": None, "status": "setup"})
 
         record_id = int(pending["record_id"].iloc[0])
         item = asdict(db.input.get_records(record_id))
         record_lists = db.get_lists(record_id)
+        tags_form = read_tags_data(db) or []
+        llm_meta = db.get_llm_meta(record_id, prompt_hash)
+        payload_json = db.get_llm_payload(record_id, prompt_hash)
+
+        # When the dispatch status is "ready" but no payload exists for the
+        # current prompt hash, the LLM settings must have changed. Re-queue
+        # every stale dispatch row so the buffer isn't clogged by records
+        # with results that are invisible to the current prompt.
+        if (
+            llm_meta is not None
+            and llm_meta.get("status") == "ready"
+            and payload_json is None
+        ):
+            count = db.requeue_for_prompt_change(prompt_hash)
+            logging.info(
+                "Prompt change detected — re-queued %d records.", count)
+            llm_meta["status"] = "queued"
 
     item["state"] = pending.iloc[0].to_dict()
     item["state"]["lists"] = record_lists
-    item["tags_form"] = read_tags_data(project)
+    item["tags_form"] = tags_form
     item["lists_form"] = read_lists_data(project)
     item["state"]["user"] = None
     del item["state"]["user_id"]
+    item["llm"] = llm_meta
+
+    # Server-side pre-fill: only when a result exists for the current prompt
+    # and the human has no saved input yet.
+    state_tags = item["state"].get("tags")
+    has_tags = (
+        state_tags is not None
+        and not (isinstance(state_tags, float) and math.isnan(state_tags))
+        and state_tags
+    )
+    if payload_json and not has_tags and not record_lists:
+        try:
+            prefill = build_prefill_state(
+                json.loads(payload_json), tags_form, item["lists_form"],
+                uuid_fn=lambda: uuid7())
+            item["state"]["tags"] = prefill["tags"]
+            item["state"]["lists"] = prefill["lists"]
+        except Exception:
+            logging.exception("LLM pre-fill failed for record %s", record_id)
+
+    if llm_meta is None or llm_meta.get("status") != "ready":
+        logging.info("llm buffer-miss: served record %s with status=%s",
+                     record_id, (llm_meta or {}).get("status"))
 
     try:
         item["error"] = project.get_review_error()
@@ -2092,6 +2643,91 @@ def api_get_record(project):  # noqa: F401
         pass
 
     return jsonify({"result": item, "status": "review"})
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/llm", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_record_llm(project, record_id):  # noqa: F401
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        meta = db.get_llm_meta(int(record_id), prompt_hash)
+    return jsonify(meta)
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/reprocess",
+          methods=["POST"])
+@login_required
+@project_authorization
+def api_reprocess_record(project, record_id):  # noqa: F401
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        db.force_requeue(int(record_id), prompt_hash)
+    return jsonify({"success": True})
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/recheck_pdf",
+          methods=["POST"])
+@login_required
+@project_authorization
+def api_recheck_pdf(project, record_id):  # noqa: F401
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        db.force_requeue(int(record_id), prompt_hash)
+    return jsonify({"success": True})
+
+
+@bp.route("/projects/<project_id>/record/<record_id>/apply_llm",
+          methods=["POST"])
+@login_required
+@project_authorization
+def api_apply_llm(project, record_id):  # noqa: F401
+    """Return LLM pre-filled tags and lists for a record, forcing overwrite."""
+    prompt_hash = _current_prompt_hash(project)
+    with project.db as db:
+        payload_json = db.get_llm_payload(int(record_id), prompt_hash)
+    if not payload_json:
+        return jsonify({"message": "No LLM result available"}), 404
+
+    tags_form = read_tags_data(project.db) or []
+    lists_form = read_lists_data(project)
+    prefill = build_prefill_state(
+        json.loads(payload_json), tags_form, lists_form,
+        uuid_fn=lambda: uuid7())
+    return jsonify({"tags": prefill["tags"], "lists": prefill["lists"]})
+
+
+@bp.route("/projects/<project_id>/llm_settings", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_llm_settings(project):  # noqa: F401
+    settings = _llm_settings(project)
+    # Mask the API key — never expose it to the frontend.
+    if settings.get("api_key"):
+        settings["api_key"] = True
+    return jsonify(settings)
+
+
+@bp.route("/projects/<project_id>/llm_settings", methods=["PUT"])
+@login_required
+@project_authorization
+def api_update_llm_settings(project):  # noqa: F401
+    body = request.get_json(silent=True) or {}
+    current = _llm_settings(project)
+    merged = {**current, **{k: body[k] for k in DEFAULT_LLM_SETTINGS
+                            if k in body}}
+    merged["buffer_size"] = max(1, int(merged["buffer_size"]))
+    merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
+    merged["criteria_text"] = str(merged["criteria_text"])
+    merged["api_key"] = str(merged.get("api_key", ""))
+    old_hash = _current_prompt_hash(project)
+    project.update_config(llm=merged)
+    new_hash = _current_prompt_hash(project)
+    if new_hash != old_hash:
+        with project.db as db:
+            n = db.requeue_for_prompt_change(new_hash)
+        logging.info("prompt changed; re-queued %s records", n)
+    return jsonify(_llm_settings(project))
 
 
 @bp.route("/projects/<project_id>/delete", methods=["DELETE"])

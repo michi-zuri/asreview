@@ -18,6 +18,8 @@ import {
   Tooltip,
 } from "@mui/material";
 import EditIcon from "@mui/icons-material/Edit";
+import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import DeleteIcon from "@mui/icons-material/Delete";
 import { ProjectContext } from "context/ProjectContext";
 import { useContext } from "react";
 import { LoadingCardHeader } from "StyledComponents/LoadingCardheader";
@@ -29,6 +31,8 @@ import { useTheme } from "@mui/material/styles";
 import useMediaQuery from "@mui/material/useMediaQuery";
 
 import { useToggle } from "hooks/useToggle";
+
+const nowSeconds = () => Date.now() / 1000;
 
 const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
   const theme = useTheme();
@@ -42,6 +46,9 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
   const [requiredForRelevant, setRequiredForRelevant] = React.useState(
     list ? Boolean(list.required_for_relevant) : false,
   );
+  const [sortedAt, setSortedAt] = React.useState(
+    list ? list.sorted_at || nowSeconds() : nowSeconds(),
+  );
 
   React.useEffect(() => {
     if (open) {
@@ -50,6 +57,7 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
       setRequiredForRelevant(
         list ? Boolean(list.required_for_relevant) : false,
       );
+      setSortedAt(list ? list.sorted_at || nowSeconds() : nowSeconds());
     }
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -75,6 +83,17 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
     },
   );
 
+  const { mutate: deleteMutateList, error: deleteError } = useMutation(
+    ProjectAPI.deleteList,
+    {
+      mutationKey: ["deleteList"],
+      onSuccess: () => {
+        queryClient.invalidateQueries(["fetchLists", { project_id }]);
+        onClose();
+      },
+    },
+  );
+
   const onSave = () => {
     if (list !== null) {
       mutateList({
@@ -84,6 +103,7 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
           name,
           input_helper_text: inputHelperText,
           required_for_relevant: requiredForRelevant,
+          sorted_at: sortedAt,
         },
       });
     } else {
@@ -93,9 +113,17 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
           name,
           input_helper_text: inputHelperText,
           required_for_relevant: requiredForRelevant,
+          sorted_at: sortedAt,
         },
       });
     }
+  };
+
+  const onDelete = () => {
+    deleteMutateList({
+      project_id,
+      list_id: list.id,
+    });
   };
 
   return (
@@ -135,9 +163,34 @@ const MutateListDialog = ({ project_id, open, onClose, list = null }) => {
               label="Require an item to mark a record as relevant"
             />
           </Tooltip>
-          {(createError || mutateError) && (
+          <Stack direction="row" spacing={2} alignItems="center">
+            <Tooltip title="Move to bottom">
+              <Button
+                variant="outlined"
+                startIcon={<ArrowDownwardIcon />}
+                onClick={() => setSortedAt(nowSeconds())}
+              >
+                Move to bottom
+              </Button>
+            </Tooltip>
+            {list !== null && (
+              <Tooltip title="Delete this list">
+                <Button
+                  variant="outlined"
+                  color="error"
+                  startIcon={<DeleteIcon />}
+                  onClick={onDelete}
+                >
+                  Delete list
+                </Button>
+              </Tooltip>
+            )}
+          </Stack>
+          {(createError || mutateError || deleteError) && (
             <Alert severity="error">
-              {createError?.message || mutateError?.message}
+              {createError?.message ||
+                mutateError?.message ||
+                deleteError?.message}
             </Alert>
           )}
         </Stack>

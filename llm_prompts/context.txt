@@ -1,0 +1,86 @@
+
+PROJECT
+  ASReview LAB v3.0.6 fork (repo: michi-zuri/asreview, branch: mama).
+  Flask backend (Python) + React frontend + per-project SQLite databases.
+  We are adding LLM-assisted full-text screening: Claude pre-fills the
+  screening form (label/tag groups + lists) for each PDF, and a HUMAN
+  reviewer always makes the final decision. The LLM never decides
+  autonomously — it only pre-fills a form that a human confirms or edits.
+
+REPOSITORY LAYOUT (this is the git root)
+  /Users/killi/Dev/asreview/asreview
+  Work ONLY inside this tree. The Python package lives at:
+      asreview/                     (the importable package, e.g. asreview.webapp)
+  Key files you will touch or reference:
+      asreview/data/record.py                  Record ORM model
+      asreview/database/database.py            Database class (per-project SQLite)
+      asreview/database/store.py               DataStore (input records)
+      asreview/webapp/_api/projects.py         Flask routes (get_record, labeling, etc.)
+      asreview/webapp/_api/zotero.py           Zotero attachment lookup
+      asreview/webapp/_api/utils.py            read_tags_data, read_lists_data
+  Tests live under (RELATIVE TO THE GIT ROOT above):
+      tests/                                   package-level unit tests
+                                               (database, data, records, etc.)
+      asreview/webapp/tests/test_api/          Flask/API + webapp helper tests
+    Put DB-layer / core-library tests in  tests/<name>.py  (NOT
+    asreview/tests/ — that directory does not exist and breaks `import
+    asreview`). Put webapp/_api helper tests in
+    asreview/webapp/tests/test_api/<name>.py .
+
+HARD RULES
+  1. READ every file named in the task IN FULL before writing anything.
+     Do not guess at APIs, column names, or function signatures — open the
+     file and confirm. If a name in the task does not match the file, STOP
+     and report the mismatch instead of inventing code.
+  2. Change ONLY the files the task names. Do not refactor, reformat, rename,
+     or "improve" unrelated code. Smallest correct change wins.
+  3. Every task ends with a test you write (or extend) and RUN with pytest.
+     Do not report success until the test actually passes. Paste the pytest
+     output. If it fails, fix it or report the failure honestly.
+  4. Match existing conventions: import style, error handling, docstring
+     style (these files use Apache-license headers + numpy-style docstrings).
+  5. UTC for all timestamps. Use datetime.now(timezone.utc).
+  6. No new third-party dependencies unless the task explicitly says so.
+     Mock external HTTP with unittest.mock / pytest monkeypatch — the project
+     does NOT have `responses` or `requests_mock` installed.
+
+FACTS ABOUT THIS CODEBASE (verified — trust these over your assumptions)
+  - The Zotero integration supports GROUP libraries ONLY. Config lives in a
+    per-project zotero.json read by get_zotero_config(); it exposes
+    group_id, group_slug, api_key, recheck_interval. There is NO "user vs
+    group" library-type setting. Do not invent one.
+  - A record's Zotero ITEM key is record.original_id.
+    A record's ATTACHMENT is record.attachment, which holds EITHER a Zotero
+    attachment key OR an ISO-8601 timestamp of the last failed lookup.
+    Use zotero.is_attachment_key(value) to tell them apart.
+  - "Prior irrelevant" means record.included == 0 (Record.included is 0, 1,
+    or None). Screening decisions also exist in the results table
+    (results.label), but the dispatch filter uses record.included == 0.
+  - Saved tags in ASReview are keyed by NUMERIC id, not by export name
+    (see _record_tags_invalid / _tag_is_checked in projects.py). The LLM is
+    asked to return `export` names, so a mapping export->id is required
+    before pre-filling. (Relevant to later tasks, not necessarily this one.)
+  - The label schema the LLM must fill is the BINDING CONTRACT and is built
+    from the DB tables (tag_groups/tag_options via read_tags_data, and
+    list_containers via read_lists_data). A separate human-facing free-text
+    block is only additional context, never the contract.
+  - case_identifiers and issues are LISTS: their items live in the `lists`
+    table; their shape/constraints are defined in `list_containers`.
+  - Background work runs in a STANDALONE process (a socket queue-manager),
+    not asyncio inside Flask. The LLM worker will be a standalone process.
+  - PDFs are sent to Claude as base64 `document` content blocks (NOT the
+    Files API). Model string is exactly: claude-opus-4-8
+  - This fork targets MULTI-USER server installs (AUTHENTICATION=True).
+
+HOW TO RUN TESTS
+  pandas and other deps come from nix via devbox (they are NOT in the plain
+  .venv, and bare `python` is not on PATH). ALWAYS run tests through devbox
+  from the git root:
+      cd /Users/killi/Dev/asreview/asreview
+      devbox run -- python -m pytest tests/<file>.py -q
+  (For webapp tests: devbox run -- python -m pytest
+   asreview/webapp/tests/test_api/<file>.py -q)
+  Run only the test you added/changed; do not run the whole suite.
+========================================================================
+
+

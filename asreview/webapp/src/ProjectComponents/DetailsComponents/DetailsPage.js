@@ -10,6 +10,8 @@ import {
   TagCard,
 } from "ProjectComponents/SetupComponents";
 
+import LlmSettingsCard from "./LlmSettingsCard";
+
 import { ProjectContext } from "context/ProjectContext";
 import { projectModes } from "globals.js";
 
@@ -26,6 +28,7 @@ const DetailsPage = () => {
           {mode !== projectModes.SIMULATION && <HighlightCard />}
           {mode !== projectModes.SIMULATION && <TagCard editable={false} />}
           {mode !== projectModes.SIMULATION && <ListCard editable={false} />}
+          {mode !== projectModes.SIMULATION && <LlmSettingsCard />}
           <ModelCard mode={mode} editable={mode !== projectModes.SIMULATION} />
           <PriorCard mode={mode} editable={mode !== projectModes.SIMULATION} />
         </Stack>

@@ -14,6 +14,7 @@
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -45,6 +46,24 @@ from asreview.webapp._authentication.remote_user_handler import RemoteUserHandle
 from asreview.webapp._entry_points.migrate import MigrationTool
 from asreview.webapp.utils import asreview_path
 
+from flask.json.provider import DefaultJSONProvider
+
+
+def _sanitize_json(obj):
+    """Recursively replace NaN and Infinity with None so the output is valid JSON."""
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    elif isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    return obj
+
+
+class SafeJSONProvider(DefaultJSONProvider):
+    def dumps(self, obj, **kwargs):
+        return json.dumps(_sanitize_json(obj), default=self.default, **kwargs)
+
 
 def create_app(**config_vars):
     """Create a new ASReview webapp.
@@ -74,6 +93,8 @@ def create_app(**config_vars):
     # if there are no cors and config is in debug mode, add default cors
     if app.debug and not app.config.get("CORS_ORIGINS", None):
         app.config["CORS_ORIGINS"] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+    app.json = SafeJSONProvider(app)
 
     CORS(app, supports_credentials=True, expose_headers=["Content-Disposition"])
 

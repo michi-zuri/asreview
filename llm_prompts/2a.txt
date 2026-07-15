@@ -1,0 +1,150 @@
+========================================================================
+TASK 2a — Worker DAO helpers on the Database class
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: Phase 1 (tasks 1a–1e) already merged.
+
+GOAL
+  Add the small SQL methods the LLM worker needs to claim work and record
+  outcomes on the llm_dispatch / llm_results tables. Pure DAO methods on the
+  Database class in asreview/database/database.py. No LLM/network code here.
+
+BEFORE WRITING ANYTHING — read
+  In asreview/database/database.py study:
+    - claim/return patterns using UPDATE ... WHERE (...) RETURNING and how
+      commits are done (see checkout_oldest_dispatched, query_top_ranked).
+    - the llm_dispatch columns (record_id, dispatched_at, status, prompt_hash,
+      attempts, last_error) and llm_results columns (record_id, prompt_hash,
+      model, payload_json, input_tokens, output_tokens, created_at).
+    - `time` (module) is already imported.
+
+WHAT TO IMPLEMENT
+  Add these five methods (place them near top_up_dispatch):
+
+      def claim_next_queued_dispatch(self):
+          """Atomically claim the oldest queued dispatch row.
+
+          Sets its status to 'in_flight' and returns its record_id, or None if
+          no queued rows exist. Concurrency-safe: SQLite serializes writers, so
+          two workers claim different rows.
+          """
+          con = self._conn
+          cur = con.cursor()
+          row = cur.execute(
+              """UPDATE llm_dispatch
+                 SET status = 'in_flight'
+                 WHERE record_id = (
+                     SELECT record_id FROM llm_dispatch
+                     WHERE status = 'queued'
+                     ORDER BY dispatched_at ASC
+                     LIMIT 1
+                 )
+                 RETURNING record_id"""
+          ).fetchone()
+          con.commit()
+          return row[0] if row else None
+
+      def store_llm_result(self, record_id, prompt_hash, model, payload_json,
+                           input_tokens=None, output_tokens=None):
+          """Upsert an llm_results row and mark its dispatch row 'ready'.
+
+          Keyed by (record_id, prompt_hash); re-processing overwrites. Also
+          clears last_error on the dispatch row.
+          """
+          now = time.time()
+          con = self._conn
+          cur = con.cursor()
+          cur.execute(
+              """INSERT INTO llm_results
+                 (record_id, prompt_hash, model, payload_json,
+                  input_tokens, output_tokens, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(record_id, prompt_hash) DO UPDATE SET
+                     model = excluded.model,
+                     payload_json = excluded.payload_json,
+                     input_tokens = excluded.input_tokens,
+                     output_tokens = excluded.output_tokens,
+                     created_at = excluded.created_at""",
+              (record_id, prompt_hash, model, payload_json,
+               input_tokens, output_tokens, now),
+          )
+          cur.execute(
+              "UPDATE llm_dispatch SET status = 'ready', last_error = NULL "
+              "WHERE record_id = ?",
+              (record_id,),
+          )
+          con.commit()
+
+      def mark_dispatch_failed(self, record_id, error):
+          """Set a dispatch row to 'failed' and record last_error."""
+          con = self._conn
+          cur = con.cursor()
+          cur.execute(
+              "UPDATE llm_dispatch SET status = 'failed', last_error = ? "
+              "WHERE record_id = ?",
+              (str(error) if error is not None else None, record_id),
+          )
+          con.commit()
+
+      def mark_dispatch_missing_pdf(self, record_id):
+          """Set a dispatch row to 'missing_pdf'."""
+          con = self._conn
+          cur = con.cursor()
+          cur.execute(
+              "UPDATE llm_dispatch SET status = 'missing_pdf' WHERE record_id = ?",
+              (record_id,),
+          )
+          con.commit()
+
+      def increment_dispatch_attempts(self, record_id):
+          """Increment attempts on a dispatch row; return the new count."""
+          con = self._conn
+          cur = con.cursor()
+          row = cur.execute(
+              "UPDATE llm_dispatch SET attempts = attempts + 1 "
+              "WHERE record_id = ? RETURNING attempts",
+              (record_id,),
+          ).fetchone()
+          con.commit()
+          return row[0] if row else None
+
+  Change no other file.
+
+TEST (write this, then run it)
+  Append to tests/test_llm_db.py (reuse `db`, `db_pool`, `_dispatch_rows`,
+  and add a small status reader if useful):
+
+      def _dispatch_status(db, record_id):
+          cur = db._conn.cursor()
+          r = cur.execute(
+              "SELECT status, last_error, attempts FROM llm_dispatch "
+              "WHERE record_id = ?", (record_id,)
+          ).fetchone()
+          return r  # (status, last_error, attempts)
+
+  Cover:
+    1. claim oldest: db_pool.top_up_dispatch(3, "H"); claim_next_queued_dispatch()
+       returns 0 and record 0's status becomes 'in_flight'.
+    2. claim distinct: a second claim returns 1 (the next oldest), leaving 0
+       'in_flight'.
+    3. claim none: after claiming all queued rows, claim_next_queued_dispatch()
+       returns None.
+    4. store_llm_result: after claiming record 0, store_llm_result(0, "H",
+       "claude-opus-4-8", '{"labels":[]}', 10, 20). An llm_results row exists
+       for (0,"H") with that payload/model/tokens, and dispatch status of 0 is
+       'ready' with last_error NULL.
+    5. store upsert: calling store_llm_result(0, "H", ...new payload...) again
+       overwrites payload_json (still one row for (0,"H")).
+    6. mark_dispatch_failed(1, "boom"): status 'failed', last_error 'boom'.
+    7. mark_dispatch_missing_pdf(2): status 'missing_pdf'.
+    8. increment_dispatch_attempts(1): returns 1, then 2 on a second call.
+
+RUN
+  cd /Users/killi/Dev/asreview/asreview
+  devbox run -- python -m pytest tests/test_llm_db.py -q
+  Paste the full pytest output. Do not report done until green.
+
+DONE WHEN
+  - All five methods exist as specified; no other file changed.
+  - All eight new test cases pass (and earlier LLM-db tests still pass).
+========================================================================

@@ -7,6 +7,8 @@ from pathlib import Path
 from asreview.project.migration.v1v2 import _migrate as _migrate_v1v2
 from asreview.project.migration.v2v3 import _migrate as _migrate_v2v3
 from asreview.project.migration.v2v3 import _validate as _validate_v2v3
+from asreview.project.migration.v3v4 import _migrate as _migrate_v3v4
+from asreview.project.migration.v3v4 import _validate as _validate_v3v4
 
 
 __all__ = ["detect_version", "migrate_project"]
@@ -46,8 +48,8 @@ def migrate_project(folder, src_version, dst_version):
     """
     if src_version < 1:
         raise ValueError("Source version should be at least 1")
-    if dst_version > 3:
-        raise ValueError("Destination version should be at most 3")
+    if dst_version > 4:
+        raise ValueError("Destination version should be at most 4")
     if src_version >= dst_version:
         raise ValueError("Source version should be less than destination version.")
 
@@ -95,6 +97,9 @@ def _migrate_project_one_version(folder, current_version):
     elif current_version == 2:
         migrate = _migrate_v2v3
         validate = _validate_v2v3
+    elif current_version == 3:
+        migrate = _migrate_v3v4
+        validate = _validate_v3v4
     else:
         raise ValueError("Invalid current version.")
 

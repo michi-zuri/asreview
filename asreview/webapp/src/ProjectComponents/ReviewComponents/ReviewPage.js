@@ -1,4 +1,10 @@
-import { Button, Stack, Typography, useMediaQuery } from "@mui/material";
+import {
+  Button,
+  Snackbar,
+  Stack,
+  Typography,
+  useMediaQuery,
+} from "@mui/material";
 import * as React from "react";
 import { useQuery, useQueryClient } from "react-query";
 import { useParams } from "react-router-dom";
@@ -23,6 +29,7 @@ const ReviewPage = () => {
   const { fontSize, modelLogLevel, orientation } = useReviewSettings();
 
   const [tagValues, setTagValues] = React.useState({});
+  const [notice, setNotice] = React.useState(null);
 
   const { data: projectInfo } = useQuery(
     ["fetchProject", { project_id }],
@@ -45,6 +52,24 @@ const ReviewPage = () => {
       refetchIntervalInBackground: true,
     },
   );
+
+  const recordId = data?.result?.record_id;
+
+  // Heartbeat: POST every 60s while a record is open.
+  React.useEffect(() => {
+    if (!recordId) return;
+    const id = setInterval(() => {
+      ProjectAPI.sendHeartbeat({ project_id, record_id: recordId })
+        .then((res) => {
+          if (!res.active) {
+            setNotice("This article was reassigned; loading the next one.");
+            refetch();
+          }
+        })
+        .catch(() => {}); // Silently ignore heartbeat failures
+    }, 10000);
+    return () => clearInterval(id);
+  }, [project_id, recordId, refetch]);
 
   const [showStoppingDialog, setShowStoppingDialog] = React.useState(false);
   const [dismissedThresholdValue, setDismissedThresholdValue] =
@@ -103,6 +128,11 @@ const ReviewPage = () => {
     });
   };
 
+  const handleDiscarded = (message) => {
+    setNotice(message || "This article was reassigned; loading the next one.");
+    afterDecision();
+  };
+
   return (
     <Container
       aria-label="review page"
@@ -134,6 +164,7 @@ const ReviewPage = () => {
               project_id={project_id}
               record={data?.result}
               afterDecision={afterDecision}
+              onDiscarded={handleDiscarded}
               fontSize={fontSize}
               showBorder={showBorder}
               modelLogLevel={modelLogLevel}
@@ -142,6 +173,8 @@ const ReviewPage = () => {
               collapseAbstract={false}
               hotkeys={true}
               hideLinks={projectInfo?.hide_links === true}
+              isOwner={projectInfo?.roles?.owner === true}
+              allowMemberReplace={projectInfo?.allow_member_replace === true}
               landscape={orientation === "landscape" && !landscapeDisabled}
             />
           )}
@@ -196,6 +229,21 @@ const ReviewPage = () => {
           </Button>
         </Alert>
       )}
+
+      <Snackbar
+        open={!!notice}
+        autoHideDuration={6000}
+        onClose={() => setNotice(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert
+          variant="filled"
+          severity="warning"
+          onClose={() => setNotice(null)}
+        >
+          {notice}
+        </Alert>
+      </Snackbar>
     </Container>
   );
 };

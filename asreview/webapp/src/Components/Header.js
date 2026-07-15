@@ -1,6 +1,7 @@
 import { Menu } from "@mui/icons-material";
 import ChevronLeftIcon from "@mui/icons-material/ChevronLeft";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
+import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import {
   AppBar,
   AvatarGroup,
@@ -25,6 +26,7 @@ import { InitialsAvatar } from "StyledComponents/InitialsAvatar";
 import { useToggle } from "hooks/useToggle";
 import { ElasIcon } from "icons";
 import ElasGameDialog from "./ElasGame";
+import CriteriaPanel from "../ProjectComponents/ReviewComponents/CriteriaPanel";
 
 const HeaderTeam = ({ project_id }) => {
   const theme = useTheme();
@@ -83,6 +85,7 @@ const HeaderTeam = ({ project_id }) => {
 
 const Header = ({ toggleNavDrawer, menuOpenButton = true }) => {
   const [openGame, toggleGame] = useToggle();
+  const [openCriteria, toggleCriteria] = useToggle();
   const { project_id } = useParams();
 
   const { pathname } = useLocation();
@@ -134,6 +137,13 @@ const Header = ({ toggleNavDrawer, menuOpenButton = true }) => {
           </Box>
 
           <Box sx={{ display: "flex", alignItems: "center" }}>
+            {project_id && (
+              <Tooltip title="Screening criteria" placement="right">
+                <IconButton onClick={toggleCriteria}>
+                  <LightbulbOutlinedIcon />
+                </IconButton>
+              </Tooltip>
+            )}
             {project_id && isReviewPath && (
               <Tooltip title={"Go on adventure with Elas"} placement={"right"}>
                 <IconButton onClick={toggleGame}>
@@ -153,6 +163,12 @@ const Header = ({ toggleNavDrawer, menuOpenButton = true }) => {
 
       {/* Game */}
       <ElasGameDialog open={openGame} toggleOpen={toggleGame} />
+      {/* Criteria panel */}
+      <CriteriaPanel
+        open={openCriteria}
+        onClose={toggleCriteria}
+        project_id={project_id}
+      />
     </>
   );
 };

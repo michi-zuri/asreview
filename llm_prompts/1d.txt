@@ -1,0 +1,126 @@
+========================================================================
+TASK 1d — DAO: checkout_oldest_dispatched(user_id)  (concurrency-safe)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: tasks 1a, 1b, 1c already merged.
+
+GOAL
+  Add ONE method, checkout_oldest_dispatched, to the Database class in
+  asreview/database/database.py. It assigns the OLDEST dispatched, not-yet-
+  checked-out record (ORDER BY dispatched_at ASC) to a user by creating the
+  record's ``results`` row(s), stamping ``assigned_at`` and ``last_active``.
+  It must be safe under concurrent callers: two users must never check out the
+  same record.
+
+BEFORE WRITING ANYTHING — read query_top_ranked
+  Study query_top_ranked(self) in asreview/database/database.py closely — your
+  method mirrors it, with three differences:
+    (a) the "top" record is chosen from llm_dispatch ordered by dispatched_at
+        (not from last_ranking ordered by ranking),
+    (b) you also set assigned_at and last_active on the inserted rows,
+    (c) on conflict you DO NOTHING (never steal an already-assigned record;
+        stealing is task 1e's job).
+  Reuse the same MODEL_COLUMNS copy-from-last_ranking + group-expansion +
+  RETURNING pattern. `time` (module) and MODEL_COLUMNS are already imported.
+
+WHAT TO IMPLEMENT
+  Add this method (place it near query_top_ranked):
+
+      def checkout_oldest_dispatched(self, user_id):
+          """Check out the oldest dispatched, not-yet-assigned record.
+
+          Selects the record with the smallest ``dispatched_at`` among
+          ``llm_dispatch`` rows with status in (queued, in_flight, ready) that
+          have no ``results`` row yet, and creates ``results`` rows for its
+          whole group assigned to ``user_id`` with ``assigned_at`` and
+          ``last_active`` set to now. Concurrency-safe: the INSERT ... ON
+          CONFLICT DO NOTHING guard means two callers cannot claim the same
+          record (SQLite serializes writers; the second caller sees the first's
+          committed row and picks the next record, or gets nothing).
+
+          Returns
+          -------
+          pandas.DataFrame
+              The user's pending row(s) (same shape as get_pending). Empty when
+              nothing was available to check out.
+          """
+          now = time.time()
+          model_string = ", ".join(MODEL_COLUMNS)
+          top_cols = ", ".join(f"top_record.{c}" for c in MODEL_COLUMNS)
+
+          con = self._conn
+          cur = con.cursor()
+          result = cur.execute(
+              f"""
+              WITH top_record AS (
+                  SELECT last_ranking.*
+                  FROM llm_dispatch
+                  JOIN last_ranking USING (record_id)
+                  LEFT JOIN results ON results.record_id = llm_dispatch.record_id
+                  WHERE llm_dispatch.status IN ('queued', 'in_flight', 'ready')
+                    AND results.record_id IS NULL
+                  ORDER BY llm_dispatch.dispatched_at ASC
+                  LIMIT 1
+              ),
+              group_records AS (
+                  SELECT record.record_id
+                  FROM {self.record_table_name} AS record
+                  WHERE group_id = (
+                      SELECT group_id
+                      FROM {self.record_table_name}
+                      WHERE record_id = (SELECT record_id FROM top_record)
+                  )
+              )
+              INSERT INTO results
+                  (record_id, user_id, assigned_at, last_active, {model_string})
+              SELECT group_records.record_id, :user_id, :now, :now, {top_cols}
+              FROM group_records
+              CROSS JOIN top_record ON TRUE
+              ON CONFLICT(record_id) DO NOTHING
+              RETURNING record_id
+              """,
+              {"user_id": user_id, "now": now},
+          ).fetchone()
+          con.commit()
+
+          if result is None:
+              return self.get_pending(user_id=user_id).iloc[0:0]
+          return self.get_pending(user_id=user_id)
+
+  Change no other file.
+
+TEST (write this, then run it)
+  Append to asreview/tests/test_llm_db.py. Reuse the `db`, `db_pool`,
+  `_dispatch_rows` helpers from earlier tasks. Add a helper if useful:
+
+      def _results_row(db, record_id):
+          cur = db._conn.cursor()
+          return cur.execute(
+              "SELECT user_id, label, assigned_at, last_active "
+              "FROM results WHERE record_id = ?",
+              (record_id,),
+          ).fetchone()
+
+  Cover:
+    1. Checkout returns oldest: on db_pool with top_up_dispatch(3, "H")
+       (dispatch order [0,1,2]), checkout_oldest_dispatched(user_id=1) returns
+       a non-empty DataFrame containing record_id 0; _results_row(db, 0) shows
+       user_id == 1, label is None, and assigned_at and last_active are both
+       not None (floats).
+    2. Distinct records for two users: after user 1 checks out record 0,
+       checkout_oldest_dispatched(user_id=2) returns record 1 (the next
+       oldest), NOT record 0. The two users hold different records.
+    3. No collision on the same record: assert record 0's results row user_id
+       is still 1 after user 2's checkout (user 2 did not steal it).
+    4. Nothing to check out: on a fresh db_pool with NO dispatch rows,
+       checkout_oldest_dispatched(user_id=1) returns an empty DataFrame.
+
+RUN
+  From /Users/killi/Dev/asreview/asreview :
+      pytest asreview/tests/test_llm_db.py -q
+  Paste the full pytest output. Do not report done until green.
+
+DONE WHEN
+  - checkout_oldest_dispatched exists as specified and changes no other file.
+  - All four test cases pass (and earlier LLM-db tests still pass).
+========================================================================

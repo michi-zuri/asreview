@@ -247,7 +247,6 @@ class Simulate:
                     "training_set",
                     "time",
                     "note",
-                    "tags",
                     "user_id",
                 ]
             )
@@ -374,7 +373,6 @@ class Simulate:
                 "training_set": training_set,
                 "time": time.time(),
                 "note": None,
-                "tags": None,
                 "user_id": None,
             }
         )
