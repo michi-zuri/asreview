@@ -25,6 +25,11 @@ global concurrency cap. Each project's Anthropic API key and screening
 criteria are read from its stored LLM settings; the ANTHROPIC_API_KEY
 environment variable is used as a fallback when no per-project key is set.
 
+The worker is a polling daemon — it never accepts inbound requests as part
+of its screening function. When --port is given, a lightweight health check
+HTTP server listens on that port (GET / returns 200) so process monitors
+can verify the worker is alive.
+
 Example NixOS systemd service:
   systemd.services.asreview-llm-worker = {
     description = "ASReview LLM screening worker";
@@ -36,7 +41,7 @@ Example NixOS systemd service:
       ASREVIEW_LLM_MAX_CONCURRENT = "3";
     };
     serviceConfig = {
-      ExecStart = "${pkg}/bin/asreview-llm-worker";
+      ExecStart = "${pkg}/bin/asreview-llm-worker --port 5603";
       EnvironmentFile = config.age.secrets.anthropic.path; # fallback ANTHROPIC_API_KEY
       Restart = "always";
       User = "asreview";
@@ -55,6 +60,9 @@ def main(argv=None):
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-concurrent", type=int, default=None)
     parser.add_argument("--poll-interval", type=float, default=5.0)
+    parser.add_argument("--port", type=int, default=None,
+                        help="Port for the health check HTTP server. "
+                             "No server is started if omitted.")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO
@@ -63,4 +71,5 @@ def main(argv=None):
         model=args.model,
         max_concurrent=args.max_concurrent,
         poll_interval=args.poll_interval,
+        port=args.port,
     )

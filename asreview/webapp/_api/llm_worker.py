@@ -19,9 +19,11 @@ import json
 import logging
 import os
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import anthropic
 
@@ -422,7 +424,30 @@ def run_worker_all(model, executor=None, max_concurrent=3, max_attempts=5):
     return total
 
 
-def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0):
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Minimal handler that responds 200 OK to every request."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}\n')
+
+    def log_message(self, format, *args):
+        logging.debug("health check: %s", args[0])
+
+
+def _start_health_server(port):
+    """Start a health-check HTTP server on *port* in a daemon thread."""
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logging.info("LLM worker health check listening on port %s", port)
+    return server
+
+
+def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0,
+                       port=None):
     """Run the all-projects worker forever with a single global pool.
 
     The one ThreadPoolExecutor(max_concurrent) shared across all projects
@@ -436,6 +461,8 @@ def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0):
         max_concurrent = int(
             os.environ.get("ASREVIEW_LLM_MAX_CONCURRENT", "3")
         )
+    if port is not None:
+        _start_health_server(port)
     logging.info(
         "ASReview LLM worker starting (model=%s, max_concurrent=%s)",
         model, max_concurrent,
