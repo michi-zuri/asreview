@@ -293,14 +293,12 @@ def run_worker_once(project, model, max_concurrent=3, max_attempts=5,
 
     settings = _llm_settings(project)
 
-    # Resolve API key: per-project setting first, env var as fallback.
-    api_key = settings.get("api_key", "") or os.environ.get(
-        "ANTHROPIC_API_KEY", ""
-    )
+    # Resolve API key from per-project setting.
+    api_key = settings.get("api_key", "")
     if not api_key:
         logging.warning(
             "LLM worker: skipping project %s — no API key configured "
-            "(set ANTHROPIC_API_KEY env var or configure per project)",
+            "(configure per project in the UI)",
             project.project_path,
         )
         return 0
@@ -345,14 +343,9 @@ def run_worker_once(project, model, max_concurrent=3, max_attempts=5,
     return len(claimed)
 
 
-def run_worker(project_path, model=None, max_concurrent=None,
+def run_worker(project_path, model="claude-opus-4-8", max_concurrent=3,
                poll_interval=5.0):
     """Continuously drain a project's LLM queue (single-project mode)."""
-    model = model or os.environ.get("ASREVIEW_LLM_MODEL", "claude-opus-4-8")
-    if max_concurrent is None:
-        max_concurrent = int(
-            os.environ.get("ASREVIEW_LLM_MAX_CONCURRENT", "3")
-        )
     with asr.Project(project_path) as project:
         while True:
             n = run_worker_once(
@@ -369,13 +362,9 @@ def main():
     logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser(description="ASReview LLM screening worker")
     ap.add_argument("project_path")
-    ap.add_argument("--model", default=None)
-    ap.add_argument("--max-concurrent", type=int, default=None)
     ap.add_argument("--poll-interval", type=float, default=5.0)
     args = ap.parse_args()
-    run_worker(args.project_path, model=args.model,
-               max_concurrent=args.max_concurrent,
-               poll_interval=args.poll_interval)
+    run_worker(args.project_path, poll_interval=args.poll_interval)
 
 
 if __name__ == "__main__":
@@ -446,21 +435,16 @@ def _start_health_server(port):
     return server
 
 
-def run_worker_service(model=None, max_concurrent=None, poll_interval=5.0,
-                       port=None):
+def run_worker_service(poll_interval=5.0, port=None):
     """Run the all-projects worker forever with a single global pool.
 
-    The one ThreadPoolExecutor(max_concurrent) shared across all projects
-    is what makes ``max_concurrent`` a GLOBAL cap. Only drains; never tops
-    up. Each project's Anthropic API key and screening criteria are read
-    from its stored LLM settings (per-project config), falling back to the
-    ``ANTHROPIC_API_KEY`` environment variable when no key is configured.
+    The one ThreadPoolExecutor shared across all projects provides a global
+    concurrency cap. Only drains; never tops up. Each project's Anthropic
+    API key and screening criteria are read from its stored LLM settings
+    (configured per project in the UI).
     """
-    model = model or os.environ.get("ASREVIEW_LLM_MODEL", "claude-opus-4-8")
-    if max_concurrent is None:
-        max_concurrent = int(
-            os.environ.get("ASREVIEW_LLM_MAX_CONCURRENT", "3")
-        )
+    model = "claude-opus-4-8"
+    max_concurrent = 3
     if port is not None:
         _start_health_server(port)
     logging.info(
