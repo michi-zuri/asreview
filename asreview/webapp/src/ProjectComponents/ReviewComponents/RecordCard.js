@@ -506,6 +506,7 @@ const RecordCard = ({
   transitionSpeed = { enter: 500, exit: 100 },
   landscape = false,
   changeDecision = true,
+  disabled = false,
 }) => {
   const [open, setOpen] = React.useState(true);
   const theme = useTheme();
@@ -560,14 +561,23 @@ const RecordCard = ({
     [highlightAvailable, highlightConfig],
   );
 
+  // Records without a decision (no label) have no model state to report;
+  // showing the "was labeled" alert for them is misleading.
+  const showModelTraining = !(
+    (record?.state?.label === null || record?.state?.label === undefined) &&
+    (record?.state?.querier === null || record?.state?.querier === undefined)
+  );
+
   const styledRepoCard = (
     <Box>
-      <RecordCardModelTraining
-        key={"record-card-model-" + project_id + "-" + record?.record_id}
-        record={record}
-        modelLogLevel={modelLogLevel}
-        sx={{ mb: 3 }}
-      />
+      {showModelTraining && (
+        <RecordCardModelTraining
+          key={"record-card-model-" + project_id + "-" + record?.record_id}
+          record={record}
+          modelLogLevel={modelLogLevel}
+          sx={{ mb: 3 }}
+        />
+      )}
       <Card
         elevation={showBorder ? 4 : 0}
         sx={(theme) => ({
@@ -632,6 +642,7 @@ const RecordCard = ({
               onToggleHighlight={toggleHighlight}
               resetKey={resetKey}
               onDirtyChange={setIsDirty}
+              disabled={disabled}
             />
           </Grid>
         </Grid>

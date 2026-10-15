@@ -2134,6 +2134,89 @@ class Database:
             df_results["tags"] = pd.Series(dtype="object")
         return df_results
 
+    def get_unlabeled_page(self, *, has_note=None, cursor=None, limit=50,
+                           latest_first=True):
+        """Get an ordered page of unlabeled base records (keyset pagination).
+
+        Returns a DataFrame with the same columns as get_results_page
+        (one row per record, results columns NULL when the record has no
+        results row, ``tags`` parsed), ordered by record_id.
+        ``cursor`` is ``(None, record_id)`` of the last row of the previous
+        page (time is always NULL for these rows).
+
+        Parameters
+        ----------
+        has_note : bool | None
+            ``True`` keeps only rows with a note, ``False`` only rows without a
+            note, ``None`` keeps both.
+        cursor : tuple[None, int] | None
+            ``(None, record_id)`` of the last row of the previous page. ``None``
+            starts from the beginning.
+        limit : int
+            Maximum number of rows to return.
+        latest_first : bool
+            Order by descending record_id when ``True`` (most recent first).
+
+        Returns
+        -------
+        pd.DataFrame
+            Up to ``limit`` rows, ordered by record_id, with ``tags`` parsed.
+        """
+        results_columns = [
+            "label",
+            "classifier",
+            "querier",
+            "balancer",
+            "feature_extractor",
+            "training_set",
+            "time",
+            "note",
+            "user_id",
+            "assigned_at",
+            "last_active",
+        ]
+        select = "rec.record_id AS record_id, " + ", ".join(
+            f"r.{col}" for col in results_columns
+        )
+        where = ["rec.duplicate_of IS NULL", "r.label IS NULL"]
+        params = {}
+
+        if has_note is True:
+            where.append("r.note IS NOT NULL")
+        elif has_note is False:
+            where.append("r.note IS NULL")
+
+        if cursor is not None:
+            _, cursor_id = cursor
+            params["cid"] = int(cursor_id)
+            if latest_first:
+                where.append("rec.record_id < :cid")
+            else:
+                where.append("rec.record_id > :cid")
+
+        order_by = "rec.record_id DESC" if latest_first else "rec.record_id ASC"
+        params["limit"] = int(limit)
+
+        df_results = pd.read_sql_query(
+            f"""SELECT {select}
+            FROM {self.record_table_name} AS rec
+            LEFT JOIN results AS r ON r.record_id = rec.record_id
+            WHERE {" AND ".join(where)}
+            ORDER BY {order_by}
+            LIMIT :limit""",
+            self._conn,
+            params=params,
+            dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES,
+        )
+        if not df_results.empty:
+            tags_by_record = self._load_tags(df_results["record_id"].tolist())
+            df_results["tags"] = df_results["record_id"].map(
+                lambda rid: tags_by_record.get(int(rid), [])
+            )
+        else:
+            df_results["tags"] = pd.Series(dtype="object")
+        return df_results
+
     def get_priors(self):
         """Get the record ids of the priors.
 

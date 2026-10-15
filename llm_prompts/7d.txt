@@ -1,0 +1,131 @@
+========================================================================
+TASK 7d — Collections: fourth tab "Unlabeled" (OPTIONAL — do after 7c)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 7c merged.
+
+GOAL
+  The Collections page has three chips: Relevant, Not relevant,
+  Full history. Add a fourth chip "Unlabeled" that lists records that have
+  NO decision yet, with the same Filter popover (Full text, Has abstract,
+  tags, ...) and the same infinite scrolling. Main use: "Unlabeled" +
+  "Full text (Zotero): False" shows articles that still need a PDF before
+  they can be screened.
+
+DEFINITION (decided)
+  Unlabeled = base records (record.duplicate_of IS NULL) that either have
+  no row in `results`, or whose results row has label IS NULL (pending /
+  checked out by a reviewer). The decision filters "Prior knowledge" and
+  "Decisions by <user>" do not apply to unlabeled records: IGNORE them for
+  this subset (do not error). "Contains note" still applies.
+  Order: by record_id, descending when latest_first (the default),
+  ascending otherwise. Unlabeled cards are read-only (no decision menu).
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/database/database.py: get_results_page (whole method),
+    _load_tags, RESULTS_TABLE_COLUMNS_PANDAS_DTYPES, the CREATE TABLE
+    results statement AND any later ALTER TABLE ... results migrations
+    (the table has more columns than the dtype map, e.g. assigned_at,
+    last_active — list them all), record_table_name.
+  - asreview/webapp/_api/projects.py: api_get_labeled (whole function),
+    _labeled_filter_signature, _encode_cursor/_decode_cursor.
+  - asreview/webapp/src/ProjectComponents/HistoryComponents/
+    LabelHistory.js, LabeledRecord.js.
+  - asreview/webapp/src/ProjectComponents/ReviewComponents/RecordCard.js
+    (where record.state.label/time/user are passed to RecordCardLabeler)
+    and RecordCardLabeler.js: find every use of label, labelTime and user
+    and check what happens when label is null and time is null.
+  RecordCard.js / LlmResultCard.js contain the user's uncommitted edits —
+  keep them.
+
+------------------------------------------------------------------------
+PART A — DAO: Database.get_unlabeled_page (database.py, after
+         get_results_page)
+------------------------------------------------------------------------
+    def get_unlabeled_page(self, *, has_note=None, cursor=None, limit=50,
+                           latest_first=True):
+        """Get an ordered page of unlabeled base records (keyset pagination).
+
+        Returns a DataFrame with the same columns as get_results_page
+        (one row per record, results columns NULL when the record has no
+        results row, ``tags`` parsed), ordered by record_id.
+        ``cursor`` is ``(None, record_id)`` of the last row of the previous
+        page (time is always NULL for these rows).
+        """
+  SQL shape (select EVERY results column explicitly, taking record_id from
+  the record table):
+      SELECT rec.record_id AS record_id, r.label, r.classifier, ... all
+             other results columns ...
+      FROM {self.record_table_name} AS rec
+      LEFT JOIN results AS r ON r.record_id = rec.record_id
+      WHERE rec.duplicate_of IS NULL AND r.label IS NULL
+        [AND r.note IS NOT NULL | AND r.note IS NULL]       -- has_note
+        [AND rec.record_id < :cid | > :cid]                 -- cursor
+      ORDER BY rec.record_id DESC|ASC
+      LIMIT :limit
+  Use pd.read_sql_query with dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES and
+  attach tags exactly like get_results_page does.
+
+  DAO test in tests/test_database.py (or wherever get_results_page is
+  tested — grep; extend that file): 5 records; record 0 labeled 1,
+  record 1 labeled 0, record 2 pending (results row, label NULL), records 3
+  and 4 without results rows; make record 4 a duplicate of record 3 if the
+  existing tests show how to set duplicate_of, otherwise skip that part.
+  Expect ids [3, 2] (or [4, 3, 2] without the duplicate) with
+  latest_first=True; paginating with limit=1 and the cursor returns each
+  id exactly once.
+
+------------------------------------------------------------------------
+PART B — route: subset=unlabeled in api_get_labeled
+------------------------------------------------------------------------
+  - In the subset parsing, accept "unlabeled".
+  - In the scan loop, when subset == "unlabeled", call
+    db.get_unlabeled_page(has_note=has_note, cursor=scan_cursor,
+    limit=batch_size, latest_first=latest_first) instead of
+    get_results_page. Everything else (post-scan filters pdf/abstract/tags/
+    invalid_tags, cursor encoding, result building) stays shared.
+  - The existing cursor handling already produces (None, record_id) for
+    rows with NULL time — confirm, don't duplicate it.
+  - Docstring: mention the new subset.
+
+  API test in asreview/webapp/tests/test_api/test_labeled_pagination.py:
+    label 2 records (one 1, one 0). subset=unlabeled returns neither of
+    them and returns per_page items with a next_cursor (the benchmark
+    project has many records). Paging 3 pages with per_page=5 gives 15
+    distinct ids, none of them labeled.
+    With filter="pdf=false": take the FIRST id of the first page, call
+    set_attachment(that_id, "ABCD1234"), request the first page again ->
+    that id is gone and the page is still full.
+    Also assert the raw response body is strict JSON:
+        assert b"NaN" not in resp.data
+    (Python's json accepts NaN, the browser's JSON.parse does not.) If it
+    fails, convert missing values to None for the unlabeled rows before
+    jsonify, minimally.
+
+------------------------------------------------------------------------
+PART C — frontend
+------------------------------------------------------------------------
+  - LabelHistory.js: add a fourth Chip after "Full history":
+        label "Unlabeled", variant filled when label === "unlabeled",
+        onClick setLabel("unlabeled"), color "default".
+    LabeledRecord.js already passes `label` as `subset` — no change there
+    unless reading it proves otherwise.
+  - RecordCard / RecordCardLabeler: for a record with state.label null and
+    state.time null, make sure nothing crashes and no misleading text is
+    shown (e.g. "Invalid date", "Labeled by undefined"). Guard ONLY what
+    your reading shows actually breaks; report what you guarded and why.
+
+------------------------------------------------------------------------
+VERIFY
+------------------------------------------------------------------------
+    devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_labeled_pagination.py <DAO test file> -q'
+    cd asreview/webapp && npm run build
+Paste both outputs. List for the user the manual browser check:
+Collections → "Unlabeled" shows cards without a decision, scrolls
+infinitely, and combines with "Full text (Zotero): False".
+
+DONE WHEN
+  - subset=unlabeled works through the API with pagination and post-scan
+    filters; tests green; build compiles.
+  - The fourth chip exists and the other three behave exactly as before.
+========================================================================

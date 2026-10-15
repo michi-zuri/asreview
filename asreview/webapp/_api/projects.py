@@ -718,11 +718,19 @@ def _record_tags_invalid(saved_tags, tags_form, label=None):
     return False
 
 
+def _is_missing_scalar(value):
+    """Whether ``value`` is a scalar pandas missing marker (NA/NaN)."""
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
 @bp.route("/projects/<project_id>/labeled", methods=["GET"])
 @login_required
 @project_authorization
 def api_get_labeled(project):  # noqa: F401
-    """Get a page of labeled records using keyset (cursor) pagination.
+    """Get a page of labeled (or unlabeled) records using keyset pagination.
 
     Cheap filters (subset, prior, note, user) are pushed into SQL and the page
     is read with ``ORDER BY ... LIMIT n+1`` (the extra row signals whether more
@@ -730,6 +738,11 @@ def api_get_labeled(project):  # noqa: F401
     ``invalid_tags``) and the Zotero ``pdf`` filter are applied as a bounded
     Python scan over the ordered candidates, so the whole table is never loaded
     or parsed at once.
+
+    The ``subset`` "unlabeled" lists base records without a decision (no
+    results row, or a pending row with ``label IS NULL``), ordered by
+    record_id. The "prior" and "user" decision filters do not apply to this
+    subset and are ignored; "note" still applies.
     """
     per_page = request.args.get("per_page", default=50, type=int)
     subset = request.args.get("subset", default="all", type=str)
@@ -870,16 +883,26 @@ def api_get_labeled(project):  # noqa: F401
         has_next = False
 
         while True:
-            page_df = db.get_results_page(
-                label=label,
-                priors=priors,
-                has_note=has_note,
-                include_users=include_users or None,
-                exclude_users=exclude_users or None,
-                cursor=scan_cursor,
-                limit=batch_size,
-                latest_first=latest_first,
-            )
+            if subset == "unlabeled":
+                # Unlabeled records have no decision: order by record_id, and
+                # the prior/user decision filters do not apply.
+                page_df = db.get_unlabeled_page(
+                    has_note=has_note,
+                    cursor=scan_cursor,
+                    limit=batch_size,
+                    latest_first=latest_first,
+                )
+            else:
+                page_df = db.get_results_page(
+                    label=label,
+                    priors=priors,
+                    has_note=has_note,
+                    include_users=include_users or None,
+                    exclude_users=exclude_users or None,
+                    cursor=scan_cursor,
+                    limit=batch_size,
+                    latest_first=latest_first,
+                )
             if page_df.empty:
                 break
 
@@ -921,7 +944,15 @@ def api_get_labeled(project):  # noqa: F401
         result = []
         for state, record in zip(matched, records):
             record_d = asdict(record)
-            record_d["state"] = state.to_dict()
+            state_d = state.to_dict()
+            if subset == "unlabeled":
+                # Results columns are NULL for these rows; JSON cannot carry
+                # NaN/NA, so convert them to None before jsonify.
+                state_d = {
+                    k: (None if _is_missing_scalar(v) else v)
+                    for k, v in state_d.items()
+                }
+            record_d["state"] = state_d
             record_d["state"]["lists"] = lists_by_record.get(
                 int(state["record_id"]), []
             )

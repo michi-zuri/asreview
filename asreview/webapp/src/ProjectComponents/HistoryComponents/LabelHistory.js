@@ -102,6 +102,14 @@ const LabelHistory = ({
                   setLabel("all");
                 }}
               />
+              <Chip
+                label={"Unlabeled"}
+                color="default"
+                variant={label !== "unlabeled" ? "outlined" : "filled"}
+                onClick={() => {
+                  setLabel("unlabeled");
+                }}
+              />
             </Stack>
             {!mobileScreen && showFilter && (
               <Box sx={{ flexGrow: 1, minWidth: "200px" }}>

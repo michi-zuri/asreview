@@ -110,6 +110,59 @@ def test_pdf_filter_reflects_attachment_cache(client, project):
     assert {item["record_id"] for item in r.json["result"]} == {a, b}
 
 
+def test_unlabeled_subset_pagination_and_pdf_filter(client, project):
+    # Label 2 records; they must not appear in the unlabeled subset.
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    ids = [r["record_id"] for r in res.json["result"]][:2]
+    au.label_project_record(client, project, ids[0], label=1)
+    au.label_project_record(client, project, ids[1], label=0)
+
+    r = _labeled(client, project, subset="unlabeled", per_page=5)
+    assert r.status_code == 200
+    page1 = r.json
+    assert len(page1["result"]) == 5
+    assert page1["next_cursor"] is not None
+    assert not ({item["record_id"] for item in page1["result"]} & set(ids))
+
+    # Paging 3 pages of 5 gives 15 distinct ids, none of them labeled.
+    seen = set()
+    cursor = None
+    for _ in range(3):
+        params = {"subset": "unlabeled", "per_page": 5}
+        if cursor:
+            params["cursor"] = cursor
+        page = _labeled(client, project, **params).json
+        for item in page["result"]:
+            assert item["record_id"] not in seen
+            seen.add(item["record_id"])
+            assert item["record_id"] not in ids
+        cursor = page["next_cursor"]
+        assert cursor is not None
+    assert len(seen) == 15
+
+    # filter="pdf=false": giving the first id a PDF removes it from the
+    # first page, which stays full. The body must be strict JSON.
+    r = _labeled(
+        client, project, subset="unlabeled", per_page=5, filter="pdf=false"
+    )
+    assert r.status_code == 200
+    assert b"NaN" not in r.data
+    result = r.json["result"]
+    assert len(result) == 5
+    target = result[0]["record_id"]
+
+    with asr.Project(project.project_path) as asr_project:
+        asr_project.db.input.set_attachment(target, "ABCD1234")
+
+    r = _labeled(
+        client, project, subset="unlabeled", per_page=5, filter="pdf=false"
+    )
+    assert r.status_code == 200
+    new_ids = {item["record_id"] for item in r.json["result"]}
+    assert target not in new_ids
+    assert len(new_ids) == 5
+
+
 def test_invalid_cursor_returns_400(client, project):
     r = _labeled(client, project, cursor="not-a-valid-cursor")
     assert r.status_code == 400

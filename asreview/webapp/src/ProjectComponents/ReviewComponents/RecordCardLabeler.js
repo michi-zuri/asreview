@@ -951,8 +951,9 @@ const RecordCardLabeler = ({
   onToggleHighlight = null,
   resetKey = 0,
   onDirtyChange = null,
+  disabled = false,
 }) => {
-  const [editState] = useToggle(!(label === 1 || label === 0));
+  const [editState] = useToggle(!(label === 1 || label === 0) && !disabled);
   const [showNotesDialog, toggleShowNotesDialog] = useToggle(false);
   const [showTagsDialog, toggleShowTagsDialog] = useToggle(false);
   const [showListsDialog, toggleShowListsDialog] = useToggle(false);

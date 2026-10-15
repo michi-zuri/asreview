@@ -646,6 +646,41 @@ def test_get_unlabeled(db_with_data):
     assert db_with_data.get_unlabeled(groups=True).to_list() == [6, 7, 8, 11, 9, 10]
 
 
+def test_get_unlabeled_page(db):
+    records = [Record(i, "foo") for i in range(5)]
+    db.input.add_records(records)
+    # Record 4 is a duplicate of record 3.
+    db.input.set_groups([(3, 3), (3, 4)])
+    db.label_record(0, 1)
+    db.label_record(1, 0)
+    # Record 2 is pending: results row with label NULL.
+    with db._conn:
+        db._conn.execute("INSERT INTO results (record_id, user_id) VALUES (2, 1)")
+
+    # Same columns as get_results_page; only base, undecided records.
+    page = db.get_unlabeled_page()
+    assert set(page.columns) == set(db.get_results_page().columns)
+    assert page["record_id"].to_list() == [3, 2]
+    assert pd.isna(page.iloc[0]["label"])
+
+    # Ascending order.
+    assert db.get_unlabeled_page(latest_first=False)["record_id"].to_list() == [2, 3]
+
+    # Keyset pagination with limit=1 returns each id exactly once.
+    seen = []
+    cursor = None
+    while True:
+        rows = db.get_unlabeled_page(cursor=cursor, limit=1)
+        if rows.empty:
+            break
+        last = rows.iloc[-1]
+        rid = int(last["record_id"])
+        assert rid not in seen
+        seen.append(rid)
+        cursor = (None, rid)
+    assert seen == [3, 2]
+
+
 def test_get_pending(db_with_data):
     assert db_with_data.get_pending()["record_id"].to_list() == [6, 8]
     assert db_with_data.get_pending(user_id=1)["record_id"].to_list() == [6]
