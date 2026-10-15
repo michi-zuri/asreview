@@ -741,8 +741,9 @@ def api_get_labeled(project):  # noqa: F401
 
     The ``subset`` "unlabeled" lists base records without a decision (no
     results row, or a pending row with ``label IS NULL``), ordered by
-    record_id. The "prior" and "user" decision filters do not apply to this
-    subset and are ignored; "note" still applies.
+    record_id. On this subset the "prior" filter (``is_prior``) refers to the
+    dataset label (``included``) and the user filters mean "assigned to".
+    "note" applies.
     """
     per_page = request.args.get("per_page", default=50, type=int)
     subset = request.args.get("subset", default="all", type=str)
@@ -884,10 +885,14 @@ def api_get_labeled(project):  # noqa: F401
 
         while True:
             if subset == "unlabeled":
-                # Unlabeled records have no decision: order by record_id, and
-                # the prior/user decision filters do not apply.
+                # Unlabeled records have no decision: order by record_id. The
+                # prior filter refers to the dataset label (included), and the
+                # user filters mean "assigned to" here.
                 page_df = db.get_unlabeled_page(
+                    priors=priors,
                     has_note=has_note,
+                    include_users=include_users or None,
+                    exclude_users=exclude_users or None,
                     cursor=scan_cursor,
                     limit=batch_size,
                     latest_first=latest_first,
@@ -982,20 +987,27 @@ def api_get_labeled(project):  # noqa: F401
 @login_required
 @project_authorization
 def api_get_labeled_stats(project):  # noqa: F401
-    """Get all records classified as prior documents"""
+    """Get decision statistics of a project.
+
+    Prior knowledge is defined by the dataset itself: the record table's
+    ``included`` column carries the label the record had on import.
+    """
 
     # Retrieve the include_priors parameter from the request's query.
-    include_priors = request.args.get("priors", True, type=bool)
+    include_priors = request.args.get("priors", "true").lower() == "true"
 
     try:
         with project.db as db:
-            data = db.get_results_table(["label", "querier"])
-        data_prior = data[data["querier"].isnull()]
+            data = db.get_results_table(["record_id", "label"])
+            data = data.merge(
+                db.input[["record_id", "included"]], on="record_id", how="left"
+            )
+        data_prior = data[data["included"].notnull()]
 
-        # If the 'include_priors' flag is set to False, filter out records that have a
-        # query strategy marked as prior.
+        # If the 'include_priors' flag is set to False, filter out records
+        # that carry a prior label in the dataset.
         if not include_priors:
-            data = data[data["querier"] != "prior"]
+            data = data[data["included"].isnull()]
 
         return jsonify(
             {

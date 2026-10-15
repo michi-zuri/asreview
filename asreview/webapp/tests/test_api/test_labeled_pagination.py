@@ -163,6 +163,74 @@ def test_unlabeled_subset_pagination_and_pdf_filter(client, project):
     assert len(new_ids) == 5
 
 
+def test_prior_and_user_filters_on_unlabeled_and_decided(client, project):
+    # The benchmark dataset is fully labeled, so every record carries an
+    # ``included`` value. Override a few records to control the expectations.
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    ids = [r["record_id"] for r in res.json["result"]][:4]
+    au.label_project_record(client, project, ids[0], label=1)
+    au.label_project_record(client, project, ids[1], label=0)
+
+    with asr.Project(project.project_path) as asr_project:
+        db = asr_project.db
+        # ids[0]: manually labeled, no dataset label -> not a prior.
+        # ids[1]: dataset label -> prior even though decided in the app.
+        # ids[2]: dataset label; ids[3]: no dataset label.
+        with db.input.Session() as session, session.begin():
+            session.get(db.input.record_cls, ids[0]).included = None
+            session.get(db.input.record_cls, ids[1]).included = 1
+            session.get(db.input.record_cls, ids[2]).included = 1
+            session.get(db.input.record_cls, ids[3]).included = None
+        # ids[2] is pending and assigned to user 1.
+        with db._conn:
+            db._conn.execute(
+                "INSERT INTO results (record_id, user_id) VALUES (?, ?)",
+                (ids[2], 1),
+            )
+
+    def all_ids(subset, filter=None):
+        params = {"subset": subset, "per_page": 50}
+        if filter:
+            params["filter"] = filter
+        seen = set()
+        cursor = None
+        while True:
+            if cursor:
+                params["cursor"] = cursor
+            r = _labeled(client, project, **params)
+            assert r.status_code == 200
+            page = r.json
+            for item in page["result"]:
+                seen.add(item["record_id"])
+            cursor = page["next_cursor"]
+            if not cursor:
+                return seen
+
+    # is_prior refers to the dataset label, not to results.querier: the
+    # manually labeled relevant record is not a prior.
+    assert all_ids("relevant", "is_prior") == set()
+    assert all_ids("relevant") == {ids[0]}
+    # A decided record with a dataset label is a prior.
+    assert all_ids("irrelevant", "is_prior") == {ids[1]}
+
+    # On the unlabeled subset the same included-based semantics apply.
+    unlabeled_priors = all_ids("unlabeled", "is_prior")
+    assert ids[2] in unlabeled_priors
+    assert ids[3] not in unlabeled_priors
+    unlabeled_no_priors = all_ids("unlabeled", "is_prior=false")
+    assert ids[3] in unlabeled_no_priors
+    assert ids[2] not in unlabeled_no_priors
+
+    # On the unlabeled subset, user filters mean "assigned to": the pending
+    # ids[2] belongs to user 1, ids[3] was never assigned.
+    assigned_to_1 = all_ids("unlabeled", "user_1")
+    assert ids[2] in assigned_to_1
+    assert ids[3] not in assigned_to_1
+    not_assigned_to_1 = all_ids("unlabeled", "user_1=false")
+    assert ids[3] in not_assigned_to_1
+    assert ids[2] not in not_assigned_to_1
+
+
 def test_invalid_cursor_returns_400(client, project):
     r = _labeled(client, project, cursor="not-a-valid-cursor")
     assert r.status_code == 400

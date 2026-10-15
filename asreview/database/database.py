@@ -2019,8 +2019,9 @@ class Database:
             Keep only rows with this label (1 or 0). ``None`` keeps all labeled
             rows.
         priors : bool | None
-            ``True`` keeps only priors (``querier IS NULL``), ``False`` excludes
-            priors, ``None`` keeps both.
+            ``True`` keeps only records that carry a prior label in the dataset
+            (``included`` is not NULL), ``False`` excludes them, ``None`` keeps
+            both.
         has_note : bool | None
             ``True`` keeps only rows with a note, ``False`` only rows without a
             note, ``None`` keeps both.
@@ -2060,10 +2061,20 @@ class Database:
             where.append("label = :label")
             params["label"] = int(label)
 
+        # Prior knowledge is defined by the dataset itself: the record table's
+        # ``included`` column carries the label the record had on import.
         if priors is True:
-            where.append("querier IS NULL")
+            where.append(
+                f"EXISTS (SELECT 1 FROM {self.record_table_name} AS rec "
+                "WHERE rec.record_id = results.record_id "
+                "AND rec.included IS NOT NULL)"
+            )
         elif priors is False:
-            where.append("querier IS NOT NULL")
+            where.append(
+                f"EXISTS (SELECT 1 FROM {self.record_table_name} AS rec "
+                "WHERE rec.record_id = results.record_id "
+                "AND rec.included IS NULL)"
+            )
 
         if has_note is True:
             where.append("note IS NOT NULL")
@@ -2134,8 +2145,9 @@ class Database:
             df_results["tags"] = pd.Series(dtype="object")
         return df_results
 
-    def get_unlabeled_page(self, *, has_note=None, cursor=None, limit=50,
-                           latest_first=True):
+    def get_unlabeled_page(self, *, priors=None, has_note=None,
+                           include_users=None, exclude_users=None,
+                           cursor=None, limit=50, latest_first=True):
         """Get an ordered page of unlabeled base records (keyset pagination).
 
         Returns a DataFrame with the same columns as get_results_page
@@ -2146,9 +2158,19 @@ class Database:
 
         Parameters
         ----------
+        priors : bool | None
+            ``True`` keeps only records that carry a prior label in the dataset
+            (``included`` is not NULL), ``False`` excludes them, ``None`` keeps
+            both.
         has_note : bool | None
             ``True`` keeps only rows with a note, ``False`` only rows without a
             note, ``None`` keeps both.
+        include_users : Iterable[int] | None
+            Keep only rows assigned to one of these users. Rows without a
+            results row (never assigned) are excluded.
+        exclude_users : Iterable[int] | None
+            Exclude rows assigned to these users (rows without a user are
+            kept).
         cursor : tuple[None, int] | None
             ``(None, record_id)`` of the last row of the previous page. ``None``
             starts from the beginning.
@@ -2180,6 +2202,29 @@ class Database:
         )
         where = ["rec.duplicate_of IS NULL", "r.label IS NULL"]
         params = {}
+
+        # Prior knowledge is defined by the dataset itself: the record table's
+        # ``included`` column carries the label the record had on import.
+        if priors is True:
+            where.append("rec.included IS NOT NULL")
+        elif priors is False:
+            where.append("rec.included IS NULL")
+
+        include_users = list(include_users) if include_users else []
+        if include_users:
+            keys = [f":iu{i}" for i in range(len(include_users))]
+            where.append(f"r.user_id IN ({', '.join(keys)})")
+            for k, v in zip(keys, include_users):
+                params[k[1:]] = int(v)
+
+        exclude_users = list(exclude_users) if exclude_users else []
+        if exclude_users:
+            keys = [f":eu{i}" for i in range(len(exclude_users))]
+            # Rows without a results row (never assigned) are kept, mirroring
+            # get_results_page's ``~isin`` behavior for a NULL user_id.
+            where.append(f"(r.user_id IS NULL OR r.user_id NOT IN ({', '.join(keys)}))")
+            for k, v in zip(keys, exclude_users):
+                params[k[1:]] = int(v)
 
         if has_note is True:
             where.append("r.note IS NOT NULL")

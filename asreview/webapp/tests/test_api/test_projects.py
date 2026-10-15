@@ -502,6 +502,46 @@ def test_get_labeled_stats(client, project):
     assert r.json["n_prior"] == 2
 
 
+def test_get_labeled_stats_prior_counts(client, project):
+    # Prior counts follow the dataset label (``included``), not the querier:
+    # both records below were labeled through the API (querier is NULL), but
+    # only the one that still carries a dataset label is a prior.
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    ids = [r["record_id"] for r in res.json["result"]][:2]
+    au.label_project_record(client, project, ids[0], label=1)
+    au.label_project_record(client, project, ids[1], label=0)
+
+    # The benchmark dataset is fully labeled: give ids[0] an exclusion label
+    # and strip ids[1]'s dataset label.
+    with asr.Project(project.project_path) as asr_project:
+        db = asr_project.db
+        with db.input.Session() as session, session.begin():
+            session.get(db.input.record_cls, ids[0]).included = 0
+            session.get(db.input.record_cls, ids[1]).included = None
+
+    r = au.get_labeled_project_data_stats(client, project)
+    assert r.status_code == 200
+    assert r.json["n"] == 2
+    assert r.json["n_inclusions"] == 1
+    assert r.json["n_exclusions"] == 1
+    # ids[0] carries a dataset label and is decided relevant; ids[1] no
+    # longer carries a dataset label.
+    assert r.json["n_prior"] == 1
+    assert r.json["n_prior_inclusions"] == 1
+    assert r.json["n_prior_exclusions"] == 0
+
+    # priors=false keeps only the record without a dataset label.
+    r = client.get(
+        f"/api/projects/{au.get_project_id(project)}/labeled_stats",
+        query_string={"priors": "false"},
+    )
+    assert r.status_code == 200
+    assert r.json["n"] == 1
+    assert r.json["n_inclusions"] == 0
+    assert r.json["n_exclusions"] == 1
+    assert r.json["n_prior"] == 1
+
+
 # Test listing the available algorithms
 def test_list_learners(client, user):
     r = au.get_project_algorithms_options(client)

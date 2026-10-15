@@ -681,6 +681,29 @@ def test_get_unlabeled_page(db):
     assert seen == [3, 2]
 
 
+def test_get_unlabeled_page_filters(db):
+    records = [Record(i, "foo") for i in range(5)]
+    db.input.add_records(records)
+    db.label_record(0, 1)
+    db.label_record(1, 0)
+    # Record 2 is pending and assigned to user 1; records 3 and 4 have no
+    # results row. Only record 2 carries a dataset prior label.
+    with db._conn:
+        db._conn.execute("INSERT INTO results (record_id, user_id) VALUES (2, 1)")
+    with db.input.Session() as session, session.begin():
+        session.get(db.input.record_cls, 2).included = 1
+
+    # is_prior refers to the dataset label (included), not to results.querier.
+    assert db.get_unlabeled_page(priors=True)["record_id"].to_list() == [2]
+    assert db.get_unlabeled_page(priors=False)["record_id"].to_list() == [4, 3]
+
+    # User filters mean "assigned to" for pending rows; records without a
+    # results row are never assigned.
+    assert db.get_unlabeled_page(include_users=[1])["record_id"].to_list() == [2]
+    assert db.get_unlabeled_page(include_users=[2])["record_id"].to_list() == []
+    assert db.get_unlabeled_page(exclude_users=[1])["record_id"].to_list() == [4, 3]
+
+
 def test_get_pending(db_with_data):
     assert db_with_data.get_pending()["record_id"].to_list() == [6, 8]
     assert db_with_data.get_pending(user_id=1)["record_id"].to_list() == [6]
