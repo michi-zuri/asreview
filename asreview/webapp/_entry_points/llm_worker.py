@@ -30,6 +30,11 @@ of its screening function. When --port is given, a lightweight health check
 HTTP server listens on that port (GET / returns 200) so process monitors
 can verify the worker is alive.
 
+By default the worker also refreshes the Zotero full-text cache of every
+project in the background: records whose PDF attachment lookup has failed
+are re-checked at most once per 24 hours. Use --no-zotero-sync to disable
+this.
+
 Example NixOS systemd service:
   systemd.services.asreview-llm-worker = {
     description = "ASReview LLM screening worker";
@@ -59,6 +64,8 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=None,
                         help="Port for the health check HTTP server. "
                              "No server is started if omitted.")
+    parser.add_argument("--no-zotero-sync", action="store_true",
+                        help="Disable the background Zotero full-text sync.")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO
@@ -66,4 +73,5 @@ def main(argv=None):
     run_worker_service(
         poll_interval=args.poll_interval,
         port=args.port,
+        zotero_sync=not args.no_zotero_sync,
     )

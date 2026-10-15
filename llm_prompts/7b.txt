@@ -1,0 +1,206 @@
+========================================================================
+TASK 7b — Background Zotero full-text sync (24 h re-check window)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 7a merged (attachment_check_due, refresh_attachment,
+            BACKGROUND_RECHECK_INTERVAL exist in zotero.py).
+
+WHY
+  The Collections "Full text (Zotero)" filter only knows what is cached in
+  record.attachment. Today that cache is filled only when a record card
+  scrolls into view (or the LLM worker touches the record). So records that
+  were never displayed are wrongly counted as "no full text", and a PDF added
+  to Zotero directly (Zotero desktop, another user) is never noticed.
+  A background sync must walk every record of every project that does NOT
+  yet have an attachment key and refresh it, skipping records whose last
+  failed check is less than 24 h old.
+
+DESIGN (decided — follow it)
+  - New module asreview/webapp/_api/zotero_sync.py (Apache header + module
+    docstring like the sibling modules).
+  - It runs as a DAEMON THREAD inside the existing standalone LLM worker
+    service (asreview/webapp/_api/llm_worker.py :: run_worker_service), so
+    no new process/systemd unit is needed. It must NOT run inside Flask.
+  - It reuses llm_worker.discover_project_paths() to find projects.
+  - Per Zotero request it waits `delay` seconds (default 1.0) to stay well
+    under Zotero's rate limits. On a ZoteroLookupError (network, 429, 5xx)
+    it stops the CURRENT project's pass (logs a warning) and moves on; the
+    next cycle retries. One bad project must never kill the thread.
+  - Order inside a project: never-checked records (attachment None/empty)
+    first, then oldest failed-check timestamp first. Skip duplicates
+    (duplicate_of not null) — the Collections page shows only base records.
+  - Records with an attachment key are never re-checked (out of scope).
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/webapp/_api/zotero.py (after 7a): attachment_check_due,
+    refresh_attachment, get_zotero_config, ZoteroLookupError,
+    BACKGROUND_RECHECK_INTERVAL.
+  - asreview/webapp/_api/llm_worker.py: discover_project_paths,
+    run_worker_all (how a project is opened: `with asr.Project(path) as
+    project`), run_worker_once (open_db(project.db_path) per job, closed in
+    finally), run_worker_service, _start_health_server (daemon-thread
+    pattern).
+  - asreview/webapp/_entry_points/llm_worker.py (CLI flags, description text).
+  - asreview/database/store.py :: __getitem__ (db.input[[cols]] returns a
+    DataFrame ordered by record_id), get_records.
+  - asreview/data/record.py: `duplicate_of`, `original_id`, `attachment`.
+  - tests/test_llm_worker.py (fixtures/style for worker tests).
+
+------------------------------------------------------------------------
+PART A — asreview/webapp/_api/zotero_sync.py
+------------------------------------------------------------------------
+Implement exactly these public functions (numpy docstrings):
+
+  def records_due_for_check(rows, max_age, now=None):
+      """Return record_ids whose attachment lookup is due, in check order.
+
+      rows : iterable of (record_id, original_id, attachment, duplicate_of)
+      Keeps rows with a non-empty original_id, duplicate_of None/NaN, and
+      attachment_check_due(attachment, max_age, now) True.
+      Order: never-checked (attachment None/empty/NaN) first by record_id,
+      then by parsed last-checked time ascending (unparseable timestamps
+      count as never-checked).
+      """
+    Pure function, no DB access — this is what makes it easy to test.
+    pandas gives NaN/None/pd.NA for missing values: treat all of them as
+    missing (use pd.isna on scalars, not `is None`).
+
+  def sync_db_attachments(db, config, max_age=BACKGROUND_RECHECK_INTERVAL,
+                          delay=1.0, sleep=time.sleep):
+      """Refresh the Zotero attachment cache of every due record in `db`.
+
+      Returns the number of Zotero lookups performed.
+      """
+    Steps:
+      1. df = db.input[["record_id", "original_id", "attachment",
+         "duplicate_of"]]; ids = records_due_for_check(df.itertuples(
+         index=False, name=None), max_age).
+         (VERIFIED: all four columns are selectable through db.input;
+          missing duplicate_of comes back as pd.NA, hence pd.isna.)
+      2. For each id: record = db.input.get_records(rid) (re-read: the value
+         may have changed since step 1, e.g. a user just uploaded a PDF).
+         If attachment_check_due(record.attachment, max_age) is now False,
+         skip it without sleeping. Otherwise call
+         refresh_attachment(db, config, record, max_age), count one lookup,
+         then sleep(delay). On ZoteroLookupError: logging.warning and break
+         (stop this project's pass).
+      3. logging.info one summary line: lookups done, how many turned into
+         keys.
+
+  def sync_project_attachments(project_path, max_age=BACKGROUND_RECHECK_INTERVAL,
+                               delay=1.0, sleep=time.sleep):
+      """Refresh the Zotero attachment cache of one project directory.
+
+      Returns 0 without opening the database when Zotero is not configured.
+      """
+    Thin wrapper: config = get_zotero_config(project_path); return 0 if not
+    config.enabled; open the project like run_worker_all does
+    (`with asr.Project(path) as project`), open the DB with
+    open_db(project.db_path), call sync_db_attachments, close the DB in a
+    finally.
+
+  def sync_all_projects(max_age=BACKGROUND_RECHECK_INTERVAL, delay=1.0):
+      """One pass over every project; exceptions per project are logged
+      (logging.exception) and skipped. Returns total lookups."""
+    Use discover_project_paths imported from llm_worker. If that import is
+    circular (llm_worker will import zotero_sync in Part B), import it
+    inside the function body.
+
+  def run_sync_forever(poll_interval=300.0, delay=1.0):
+      """Loop sync_all_projects forever; sleep poll_interval between passes.
+      Catches and logs any exception from a pass so the thread never dies."""
+
+------------------------------------------------------------------------
+PART B — start it from the LLM worker service
+------------------------------------------------------------------------
+In llm_worker.run_worker_service add a keyword argument
+`zotero_sync=True`. When True, before the main loop:
+
+    threading.Thread(
+        target=run_sync_forever, name="zotero-sync", daemon=True
+    ).start()
+    logging.info("Zotero full-text sync thread started")
+
+(`threading` is already imported in llm_worker.py — check.)
+
+In asreview/webapp/_entry_points/llm_worker.py add a flag
+`--no-zotero-sync` (action="store_true") and pass
+`zotero_sync=not args.no_zotero_sync`. Add one paragraph to the
+`description` text saying the worker also refreshes the Zotero full-text
+cache of every project in the background (records without a PDF are
+re-checked at most once per 24 h).
+
+Change nothing else in the worker's LLM logic.
+
+------------------------------------------------------------------------
+TESTS (write, then run)
+------------------------------------------------------------------------
+Create asreview/webapp/tests/test_api/test_zotero_sync.py.
+
+  records_due_for_check (fixed `now`, max_age=86400) — one test with a
+  mixed input where a wrong implementation would differ:
+    rows:
+      (1, "K1", None, None)                       never checked   -> due
+      (2, "K2", "ABCD1234", None)                 has key         -> not due
+      (3, "K3", <now - 23h59m iso>, None)         recent          -> not due
+      (4, "K4", <now - 30h iso>, None)            stale           -> due
+      (5, "K5", <now - 48h iso>, None)            staler          -> due
+      (6, None, None, None)                       no original_id  -> not due
+      (7, "K7", None, 1)                          duplicate       -> not due
+      (8, "K8", float("nan"), float("nan"))       pandas-missing  -> due
+    expected order: [1, 8, 5, 4]
+    (never-checked by record_id, then oldest timestamp first).
+
+  sync_db_attachments with a real Database, built like the `db` fixture in
+  tests/test_llm_worker.py:
+      with asr.Database(Path(tmp_path, "t.db")) as db:
+          db.create_tables()
+          db.input.add_records([
+              Record(0, "d", original_id="ITEMA001"),
+              Record(1, "d", original_id="ITEMB002", attachment=<now-25h iso>),
+              Record(2, "d", original_id="ITEMC003", attachment=<now-1h iso>),
+          ])
+    (Record's positional args are dataset_row, dataset_id — confirm in
+     record.py.) config = ZoteroConfig("1", None, "K", 300).
+    Monkeypatch asreview.webapp._api.zotero.fetch_pdf_attachment_key to
+    return "ABCD1234" for "ITEMA001" and None otherwise, recording the item
+    keys it was called with. Pass sleep=a recorder.
+      - returns 2; fetch called for ITEMA001 and ITEMB002 only (not
+        ITEMC003); sleep called 2 times.
+      - afterwards record 0 has "ABCD1234", record 1 has a timestamp newer
+        than the old one, record 2's timestamp is unchanged.
+      - a second call immediately after returns 0 (24 h window).
+
+  sync_project_attachments(tmp_path) where tmp_path has no zotero.json
+  returns 0 and does not call fetch.
+
+  ZoteroLookupError raised by the first lookup: sync_db_attachments returns
+  after exactly 1 fetch call and no record's attachment changed.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_zotero_sync.py asreview/webapp/tests/test_api/test_zotero.py tests/test_llm_worker.py -q'
+  Also start the service briefly to prove the thread starts and the
+  process does not crash. Write a throwaway script /tmp/start_worker.py:
+      import os, threading
+      threading.Timer(6, lambda: os._exit(0)).start()  # macOS has no `timeout`
+      from asreview.webapp._entry_points.llm_worker import main
+      main(["-v", "--poll-interval", "2"])
+  and run it with an empty projects dir:
+      devbox run -- sh -c 'export ASREVIEW_PATH=$(mktemp -d) && cd /Users/killi/Dev/asreview/asreview && python /tmp/start_worker.py'
+  Delete /tmp/start_worker.py afterwards.
+  Known pre-existing failures (do not fix, do not count against you):
+  test_run_worker_once, test_run_worker_all_drains_all,
+  test_run_worker_all_bad_project_skipped in tests/test_llm_worker.py.
+  Any other failure must be fixed.
+  Paste both outputs (the second should show "Zotero full-text sync thread
+  started" and no traceback).
+
+DONE WHEN
+  - zotero_sync.py exists with the five functions above.
+  - The LLM worker service starts the sync thread by default;
+    --no-zotero-sync disables it.
+  - Records checked within the last 24 h are skipped by the background
+    sync; the on-screen check (7a) still uses 5 minutes.
+  - Tests green; only zotero_sync.py, llm_worker.py,
+    _entry_points/llm_worker.py and the new test file changed.
+========================================================================

@@ -34,6 +34,7 @@ from asreview.webapp._api.zotero import DEFAULT_RECHECK_INTERVAL
 from asreview.webapp._api.zotero import ZoteroLookupError
 from asreview.webapp._api.zotero import is_attachment_key
 from asreview.webapp._api.zotero import refresh_attachment
+from asreview.webapp._api.zotero_sync import run_sync_forever
 from asreview.webapp.utils import asreview_path
 
 
@@ -417,16 +418,24 @@ def _start_health_server(port):
     return server
 
 
-def run_worker_service(poll_interval=5.0, port=None):
+def run_worker_service(poll_interval=5.0, port=None, zotero_sync=True):
     """Run the all-projects worker forever with a single global pool.
 
     The one ThreadPoolExecutor shared across all projects provides a global
     concurrency cap. Only drains; never tops up. Each project's Anthropic
     API key and screening criteria are read from its stored LLM settings
     (configured per project in the UI).
+
+    Unless *zotero_sync* is False, a daemon thread also refreshes the
+    Zotero full-text cache of every project in the background.
     """
     model = "claude-opus-4-8"
     max_concurrent = 3
+    if zotero_sync:
+        threading.Thread(
+            target=run_sync_forever, name="zotero-sync", daemon=True
+        ).start()
+        logging.info("Zotero full-text sync thread started")
     if port is not None:
         _start_health_server(port)
     logging.info(
