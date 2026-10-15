@@ -81,6 +81,16 @@ const ZoteroFullTextButton = ({
   const [replacing, setReplacing] = React.useState(false);
   const queryClient = useQueryClient();
 
+  // The list row was loaded without a PDF, but the live check found
+  // one: refresh the Collections list so a "no full text" filter
+  // drops this record.
+  const listHadPdf = /^[A-Z0-9]{8}$/.test(record?.attachment ?? "");
+  React.useEffect(() => {
+    if (data?.available && !listHadPdf) {
+      queryClient.invalidateQueries(["fetchLabeledRecord", { project_id }]);
+    }
+  }, [data?.available, listHadPdf, project_id, queryClient]);
+
   // Replace confirmation dialog state
   const [replaceDialogOpen, setReplaceDialogOpen] = React.useState(false);
   const [replaceError, setReplaceError] = React.useState(null);
@@ -94,6 +104,7 @@ const ZoteroFullTextButton = ({
       "fetchLlmMeta",
       { project_id, record_id: record?.record_id },
     ]);
+    queryClient.invalidateQueries(["fetchLabeledRecord", { project_id }]);
   };
 
   const handleUpload = (event) => {

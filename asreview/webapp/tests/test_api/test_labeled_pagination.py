@@ -1,5 +1,8 @@
+from datetime import datetime, timezone
+
 import pandas as pd
 
+import asreview as asr
 import asreview.webapp.tests.utils.api_utils as au
 from asreview.webapp._api.projects import (
     _decode_cursor,
@@ -64,6 +67,47 @@ def test_subset_filter_via_keyset(client, project):
     assert {r["record_id"] for r in rel["result"]} == {ids[0], ids[1]}
     irr = _labeled(client, project, subset="irrelevant").json
     assert {r["record_id"] for r in irr["result"]} == {ids[2], ids[3]}
+
+
+def test_pdf_filter_reflects_attachment_cache(client, project):
+    # 3 relevant records + 1 irrelevant.
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    ids = [r["record_id"] for r in res.json["result"]][:4]
+    for rid in ids[:3]:
+        au.label_project_record(client, project, rid, label=1)
+    au.label_project_record(client, project, ids[3], label=0)
+
+    a, b, c, d = ids
+    # A has a PDF (Zotero attachment key), B had a failed lookup (ISO UTC
+    # timestamp), C was never checked, D is the irrelevant record.
+    with asr.Project(project.project_path) as asr_project:
+        db = asr_project.db
+        db.input.set_attachment(a, "ABCD1234")
+        db.input.set_attachment(b, datetime.now(timezone.utc).isoformat())
+        db.input.set_attachment(c, None)
+        db.input.set_attachment(d, None)
+
+    def no_pdf_ids():
+        r = _labeled(client, project, subset="relevant", filter="pdf=false")
+        assert r.status_code == 200
+        result = r.json["result"]
+        # Every returned record carries its attachment cache.
+        for item in result:
+            assert "attachment" in item
+        return {item["record_id"] for item in result}
+
+    # A failed lookup (timestamp) and a never-checked record (None) both
+    # count as "no full text".
+    assert no_pdf_ids() == {b, c}
+
+    # A PDF discovered for B removes it from the "no full text" list.
+    with asr.Project(project.project_path) as asr_project:
+        asr_project.db.input.set_attachment(b, "WXYZ9876")
+    assert no_pdf_ids() == {c}
+
+    # Both records with a PDF show up under filter "pdf".
+    r = _labeled(client, project, subset="relevant", filter="pdf")
+    assert {item["record_id"] for item in r.json["result"]} == {a, b}
 
 
 def test_invalid_cursor_returns_400(client, project):

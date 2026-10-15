@@ -1,0 +1,149 @@
+========================================================================
+TASK 7c — Collections "Full text (Zotero)" filter: reliable, and a record
+          disappears from the "no full text" view once it gets a PDF
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 7a merged. (7b makes the data fresher but is not required to
+            implement or test this task.)
+
+USER GOAL (acceptance criterion for today)
+  On the Collections page, a user selects "Relevant" + filter
+  "Full text (Zotero): False" and sees every relevant article that has no
+  PDF. Each time they upload a PDF to one of those articles (PDF button on
+  the card), that article disappears from the list, so the list shrinks to
+  zero as they work through it. An article that has a PDF must never stay
+  in that list.
+
+DIAGNOSIS (verified by reading the code — trust this)
+  Backend: api_get_labeled in asreview/webapp/_api/projects.py (~line 722)
+    builds pdf_ids = records whose record.attachment is a Zotero key, and
+    "pdf=false" keeps records NOT in that set. That logic is correct for the
+    cached data. Never-checked records (attachment None) count as "no PDF";
+    7b's background sync and the per-card check resolve those. KEEP this
+    semantics: never-checked records are shown as missing until a check
+    proves otherwise (hiding them would hide genuinely missing PDFs).
+  Frontend — the actual bug: the list never refreshes when a record gains
+    a PDF.
+    - asreview/webapp/src/ProjectComponents/HistoryComponents/
+      LabeledRecord.js loads the list with
+      useInfiniteQuery(["fetchLabeledRecord", {project_id, subset, filter}]).
+    - asreview/webapp/src/ProjectComponents/ReviewComponents/RecordCard.js,
+      component ZoteroFullTextButton:
+        * after a successful upload or replace it calls
+          invalidateAttachment(), which invalidates only
+          "fetchRecordAttachment" and "fetchLlmMeta" — NOT
+          "fetchLabeledRecord". So the uploaded card stays in the
+          "no full text" list.
+        * when the card scrolls into view it calls the attachment endpoint,
+          which may DISCOVER a PDF that was added in Zotero directly. The
+          button turns into "PDF available", but the list is not refreshed,
+          so the record stays in the "no full text" list.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - RecordCard.js: the whole ZoteroFullTextButton component (top of file,
+    ~lines 46-330) and how it is rendered.
+  - LabeledRecord.js and LabelHistory.js (same folder as Filter.js).
+  - asreview/webapp/src/api/ProjectAPI.js: fetchLabeledRecord,
+    fetchRecordAttachment, uploadRecordPdf, replaceRecordPdf.
+  - asreview/webapp/_api/projects.py: api_get_labeled.
+  - asreview/webapp/tests/test_api/test_labeled_pagination.py.
+  IMPORTANT: RecordCard.js and LlmResultCard.js already contain the user's
+  own UNCOMMITTED edits (see `git diff`). Keep them. Do not revert,
+  reformat or "clean up" anything you did not need to change.
+
+------------------------------------------------------------------------
+PART A — backend regression test (no backend code change expected)
+------------------------------------------------------------------------
+Add ONE test to asreview/webapp/tests/test_api/test_labeled_pagination.py,
+same style as test_subset_filter_via_keyset:
+  - label 3 records relevant (label=1) and 1 record irrelevant (label=0).
+  - set attachments via
+        asr_project = asr.Project(project.project_path)
+        with asr_project.db as db:
+            db.input.set_attachment(rid, value)
+    (pattern: test_projects.py ~line 643):
+      relevant A -> "ABCD1234" (has PDF)
+      relevant B -> an ISO UTC timestamp (checked, no PDF)
+      relevant C -> None (never checked)
+      irrelevant D -> None
+  - GET labeled with subset=relevant and filter="pdf=false"
+    -> exactly {B, C}.
+  - set_attachment(B, "WXYZ9876")  (what a successful upload stores)
+    -> same request returns exactly {C}.
+  - subset=relevant, filter="pdf" -> exactly {A, B}.
+  - Also assert each returned item has an "attachment" key (the frontend in
+    Part B relies on it). If it does NOT, stop and report — that changes
+    Part B.
+  The `_labeled` helper passes query_string; for the filter param use
+  query_string={"subset": "relevant", "filter": "pdf=false"}.
+  If this test reveals a backend bug, fix it minimally in api_get_labeled
+  and say so in your report.
+
+------------------------------------------------------------------------
+PART B — frontend: refresh the list when a record gains a PDF
+------------------------------------------------------------------------
+All changes in RecordCard.js, inside ZoteroFullTextButton. queryClient is
+already available there (useQueryClient).
+
+  1. In invalidateAttachment(), also invalidate the Collections list:
+         queryClient.invalidateQueries(["fetchLabeledRecord", { project_id }]);
+     react-query v3 matches query keys by prefix/partial object, so this
+     refetches every subset/filter variant of the list (the same call is
+     already used in RecordCardLabeler.js — grep it to confirm the form).
+     Upload and replace both go through invalidateAttachment, so both are
+     covered.
+
+  2. A PDF discovered by the on-screen check must also refresh the list.
+     Add, after the useQuery for fetchRecordAttachment:
+
+         // The list row was loaded without a PDF, but the live check found
+         // one: refresh the Collections list so a "no full text" filter
+         // drops this record.
+         const listHadPdf = /^[A-Z0-9]{8}$/.test(record?.attachment ?? "");
+         React.useEffect(() => {
+           if (data?.available && !listHadPdf) {
+             queryClient.invalidateQueries([
+               "fetchLabeledRecord",
+               { project_id },
+             ]);
+           }
+         }, [data?.available, listHadPdf, project_id, queryClient]);
+
+     (The regex mirrors zotero.ZOTERO_KEY_RE on the backend.) This cannot
+     loop: after the refetch the row carries the key, so listHadPdf becomes
+     true and the effect does nothing.
+
+  Do not change the attachment query's options (staleTime 5 min,
+  triggerOnce, etc.) — that 5-minute behaviour matches the backend's
+  on-screen re-check window.
+
+------------------------------------------------------------------------
+VERIFY
+------------------------------------------------------------------------
+Backend (git root):
+    devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_labeled_pagination.py -q'
+Frontend:
+    cd asreview/webapp && npm run build
+  The build must compile with no new ESLint warnings in RecordCard.js
+  (CRA prints warnings; react-hooks/exhaustive-deps must be satisfied).
+Paste both outputs.
+
+You cannot click through the UI. In your report, list these manual steps
+for the user to confirm in the browser:
+  1. Collections → Relevant → Filter "Full text (Zotero)": False. Note the
+     number of cards.
+  2. On one card, upload a PDF with the PDF button → that card disappears
+     without reloading the page.
+  3. In Zotero itself, attach a PDF to another listed article, wait > 5
+     minutes, reload the Collections page and scroll to that card → it
+     disappears shortly after coming into view.
+  4. Filter "Full text (Zotero)": True → the uploaded articles are listed.
+
+DONE WHEN
+  - The new backend test passes.
+  - Upload/replace and on-screen PDF discovery both invalidate
+    "fetchLabeledRecord".
+  - npm run build compiles; only RecordCard.js and
+    test_labeled_pagination.py changed (plus projects.py only if Part A
+    found a real backend bug).
+========================================================================
