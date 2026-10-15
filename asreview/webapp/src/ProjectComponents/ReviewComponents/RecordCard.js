@@ -91,7 +91,7 @@ const ZoteroFullTextButton = ({
       { project_id, record_id: record?.record_id },
     ]);
     queryClient.invalidateQueries([
-      "fetchRecordLlm",
+      "fetchLlmMeta",
       { project_id, record_id: record?.record_id },
     ]);
   };

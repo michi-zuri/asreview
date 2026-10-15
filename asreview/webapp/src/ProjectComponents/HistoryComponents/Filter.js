@@ -163,11 +163,16 @@ export default function Filter(props) {
       .then((res) => {
         const defs = buildTagFilterDefs(res.data);
         // The "invalid tags" filter is only meaningful when a group can be
-        // invalid: a single-select group (too many selected) or a required
-        // group (no selection).
+        // invalid: a single-select group (too many selected) or a group
+        // required for either decision (no selection). Mirrors the backend
+        // `_record_tags_invalid` rules, which read `required_relevant` /
+        // `required_irrelevant` (there is no `required` field).
         const hasInvalidableGroup =
           Array.isArray(res.data) &&
-          res.data.some((g) => g.single_select || g.required);
+          res.data.some(
+            (g) =>
+              g.single_select || g.required_relevant || g.required_irrelevant,
+          );
         setTagDefs(
           hasInvalidableGroup ? [INVALID_TAGS_FILTER_DEF, ...defs] : defs,
         );

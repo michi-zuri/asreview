@@ -23,6 +23,9 @@ import { useQuery, useQueryClient } from "react-query";
 
 import { ProjectAPI } from "api";
 
+// Statuses in which no further LLM work is scheduled for the record.
+const TERMINAL_STATUSES = ["ready", "failed", "missing_pdf"];
+
 const LlmResultCard = ({
   project_id,
   record_id,
@@ -34,20 +37,19 @@ const LlmResultCard = ({
   const [applyDialogOpen, setApplyDialogOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
 
-  const isTerminal =
-    llm &&
-    (llm.status === "ready" ||
-      llm.status === "failed" ||
-      llm.status === "missing_pdf");
-
   const { data } = useQuery(
     ["fetchLlmMeta", { project_id, record_id }],
     ProjectAPI.fetchLlmMeta,
     {
       initialData: llm,
       enabled: !!llm,
-      refetchInterval: isTerminal ? false : 4000,
       refetchOnWindowFocus: false,
+      // Poll only while the latest known status is non-terminal. Deriving
+      // the interval from the query data (instead of the `llm` prop) means
+      // polling resumes when an invalidation brings in a queued/in_flight
+      // status — e.g. after a PDF upload or replace re-queued the record.
+      refetchInterval: (current) =>
+        current && TERMINAL_STATUSES.includes(current.status) ? false : 4000,
     },
   );
 
