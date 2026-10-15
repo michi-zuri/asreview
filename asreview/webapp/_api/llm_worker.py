@@ -279,7 +279,7 @@ def run_worker_once(project, model, max_concurrent=3, max_attempts=5,
     # Resolve API key from per-project setting.
     api_key = settings.get("api_key", "")
     if not api_key:
-        logging.warning(
+        logging.debug(
             "LLM worker: skipping project %s — no API key configured "
             "(configure per project in the UI)",
             project.project_path,

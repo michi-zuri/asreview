@@ -136,6 +136,15 @@ def sync_db_attachments(db, config, max_age=BACKGROUND_RECHECK_INTERVAL,
         lookups += 1
         if is_attachment_key(value):
             keys += 1
+            logging.info(
+                "Zotero sync: record %s: attachment key resolved via Zotero",
+                rid,
+            )
+        else:
+            logging.info(
+                "Zotero sync: record %s: no PDF attachment found in Zotero",
+                rid,
+            )
         sleep(delay)
 
     logging.info(
@@ -170,6 +179,10 @@ def sync_project_attachments(project_path,
     """
     config = get_zotero_config(project_path)
     if not config.enabled:
+        logging.debug(
+            "Zotero sync: project %s has no Zotero configuration, skipping",
+            project_path,
+        )
         return 0
 
     with asr.Project(project_path) as project:
