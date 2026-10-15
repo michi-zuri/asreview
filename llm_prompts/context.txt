@@ -74,12 +74,14 @@ FACTS ABOUT THIS CODEBASE (verified — trust these over your assumptions)
 
 HOW TO RUN TESTS
   pandas and other deps come from nix via devbox (they are NOT in the plain
-  .venv, and bare `python` is not on PATH). ALWAYS run tests through devbox
-  from the git root:
-      cd /Users/killi/Dev/asreview/asreview
-      devbox run -- python -m pytest tests/<file>.py -q
-  (For webapp tests: devbox run -- python -m pytest
-   asreview/webapp/tests/test_api/<file>.py -q)
+  .venv, and bare `python` is not on PATH). ALWAYS run tests through devbox.
+  devbox.json lives in the PARENT directory and `devbox run` switches the
+  working directory to /Users/killi/Dev/asreview, so cd back into the git
+  root inside the command:
+      devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/<file>.py -q'
+  (For webapp tests use the same form with
+   asreview/webapp/tests/test_api/<file>.py)
+  Wherever a task says `devbox run -- python ...`, use this sh -c form.
   Run only the test you added/changed; do not run the whole suite.
 ========================================================================
 

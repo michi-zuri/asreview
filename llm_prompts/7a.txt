@@ -1,0 +1,281 @@
+========================================================================
+TASK 7a — One shared Zotero attachment-refresh helper with an explicit
+          max-age (5 min on-screen, 24 h background)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: nothing new. Do this before 7b and 7c.
+
+BACKGROUND (verified by reading the code — trust this)
+  record.attachment caches the Zotero full-text lookup:
+    - an 8-char Zotero attachment key  -> full text available
+    - an ISO-8601 UTC timestamp        -> last lookup found NO PDF
+    - None                             -> never checked
+  The same "is the cached value due for a re-check?" logic is currently
+  copy-pasted in TWO places, both using ZoteroConfig.recheck_interval (300 s):
+    1. asreview/webapp/_api/projects.py :: api_get_record_attachment
+       (GET /projects/<id>/record/<rid>/attachment). The frontend calls this
+       when a record card scrolls into the viewport (RecordCard.js,
+       ZoteroFullTextButton, useInView).
+    2. asreview/webapp/_api/llm_worker.py :: _ensure_attachment
+  Task 7b adds a background sync that must use a DIFFERENT max age (24 h).
+  So the logic moves into one helper in zotero.py that takes the max age as
+  an argument. Behaviour of both existing callers must stay the same
+  (they keep using 300 s).
+
+GOAL
+  Add two functions to asreview/webapp/_api/zotero.py and make both existing
+  callers use them. No behaviour change for existing callers, except that a
+  timezone-naive timestamp no longer crashes (it is treated as UTC).
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/webapp/_api/zotero.py (whole file; note __all__, is_attachment_key,
+    fetch_pdf_attachment_key, ZoteroLookupError, DEFAULT_RECHECK_INTERVAL)
+  - asreview/webapp/_api/projects.py :: api_get_record_attachment (~line 2248)
+    and the zotero imports at the top (~lines 85-94)
+  - asreview/webapp/_api/llm_worker.py :: _ensure_attachment and screen_record
+  - asreview/database/store.py :: set_attachment, get_records
+  - asreview/webapp/tests/test_api/test_zotero.py (existing style)
+
+------------------------------------------------------------------------
+PART A — helpers in asreview/webapp/_api/zotero.py
+------------------------------------------------------------------------
+Add `from datetime import datetime, timezone` to the imports.
+Next to DEFAULT_RECHECK_INTERVAL add:
+
+    # The background sync (zotero_sync.py) skips records checked in the last 24 h.
+    BACKGROUND_RECHECK_INTERVAL = 24 * 60 * 60
+
+and update the comment on DEFAULT_RECHECK_INTERVAL to say it is used for
+on-demand checks (record card scrolled into view, LLM worker).
+
+Add both names below to __all__ and implement:
+
+    def attachment_check_due(cached, max_age, now=None):
+        """Return whether a record's Zotero attachment lookup should run.
+
+        Parameters
+        ----------
+        cached : str | None
+            The record's ``attachment`` value.
+        max_age : float
+            Seconds after a failed lookup before it may be repeated.
+        now : datetime, optional
+            Current time (UTC). Defaults to ``datetime.now(timezone.utc)``.
+
+        Returns
+        -------
+        bool
+            False for an attachment key (full text already known).
+            True when never checked, when the value is not a parseable
+            timestamp, or when the last failed lookup is at least
+            ``max_age`` seconds old.
+        """
+        if is_attachment_key(cached):
+            return False
+        if not cached:
+            return True
+        try:
+            last_checked = datetime.fromisoformat(cached)
+        except ValueError:
+            return True
+        if last_checked.tzinfo is None:
+            last_checked = last_checked.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        return (now - last_checked).total_seconds() >= max_age
+
+
+    def refresh_attachment(db, config, record, max_age):
+        """Look up and cache a record's Zotero PDF attachment when due.
+
+        Does nothing (no network call) when Zotero is not configured, the
+        record has no ``original_id``, or ``attachment_check_due`` is False.
+        Otherwise queries Zotero and stores the attachment key, or the current
+        UTC timestamp when Zotero reports no PDF.
+
+        Before storing a "no PDF" timestamp the record is re-read: if a key was
+        stored in the meantime (e.g. by a concurrent PDF upload) it is kept and
+        returned instead of being overwritten.
+
+        Parameters
+        ----------
+        db : asreview.database.Database
+            Open project database (uses ``db.input``).
+        config : ZoteroConfig
+        record : Record
+            Record with ``record_id``, ``original_id`` and ``attachment``.
+        max_age : float
+            See ``attachment_check_due``.
+
+        Returns
+        -------
+        str | None
+            The record's ``attachment`` value after the call.
+
+        Raises
+        ------
+        ZoteroLookupError
+            On a transient lookup failure. Nothing is written in that case.
+        """
+        cached = record.attachment
+        if (
+            not config.enabled
+            or not record.original_id
+            or not attachment_check_due(cached, max_age)
+        ):
+            return cached
+
+        attachment_key = fetch_pdf_attachment_key(config, record.original_id)
+        if attachment_key:
+            db.input.set_attachment(record.record_id, attachment_key)
+            return attachment_key
+
+        current = db.input.get_records(record.record_id).attachment
+        if is_attachment_key(current):
+            return current
+
+        checked_at = datetime.now(timezone.utc).isoformat()
+        db.input.set_attachment(record.record_id, checked_at)
+        return checked_at
+
+  NOTE: refresh_attachment must call fetch_pdf_attachment_key through the
+  module-level name (as written) so tests can monkeypatch
+  `asreview.webapp._api.zotero.fetch_pdf_attachment_key`.
+
+------------------------------------------------------------------------
+PART B — api_get_record_attachment uses the helper (projects.py)
+------------------------------------------------------------------------
+Keep the route, decorators, docstring intent and the `payload(...)` inner
+function and JSON shape EXACTLY as they are. Replace only the body inside
+`with project.db as db:` with:
+
+        record = db.input.get_records(record_id)
+        if record is None:
+            return abort(404)
+
+        try:
+            value = refresh_attachment(
+                db, config, record, DEFAULT_RECHECK_INTERVAL
+            )
+        except ZoteroLookupError:
+            # Transient failure: nothing cached, retried on the next request.
+            value = record.attachment
+
+        if is_attachment_key(value):
+            return payload(
+                True, url=build_reader_url(config, record.original_id, value)
+            )
+        return payload(False, checked_at=value)
+
+Import refresh_attachment and DEFAULT_RECHECK_INTERVAL from
+asreview.webapp._api.zotero using the same one-import-per-line style as the
+existing zotero imports. Remove the `fetch_pdf_attachment_key` import from
+projects.py ONLY if nothing else in projects.py still uses it (grep first).
+Do not remove `datetime`/`timezone` imports — other code in projects.py uses
+them (grep to confirm before touching any import).
+
+(Equivalence check you must reason through: a cached key with Zotero
+disabled still returns available=True with a URL — refresh_attachment
+returns the key unchanged in that case. Same as before.)
+
+------------------------------------------------------------------------
+PART C — llm_worker._ensure_attachment uses the helper
+------------------------------------------------------------------------
+Replace the body of _ensure_attachment(db, resolver, record) with a call to
+
+    refresh_attachment(db, resolver.config, record, DEFAULT_RECHECK_INTERVAL)
+
+wrapped in `try/except ZoteroLookupError: return` (transient failure: do
+nothing, same as today). Keep the two logging.info lines: log
+"attachment key resolved via Zotero" when the returned value is a key that
+differs from the record's original attachment, and "no PDF attachment found
+in Zotero" when the returned value is a new timestamp (differs from the
+original and is not a key). Keep the function name and signature —
+screen_record calls it. Clean up imports that become unused in
+llm_worker.py (check with grep; do not remove anything still used).
+
+------------------------------------------------------------------------
+TESTS (write, then run)
+------------------------------------------------------------------------
+Append to asreview/webapp/tests/test_api/test_zotero.py. Use a fake db —
+no real database needed:
+
+    class _FakeInput:
+        def __init__(self, record):
+            self.record = record
+            self.writes = []
+        def get_records(self, record_id):
+            return self.record
+        def set_attachment(self, record_id, value):
+            self.writes.append((record_id, value))
+            self.record.attachment = value
+
+  with `db = types.SimpleNamespace(input=_FakeInput(record))` and records as
+  `types.SimpleNamespace(record_id=7, original_id="ITEMKEY1", attachment=...)`.
+  Monkeypatch `asreview.webapp._api.zotero.fetch_pdf_attachment_key` with a
+  function that counts its calls.
+
+  Cover (each must be able to FAIL on a plausible wrong implementation):
+    1. attachment_check_due boundaries with a fixed `now`, max_age=300:
+       timestamp 299 s old -> False; 300 s old -> True; 301 s -> True.
+       Same with max_age=86400: 23 h 59 m old -> False, 24 h 1 m -> True.
+    2. attachment_check_due: key "ABCD1234" -> False even with max_age=0;
+       None -> True; "garbage" -> True; naive "2026-01-01T00:00:00" works
+       (no exception) and is treated as UTC.
+    3. refresh_attachment, never checked, fetch returns "ABCD1234":
+       writes the key, returns it, fetch called once.
+    4. refresh_attachment, fetch returns None: writes a parseable UTC
+       timestamp and returns it.
+    5. refresh_attachment, recent timestamp (10 s old), max_age=300:
+       no fetch call, no write, returns the old timestamp.
+       Same record with max_age=5: fetch IS called.
+    6. refresh_attachment, fetch raises ZoteroLookupError: the error
+       propagates and nothing is written.
+    7. Race: fetch returns None but the fake get_records returns a record
+       whose attachment is now "WXYZ9876" (simulate by having the fetch stub
+       set record.attachment = "WXYZ9876" before returning None). Result is
+       "WXYZ9876" and NO timestamp is written.
+    8. Zotero disabled (api_key=None): no fetch call, returns cached value.
+    9. ROUTE test (the viewport contract), using the `client, project`
+       fixtures exactly like asreview/webapp/tests/test_api/
+       test_labeled_pagination.py does. Write
+       {"group_id": "123", "api_key": "KEY"} to
+       Path(project.project_path, "zotero.json"). Pick any record id `rid`
+       and set its original_id in the test (there is no public setter;
+       DataStore.set_attachment in store.py shows the session pattern):
+         asr_project = asr.Project(project.project_path)  # test_projects.py ~643
+         with asr_project.db as db:
+             store = db.input
+             with store.Session() as s, s.begin():
+                 s.get(store.record_cls, rid).original_id = "ITEMKEY1"
+         Do NOT add a setter to store.py for this.
+       Monkeypatch asreview.webapp._api.zotero.fetch_pdf_attachment_key to
+       return None and count calls.
+         GET /api/projects/<id>/record/<rid>/attachment  -> available False,
+             checked_at set, fetch called once.
+         GET again immediately -> fetch NOT called again (5-minute rule).
+         Set the stored timestamp to 6 minutes ago via
+         db.input.set_attachment(rid, <iso>) and GET again -> fetch called.
+       Use au.get_project_id(project) for the URL.
+
+  There are currently NO tests for the attachment route; test 9 is it.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_zotero.py tests/test_llm_worker.py asreview/webapp/tests/test_api/test_pdf_resolver.py -q'
+  Paste the full output. Do not report done until green, EXCEPT these 3
+  tests, which already fail before your change (they still use worker
+  signatures removed in commit d766c75f) — leave them alone:
+    tests/test_llm_worker.py::test_run_worker_once
+    tests/test_llm_worker.py::test_run_worker_all_drains_all
+    tests/test_llm_worker.py::test_run_worker_all_bad_project_skipped
+  Any OTHER failure is yours to fix.
+
+DONE WHEN
+  - attachment_check_due, refresh_attachment, BACKGROUND_RECHECK_INTERVAL
+    exist in zotero.py and are exported in __all__.
+  - api_get_record_attachment and _ensure_attachment contain no copy of the
+    timestamp-age logic any more; both pass DEFAULT_RECHECK_INTERVAL (300).
+  - The route's JSON response is unchanged.
+  - All new tests pass; previously passing tests still pass.
+  - No file other than zotero.py, projects.py, llm_worker.py, test_zotero.py
+    changed.
+========================================================================

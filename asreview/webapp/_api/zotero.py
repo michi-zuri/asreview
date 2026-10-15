@@ -27,8 +27,8 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -38,7 +38,10 @@ __all__ = [
     "ZoteroLookupError",
     "ZoteroUploadError",
     "ZoteroDeleteError",
+    "BACKGROUND_RECHECK_INTERVAL",
     "get_zotero_config",
+    "attachment_check_due",
+    "refresh_attachment",
     "is_attachment_key",
     "fetch_pdf_attachment_key",
     "download_attachment_file",
@@ -91,8 +94,12 @@ ZOTERO_API_BASE = "https://api.zotero.org"
 ZOTERO_WEB_BASE = "https://www.zotero.org"
 ZOTERO_API_VERSION = "3"
 
-# By default re-check items whose full text was previously unavailable every 5 minutes.
+# Re-check interval for on-demand attachment checks (record card scrolled into
+# view, LLM worker): every 5 minutes.
 DEFAULT_RECHECK_INTERVAL = 300
+
+# The background sync (zotero_sync.py) skips records checked in the last 24 h.
+BACKGROUND_RECHECK_INTERVAL = 24 * 60 * 60
 
 
 class ZoteroConfig:
@@ -149,6 +156,94 @@ def is_attachment_key(value):
     timestamp of when the lookup last failed. This distinguishes the two.
     """
     return bool(value) and bool(ZOTERO_KEY_RE.match(value))
+
+
+def attachment_check_due(cached, max_age, now=None):
+    """Return whether a record's Zotero attachment lookup should run.
+
+    Parameters
+    ----------
+    cached : str | None
+        The record's ``attachment`` value.
+    max_age : float
+        Seconds after a failed lookup before it may be repeated.
+    now : datetime, optional
+        Current time (UTC). Defaults to ``datetime.now(timezone.utc)``.
+
+    Returns
+    -------
+    bool
+        False for an attachment key (full text already known).
+        True when never checked, when the value is not a parseable
+        timestamp, or when the last failed lookup is at least
+        ``max_age`` seconds old.
+    """
+    if is_attachment_key(cached):
+        return False
+    if not cached:
+        return True
+    try:
+        last_checked = datetime.fromisoformat(cached)
+    except ValueError:
+        return True
+    if last_checked.tzinfo is None:
+        last_checked = last_checked.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return (now - last_checked).total_seconds() >= max_age
+
+
+def refresh_attachment(db, config, record, max_age):
+    """Look up and cache a record's Zotero PDF attachment when due.
+
+    Does nothing (no network call) when Zotero is not configured, the
+    record has no ``original_id``, or ``attachment_check_due`` is False.
+    Otherwise queries Zotero and stores the attachment key, or the current
+    UTC timestamp when Zotero reports no PDF.
+
+    Before storing a "no PDF" timestamp the record is re-read: if a key was
+    stored in the meantime (e.g. by a concurrent PDF upload) it is kept and
+    returned instead of being overwritten.
+
+    Parameters
+    ----------
+    db : asreview.database.Database
+        Open project database (uses ``db.input``).
+    config : ZoteroConfig
+    record : Record
+        Record with ``record_id``, ``original_id`` and ``attachment``.
+    max_age : float
+        See ``attachment_check_due``.
+
+    Returns
+    -------
+    str | None
+        The record's ``attachment`` value after the call.
+
+    Raises
+    ------
+    ZoteroLookupError
+        On a transient lookup failure. Nothing is written in that case.
+    """
+    cached = record.attachment
+    if (
+        not config.enabled
+        or not record.original_id
+        or not attachment_check_due(cached, max_age)
+    ):
+        return cached
+
+    attachment_key = fetch_pdf_attachment_key(config, record.original_id)
+    if attachment_key:
+        db.input.set_attachment(record.record_id, attachment_key)
+        return attachment_key
+
+    current = db.input.get_records(record.record_id).attachment
+    if is_attachment_key(current):
+        return current
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    db.input.set_attachment(record.record_id, checked_at)
+    return checked_at
 
 
 def fetch_pdf_attachment_key(config, item_key, timeout=10):

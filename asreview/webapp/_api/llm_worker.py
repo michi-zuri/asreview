@@ -17,12 +17,10 @@
 import base64
 import json
 import logging
-import os
 import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import anthropic
@@ -32,11 +30,10 @@ from asreview.database.database import open_db
 from asreview.webapp._api.llm_prompt import build_system_prompt
 from asreview.webapp._api.pdf_resolver import PdfResolver
 from asreview.webapp._api.utils import read_tags_data, read_lists_data
-from asreview.webapp._api.zotero import (
-    ZoteroLookupError,
-    fetch_pdf_attachment_key,
-    is_attachment_key,
-)
+from asreview.webapp._api.zotero import DEFAULT_RECHECK_INTERVAL
+from asreview.webapp._api.zotero import ZoteroLookupError
+from asreview.webapp._api.zotero import is_attachment_key
+from asreview.webapp._api.zotero import refresh_attachment
 from asreview.webapp.utils import asreview_path
 
 
@@ -84,43 +81,28 @@ def _ensure_attachment(db, resolver, record):
 
     Mirrors the logic in ``api_get_record_attachment``.
     """
-    cached = getattr(record, "attachment", None)
+    cached = record.attachment
 
     # Already a valid attachment key — nothing to do.
     if is_attachment_key(cached):
         return
 
-    # Zotero not configured or no original_id — can't look it up.
-    if not resolver.config.enabled or not getattr(record, "original_id", None):
-        return
-
-    # If there is a recent failure timestamp, don't retry yet.
-    if cached is not None:
-        try:
-            last_checked = datetime.fromisoformat(cached)
-        except ValueError:
-            last_checked = None
-        if last_checked is not None:
-            age = (datetime.now(timezone.utc) - last_checked).total_seconds()
-            if age < resolver.config.recheck_interval:
-                return
-
     try:
-        attachment_key = fetch_pdf_attachment_key(
-            resolver.config, record.original_id)
+        value = refresh_attachment(
+            db, resolver.config, record, DEFAULT_RECHECK_INTERVAL
+        )
     except ZoteroLookupError:
         # Transient failure — don't cache anything, retry next time.
         return
 
-    record_id = record.record_id
-    if attachment_key:
-        db.input.set_attachment(record_id, attachment_key)
-        logging.info("record %s: attachment key resolved via Zotero", record_id)
+    if value == cached:
+        return
+
+    if is_attachment_key(value):
+        logging.info("record %s: attachment key resolved via Zotero", record.record_id)
     else:
-        checked_at = datetime.now(timezone.utc).isoformat()
-        db.input.set_attachment(record_id, checked_at)
         logging.info(
-            "record %s: no PDF attachment found in Zotero", record_id)
+            "record %s: no PDF attachment found in Zotero", record.record_id)
 
 
 def screen_record(db, resolver, client, record, prompt, prompt_hash,
