@@ -478,6 +478,7 @@ def test_get_llm_meta_dispatched_only(db_pool):
     assert meta["attempts"] == 0
     assert meta["last_error"] is None
     assert meta["has_result"] is False
+    assert meta["pdf_match"] is None
 
 
 def test_get_llm_meta_with_result(db_pool):
@@ -492,6 +493,33 @@ def test_get_llm_meta_with_result(db_pool):
     assert meta["input_tokens"] == 10
     assert meta["output_tokens"] == 20
     assert isinstance(meta["created_at"], float)
+
+
+def test_get_llm_meta_pdf_match(db_pool):
+    """get_llm_meta exposes pdf_match from the stored payload."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(
+        0, "H", "claude-opus-4-8",
+        '{"pdf_match": {"plausible": false, "issue": "PDF is about Z"},'
+        ' "labels": [], "lists": []}',
+        10, 20,
+    )
+    meta = db_pool.get_llm_meta(0, "H")
+    assert meta["pdf_match"] == {
+        "plausible": False, "issue": "PDF is about Z"}
+
+
+def test_get_llm_meta_pdf_match_missing(db_pool):
+    """A payload without pdf_match yields None; bad JSON never raises."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "H", "claude-opus-4-8", '{"labels":[]}', 10, 20)
+    assert db_pool.get_llm_meta(0, "H")["pdf_match"] is None
+
+    # Invalid JSON in payload_json: no exception, pdf_match is None.
+    db_pool.store_llm_result(0, "H", "claude-opus-4-8", "not json", 10, 20)
+    assert db_pool.get_llm_meta(0, "H")["pdf_match"] is None
 
 
 def test_get_llm_payload(db_pool):

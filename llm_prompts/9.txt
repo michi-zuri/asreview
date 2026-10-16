@@ -1,0 +1,222 @@
+========================================================================
+TASK 9 — Send title + abstract with the PDF; the LLM checks that the PDF
+         plausibly belongs to the article and documents a mismatch
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 7e and 8 merged.
+
+WHY
+  PDFs are attached in Zotero by hand and sometimes belong to a different
+  article (wrong item, same journal issue, supplement only, error page).
+  Today the LLM only receives the PDF, so it happily pre-fills the
+  screening form from the wrong paper — and the form is auto-applied.
+  From now on the LLM also receives the title and abstract stored in
+  ASReview for the record, checks whether the PDF is plausibly the full
+  text of THAT article, and reports a mismatch explicitly.
+
+FACTS (verified by reading the code — trust these)
+  - asreview/webapp/_api/llm_worker.py :: screen_record builds the request:
+      system = prompt  (from llm_prompt.build_system_prompt — shared by all
+                        records of a project; its SHA-256 is prompt_hash)
+      user content = [ _pdf_document_block(pdf_bytes),
+                       {"type": "text",
+                        "text": "Screen this article. Respond with JSON only."} ]
+    It re-reads the record (`record = db.input.get_records(record_id)`)
+    before resolving the PDF, so record.title and record.abstract are
+    available there (Record defaults: title "", abstract "").
+  - The parsed JSON payload is stored verbatim
+    (db.store_llm_result(..., json.dumps(payload), ...)).
+  - llm_mapping.map_llm_payload_to_asreview only reads "labels" and
+    "lists" — confirm it ignores other top-level keys.
+  - db.get_llm_meta(record_id, prompt_hash) (database.py) builds the
+    `llm` object the frontend receives (api_get_record → item["llm"],
+    api_get_record_llm → polling). It does not expose payload content.
+  - LlmResultCard.js case "ready" renders the "complete" box.
+  - Changing PROMPT_TEMPLATE changes prompt_hash for every project. That
+    is INTENDED here (old results lack the check); the existing machinery
+    (the "ready but no payload" block in api_get_record and
+    requeue_for_prompt_change) re-screens unlabeled records. Do not add
+    migration code.
+
+DESIGN (decided — follow it)
+  - Title/abstract go in the per-record USER message, never in the system
+    prompt (the system prompt must stay identical for all records so
+    prompt_hash keeps working).
+  - The JSON response gets a new required top-level key:
+        "pdf_match": {"plausible": true|false, "issue": "<text>"}
+  - The check is lenient: plausible = the PDF is very probably the same
+    work. Minor title differences, a preprint/accepted/published version,
+    a translated title, missing abstract in the PDF, OCR noise: still
+    plausible. Not plausible: a different article, only a supplement /
+    cover page / table of contents / error or login page, or content on a
+    clearly different topic.
+  - When not plausible, the LLM must NOT pre-fill anything: "labels" and
+    "lists" are empty, and "issue" explains clearly what the PDF is
+    instead (its title/authors/topic as far as visible) and what
+    contradicts the record. Rationale: pre-fill is auto-applied; filling
+    the form from the wrong paper is worse than an empty form.
+  - The mismatch is shown to the reviewer in the LLM info box.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/webapp/_api/llm_prompt.py (whole file).
+  - asreview/webapp/_api/llm_worker.py :: screen_record, _pdf_document_block.
+  - asreview/webapp/_api/llm_mapping.py :: map_llm_payload_to_asreview,
+    build_prefill_state.
+  - asreview/database/database.py :: get_llm_meta, store_llm_result.
+  - asreview/webapp/src/ProjectComponents/ReviewComponents/
+    LlmResultCard.js (whole file).
+  - asreview/webapp/tests/test_api/test_llm_prompt.py,
+    tests/test_llm_worker.py, tests/test_llm_db.py.
+  LlmResultCard.js may contain the user's uncommitted edits
+  (`git diff`) — keep them.
+
+------------------------------------------------------------------------
+PART A — system prompt (llm_prompt.py :: PROMPT_TEMPLATE)
+------------------------------------------------------------------------
+  1. In the intro, after "Read the attached PDF ...", add that the user
+     message also contains the title and abstract of the article as
+     stored in the review database, and that the FIRST task is to check
+     that the PDF plausibly is the full text of that article.
+  2. Add "pdf_match" to the "## Response shape" example (remember the
+     template uses doubled braces {{ }} for literal braces):
+         "pdf_match": {{"plausible": true, "issue": ""}},
+  3. Add a section before "## Label groups":
+
+     ## PDF check (do this first)
+     Compare the PDF with the title and abstract given in the user
+     message. Set "pdf_match.plausible" to true when the PDF is very
+     probably the full text of that article. It does not have to match
+     exactly: small title differences, a preprint or accepted-manuscript
+     version, a translated title, or OCR errors are fine. Set it to false
+     when the PDF is a different article, only supplementary material, a
+     cover page, table of contents, or an error/login page, or when its
+     content clearly does not fit the title and abstract.
+     If "plausible" is false:
+     - write in "issue" a short, specific explanation for a human
+       reviewer: what the PDF appears to be (its title, authors or topic
+       as far as visible) and what contradicts the record;
+     - return "labels": [] and "lists": [] (do not pre-fill anything).
+     If "plausible" is true, "issue" is "" (or a brief note if something
+     is slightly off but still plausible).
+     If the record has no abstract, judge from the title alone.
+
+  Keep everything else in the template unchanged.
+
+------------------------------------------------------------------------
+PART B — user message (llm_prompt.py + llm_worker.screen_record)
+------------------------------------------------------------------------
+  Add to llm_prompt.py (exported next to build_system_prompt):
+
+    def build_user_text(title, abstract):
+        """Build the per-record text that accompanies the PDF.
+
+        Gives the LLM the article's title and abstract as stored in
+        ASReview so it can check that the attached PDF belongs to it.
+        """
+        title = (title or "").strip() or "(no title stored)"
+        abstract = (abstract or "").strip() or "(no abstract stored)"
+        return (
+            "The attached PDF is supposed to be the full text of this "
+            "article from the review database:\n\n"
+            f"<record_title>\n{title}\n</record_title>\n"
+            f"<record_abstract>\n{abstract}\n</record_abstract>\n\n"
+            "First check that the PDF plausibly belongs to this article "
+            "(pdf_match), then screen it. Respond with JSON only."
+        )
+
+  In screen_record replace the fixed text block with
+      {"type": "text", "text": build_user_text(record.title, record.abstract)}
+  using the RE-READ record. Keep the document block first. Nothing else
+  in screen_record changes (the repair call stays text-only).
+
+------------------------------------------------------------------------
+PART C — expose the result (database.py :: get_llm_meta)
+------------------------------------------------------------------------
+  When the llm_results row exists, also select payload_json and set
+      meta["pdf_match"] = payload["pdf_match"]
+  only if the payload parses as a dict and payload["pdf_match"] is a dict;
+  otherwise meta["pdf_match"] = None. Never raise on bad JSON (catch
+  ValueError/TypeError). Update the docstring's key list. When no result
+  row exists, set meta["pdf_match"] = None as well, so the key is always
+  present.
+
+------------------------------------------------------------------------
+PART D — frontend (LlmResultCard.js, case "ready")
+------------------------------------------------------------------------
+  If meta.pdf_match?.plausible === false, render at the top of the ready
+  box an MUI <Alert severity="warning"> (Alert is in @mui/material;
+  import it if not yet imported):
+      title line: "The PDF may not belong to this article"
+      body: meta.pdf_match.issue, or "The LLM could not match the PDF to
+            this article's title and abstract." when issue is empty.
+      plus: "No suggestions were pre-filled. Check the PDF attachment and
+            replace it if it is wrong."
+  When plausible is true or pdf_match is missing (old results), render
+  exactly as today. Change nothing else in the card.
+
+------------------------------------------------------------------------
+TESTS (write, then run)
+------------------------------------------------------------------------
+  asreview/webapp/tests/test_api/test_llm_prompt.py:
+    1. build_user_text("A title", "An abstract") contains both strings
+       inside the record_title / record_abstract tags.
+    2. build_user_text("A title", "") and (…, None) contain
+       "(no abstract stored)"; build_user_text(None, None) contains
+       "(no title stored)".
+    3. The system prompt from build_system_prompt contains "pdf_match"
+       and does NOT depend on any record: two calls with identical forms
+       give the same hash (existing determinism test may already cover
+       this — extend it, don't duplicate).
+
+  tests/test_llm_worker.py (extend test_happy_path or add one next to it,
+  same fixtures): put a record with title "Effects of X on Y" and
+  abstract "We studied X." into the db (the `db` fixture adds Record(0,
+  "d"); build your own fixture/record the same way with title= and
+  abstract= kwargs). Run screen_record with the Mock client and assert on
+  client.messages.create.call_args:
+    - user content[0] is the document block,
+    - user content[1]["text"] contains "Effects of X on Y" and
+      "We studied X.",
+    - the `system` argument does NOT contain the title (it must stay
+      record-independent).
+  And one test where the client returns
+    {"pdf_match": {"plausible": false, "issue": "PDF is about Z"},
+     "labels": [], "lists": []}
+  → status "ready" and the stored payload_json contains the pdf_match.
+
+  tests/test_llm_db.py: get_llm_meta returns
+    - pdf_match == {"plausible": False, "issue": "PDF is about Z"} for a
+      stored payload with that key,
+    - pdf_match is None for a payload without it,
+    - pdf_match is None (no exception) when payload_json is not valid
+      JSON (insert it via store_llm_result with a raw string),
+    - pdf_match is None when there is a dispatch row but no result row.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_llm_prompt.py asreview/webapp/tests/test_api/test_llm_mapping.py tests/test_llm_worker.py tests/test_llm_db.py -q'
+  Run tests/test_llm_worker.py BEFORE your change too and note which
+  tests already fail; your change must not add failures.
+  Frontend: cd asreview/webapp && npm run build (must compile, no new
+  ESLint warnings in LlmResultCard.js).
+  Paste all outputs.
+
+  In your report, list this manual check for the user (needs a project
+  with an API key and Zotero):
+    a. Attach a deliberately WRONG PDF to an article in Zotero, let it be
+       screened → the LLM box shows the warning with a concrete
+       explanation, and the form is not pre-filled.
+    b. A correct PDF → no warning, form pre-filled as before.
+    c. Expect every unlabeled, already-screened record to be re-screened
+       once (the system prompt changed, so prompt_hash changed). This
+       costs API tokens.
+
+DONE WHEN
+  - Title and abstract are sent in the user message next to the PDF; the
+    system prompt stays record-independent.
+  - The prompt instructs a lenient plausibility check, pdf_match in the
+    response, and no pre-fill on a mismatch with a clear "issue".
+  - get_llm_meta exposes pdf_match; the info box warns on a mismatch.
+  - Tests green (except pre-existing failures), build compiles.
+  - Only llm_prompt.py, llm_worker.py, database.py, LlmResultCard.js and
+    the three test files changed.
+========================================================================

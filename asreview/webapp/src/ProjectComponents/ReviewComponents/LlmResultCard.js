@@ -4,6 +4,7 @@ import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import PictureAsPdfOffIcon from "@mui/icons-material/PictureAsPdf";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import {
+  Alert,
   Box,
   Button,
   Card,
@@ -146,8 +147,25 @@ const LlmResultCard = ({
         const dispatchedTime = meta.dispatched_at
           ? new Date(meta.dispatched_at * 1000).toLocaleString()
           : null;
+        const pdfMismatch =
+          meta.pdf_match?.plausible === false ? meta.pdf_match : null;
         return (
           <Stack spacing={0.5}>
+            {pdfMismatch && (
+              <Alert severity="warning">
+                <Typography variant="body2" fontWeight="medium">
+                  The PDF may not belong to this article
+                </Typography>
+                <Typography variant="body2">
+                  {pdfMismatch.issue ||
+                    "The LLM could not match the PDF to this article's title and abstract."}
+                </Typography>
+                <Typography variant="body2">
+                  No suggestions were pre-filled. Check the PDF attachment and
+                  replace it if it is wrong.
+                </Typography>
+              </Alert>
+            )}
             <Stack direction="row" spacing={1} alignItems="center">
               <CheckCircleOutlineIcon fontSize="small" color="success" />
               <Typography variant="body2" fontWeight="medium">

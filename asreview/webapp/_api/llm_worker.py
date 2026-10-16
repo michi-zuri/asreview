@@ -28,6 +28,7 @@ import anthropic
 import asreview as asr
 from asreview.database.database import open_db
 from asreview.webapp._api.llm_prompt import build_system_prompt
+from asreview.webapp._api.llm_prompt import build_user_text
 from asreview.webapp._api.pdf_resolver import PdfResolver
 from asreview.webapp._api.utils import read_tags_data, read_lists_data
 from asreview.webapp._api.zotero import DEFAULT_RECHECK_INTERVAL
@@ -157,7 +158,7 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
     user_content = [
         _pdf_document_block(pdf_bytes),
         {"type": "text",
-         "text": "Screen this article. Respond with JSON only."},
+         "text": build_user_text(record.title, record.abstract)},
     ]
 
     # 3. First call (transient errors propagate to the caller).

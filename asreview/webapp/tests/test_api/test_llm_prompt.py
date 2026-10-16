@@ -1,6 +1,7 @@
 import hashlib
 
 from asreview.webapp._api.llm_prompt import build_system_prompt
+from asreview.webapp._api.llm_prompt import build_user_text
 
 TAGS = [
     {
@@ -76,6 +77,7 @@ def test_contract_present():
     assert "case_identifiers" in prompt
     assert "labels" in prompt
     assert "lists" in prompt
+    assert "pdf_match" in prompt
     assert "Use export identifiers only." in prompt
 
 
@@ -94,11 +96,30 @@ def test_criteria_absent():
 
 
 def test_determinism():
-    """Same inputs yield identical prompt and hash."""
+    """Same inputs yield identical prompt and hash.
+
+    The prompt takes no record data — title and abstract travel in the
+    per-record user message (build_user_text) — so the same hash is shared
+    by every record of a project.
+    """
     p1, h1 = build_system_prompt(TAGS, LISTS, "Goal text")
     p2, h2 = build_system_prompt(TAGS, LISTS, "Goal text")
     assert p1 == p2
     assert h1 == h2
+
+
+def test_build_user_text_contains_title_and_abstract():
+    """Title and abstract appear inside their tags in the user message."""
+    text = build_user_text("A title", "An abstract")
+    assert "<record_title>\nA title\n</record_title>" in text
+    assert "<record_abstract>\nAn abstract\n</record_abstract>" in text
+
+
+def test_build_user_text_missing_fields():
+    """Empty or None title/abstract produce explicit placeholders."""
+    assert "(no abstract stored)" in build_user_text("A title", "")
+    assert "(no abstract stored)" in build_user_text("A title", None)
+    assert "(no title stored)" in build_user_text(None, None)
 
 
 def test_hash_sensitivity():

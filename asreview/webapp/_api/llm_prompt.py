@@ -22,12 +22,16 @@ systematic review.
 
 Read the attached PDF and PRE-FILL a screening form for a human reviewer. You \
 do NOT make the final decision; a human always confirms or corrects your \
-answers. Fill the form as accurately as a careful human reviewer would.
+answers. Fill the form as accurately as a careful human reviewer would. The \
+user message also contains the title and abstract of the article as stored in \
+the review database. Your FIRST task is to check that the attached PDF \
+plausibly is the full text of that article.
 
 Respond with ONLY a single JSON object. No prose, and no markdown code fences.
 
 ## Response shape
 {{
+  "pdf_match": {{"plausible": true, "issue": ""}},
   "labels": [
     {{"group": "<group_export>", "values": [
       {{"checked": "<option_export>"}},
@@ -49,6 +53,23 @@ Rules:
   satisfies all of them; otherwise leave that group unsatisfied.
 - Add `text` only for options whose `free_text` is true.
 - For each list include only the items that apply; use an empty list when none.
+
+## PDF check (do this first)
+Compare the PDF with the title and abstract given in the user message. Set \
+"pdf_match.plausible" to true when the PDF is very probably the full text of \
+that article. It does not have to match exactly: small title differences, a \
+preprint or accepted-manuscript version, a translated title, or OCR errors are \
+fine. Set it to false when the PDF is a different article, only supplementary \
+material, a cover page, table of contents, or an error/login page, or when its \
+content clearly does not fit the title and abstract.
+If "plausible" is false:
+- write in "issue" a short, specific explanation for a human reviewer: what \
+the PDF appears to be (its title, authors or topic as far as visible) and what \
+contradicts the record;
+- return "labels": [] and "lists": [] (do not pre-fill anything).
+If "plausible" is true, "issue" is "" (or a brief note if something is \
+slightly off but still plausible).
+If the record has no abstract, judge from the title alone.
 
 ## Label groups (BINDING CONTRACT)
 {label_groups_json}
@@ -134,3 +155,21 @@ def build_system_prompt(tags_form, lists_form, criteria_text=None):
     prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
     return prompt, prompt_hash
+
+
+def build_user_text(title, abstract):
+    """Build the per-record text that accompanies the PDF.
+
+    Gives the LLM the article's title and abstract as stored in
+    ASReview so it can check that the attached PDF belongs to it.
+    """
+    title = (title or "").strip() or "(no title stored)"
+    abstract = (abstract or "").strip() or "(no abstract stored)"
+    return (
+        "The attached PDF is supposed to be the full text of this "
+        "article from the review database:\n\n"
+        f"<record_title>\n{title}\n</record_title>\n"
+        f"<record_abstract>\n{abstract}\n</record_abstract>\n\n"
+        "First check that the PDF plausibly belongs to this article "
+        "(pdf_match), then screen it. Respond with JSON only."
+    )

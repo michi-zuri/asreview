@@ -88,6 +88,65 @@ def test_happy_path(db, tmp_path):
     assert last_error is None
 
 
+def test_user_message_sends_title_and_abstract(tmp_path):
+    """The document block is followed by the record's title + abstract;
+    the system prompt stays record-independent."""
+    with asr.Database(Path(tmp_path, "t2.db")) as db:
+        db.create_tables()
+        db.input.add_records([
+            Record(0, "d", title="Effects of X on Y",
+                   abstract="We studied X.")
+        ])
+        db.add_last_ranking([0], "nb", "max", "balanced", "tfidf", 0)
+        db.top_up_dispatch(1, "H")
+        pdf = tmp_path / "x.pdf"
+        pdf.write_bytes(b"%PDF-1.7")
+        resolver = FakeResolver(pdf)
+        client = mock.MagicMock()
+        client.messages.create.return_value = make_response(
+            '{"labels":[],"lists":[]}'
+        )
+
+        result = llm_worker.screen_record(
+            db, resolver, client, fake_record(), "prompt text", "H",
+            "claude-opus-4-8",
+        )
+
+        assert result == "ready"
+        kwargs = client.messages.create.call_args.kwargs
+        content = kwargs["messages"][0]["content"]
+        assert content[0]["type"] == "document"
+        assert content[0]["source"]["media_type"] == "application/pdf"
+        assert "Effects of X on Y" in content[1]["text"]
+        assert "We studied X." in content[1]["text"]
+        assert "Effects of X on Y" not in kwargs["system"]
+
+
+def test_pdf_mismatch_payload_stored(db, tmp_path):
+    """A pdf_match=false payload is stored verbatim and marks 'ready'."""
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.7")
+    resolver = FakeResolver(pdf)
+    client = mock.MagicMock()
+    client.messages.create.return_value = make_response(
+        '{"pdf_match": {"plausible": false, "issue": "PDF is about Z"},'
+        ' "labels": [], "lists": []}'
+    )
+
+    result = llm_worker.screen_record(
+        db, resolver, client, fake_record(), "prompt", "H", "claude-opus-4-8",
+    )
+
+    assert result == "ready"
+    row = _llm_result(db, 0, "H")
+    assert row is not None
+    stored = json.loads(row[0])
+    assert stored["pdf_match"] == {
+        "plausible": False, "issue": "PDF is about Z"}
+    assert stored["labels"] == []
+    assert stored["lists"] == []
+
+
 def test_fenced_json_tolerated(db, tmp_path):
     """Fenced JSON (```json ... ```) is parsed correctly."""
     pdf = tmp_path / "x.pdf"

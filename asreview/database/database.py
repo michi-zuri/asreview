@@ -1193,8 +1193,10 @@ class Database:
         """Return combined dispatch+result metadata for a record, or None.
 
         Keys: status, dispatched_at, attempts, last_error (from llm_dispatch);
-        has_result (bool, whether an llm_results row exists for prompt_hash)
-        and, when present, model, input_tokens, output_tokens, created_at.
+        has_result (bool, whether an llm_results row exists for prompt_hash),
+        pdf_match (dict or None, the "pdf_match" object from the stored
+        payload, if any) and, when present, model, input_tokens,
+        output_tokens, created_at.
         """
         cur = self._conn.cursor()
         d = cur.execute(
@@ -1204,15 +1206,25 @@ class Database:
         if d is None:
             return None
         meta = {"status": d[0], "dispatched_at": d[1], "attempts": d[2],
-                "last_error": d[3], "has_result": False}
+                "last_error": d[3], "has_result": False, "pdf_match": None}
         r = cur.execute(
-            "SELECT model, input_tokens, output_tokens, created_at "
+            "SELECT model, input_tokens, output_tokens, created_at, "
+            "payload_json "
             "FROM llm_results WHERE record_id = ? AND prompt_hash = ?",
             (record_id, prompt_hash),
         ).fetchone()
         if r is not None:
             meta.update(has_result=True, model=r[0], input_tokens=r[1],
                         output_tokens=r[2], created_at=r[3])
+            try:
+                payload = json.loads(r[4])
+                pdf_match = payload.get("pdf_match") \
+                    if isinstance(payload, dict) else None
+                if not isinstance(pdf_match, dict):
+                    pdf_match = None
+            except (ValueError, TypeError):
+                pdf_match = None
+            meta["pdf_match"] = pdf_match
         return meta
 
     def get_llm_payload(self, record_id, prompt_hash):
