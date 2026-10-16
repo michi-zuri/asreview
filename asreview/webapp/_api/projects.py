@@ -129,6 +129,16 @@ def _llm_settings(project):
     return {**DEFAULT_LLM_SETTINGS, **cfg}
 
 
+def _llm_enabled(project):
+    """Whether LLM screening is enabled for the project.
+
+    The project's Anthropic API key is the hard switch: without a
+    non-blank key nothing is queued for the LLM and no LLM data is
+    served to the frontend.
+    """
+    return bool(str(_llm_settings(project).get("api_key") or "").strip())
+
+
 def _current_prompt_hash(project):
     """Build the current system prompt hash from tags/lists/criteria."""
     tags = read_tags_data(project.db)
@@ -2388,10 +2398,12 @@ def api_upload_pdf(project, record_id):  # noqa: F401
         if tmp_path and Path(tmp_path).exists():
             Path(tmp_path).unlink(missing_ok=True)
 
-    prompt_hash = _current_prompt_hash(project)
+    llm_on = _llm_enabled(project)
+    prompt_hash = _current_prompt_hash(project) if llm_on else None
     with project.db as db:
         db.input.set_attachment(record_id, attachment_key)
-        db.force_requeue(record_id, prompt_hash)
+        if llm_on:
+            db.force_requeue(record_id, prompt_hash)
 
     return jsonify({
         "attachment_key": attachment_key,
@@ -2548,11 +2560,13 @@ def api_replace_record_pdf(project, record_id):  # noqa: F401
             )
 
     # Local cleanup — store new key, clear stale results, re-queue.
-    prompt_hash = _current_prompt_hash(project)
+    llm_on = _llm_enabled(project)
+    prompt_hash = _current_prompt_hash(project) if llm_on else None
     with project.db as db:
         db.input.set_attachment(record_id, new_attachment_key)
         db.delete_llm_results(record_id)
-        db.force_requeue(record_id, prompt_hash)
+        if llm_on:
+            db.force_requeue(record_id, prompt_hash)
 
     logging.info(
         "User %s replaced PDF for record %s: %s → %s (project %s)",
@@ -2583,16 +2597,18 @@ def api_get_record(project):  # noqa: F401
         return jsonify({"result": None, "status": "finished"})
 
     settings = _llm_settings(project)
-    prompt_hash = _current_prompt_hash(project)
+    llm_on = _llm_enabled(project)
+    prompt_hash = _current_prompt_hash(project) if llm_on else None
     stale_timeout = 86400 if project.config.get("reassign_stale") else 0
 
     with project.db as db:
-        db.top_up_dispatch(settings["buffer_size"], prompt_hash)
+        if llm_on:
+            db.top_up_dispatch(settings["buffer_size"], prompt_hash)
         pending = db.get_pending(user_id=user_id)
         if pending.empty and stale_timeout:
             pending = db.reassign_stale(
                 user_id=user_id, older_than=stale_timeout)
-        if pending.empty:
+        if pending.empty and llm_on:
             pending = db.checkout_oldest_dispatched(
                 user_id=user_id, stale_timeout=stale_timeout or None)
         if pending.empty:
@@ -2609,22 +2625,26 @@ def api_get_record(project):  # noqa: F401
         item = asdict(db.input.get_records(record_id))
         record_lists = db.get_lists(record_id)
         tags_form = read_tags_data(db) or []
-        llm_meta = db.get_llm_meta(record_id, prompt_hash)
-        payload_json = db.get_llm_payload(record_id, prompt_hash)
+        llm_meta = None
+        payload_json = None
+        if llm_on:
+            llm_meta = db.get_llm_meta(record_id, prompt_hash)
+            payload_json = db.get_llm_payload(record_id, prompt_hash)
 
-        # When the dispatch status is "ready" but no payload exists for the
-        # current prompt hash, the LLM settings must have changed. Re-queue
-        # every stale dispatch row so the buffer isn't clogged by records
-        # with results that are invisible to the current prompt.
-        if (
-            llm_meta is not None
-            and llm_meta.get("status") == "ready"
-            and payload_json is None
-        ):
-            count = db.requeue_for_prompt_change(prompt_hash)
-            logging.info(
-                "Prompt change detected — re-queued %d records.", count)
-            llm_meta["status"] = "queued"
+            # When the dispatch status is "ready" but no payload exists for
+            # the current prompt hash, the LLM settings must have changed.
+            # Re-queue every stale dispatch row so the buffer isn't clogged
+            # by records with results that are invisible to the current
+            # prompt.
+            if (
+                llm_meta is not None
+                and llm_meta.get("status") == "ready"
+                and payload_json is None
+            ):
+                count = db.requeue_for_prompt_change(prompt_hash)
+                logging.info(
+                    "Prompt change detected — re-queued %d records.", count)
+                llm_meta["status"] = "queued"
 
     item["state"] = pending.iloc[0].to_dict()
     item["state"]["lists"] = record_lists
@@ -2652,7 +2672,7 @@ def api_get_record(project):  # noqa: F401
         except Exception:
             logging.exception("LLM pre-fill failed for record %s", record_id)
 
-    if llm_meta is None or llm_meta.get("status") != "ready":
+    if llm_on and (llm_meta is None or llm_meta.get("status") != "ready"):
         logging.info("llm buffer-miss: served record %s with status=%s",
                      record_id, (llm_meta or {}).get("status"))
 
@@ -2668,6 +2688,8 @@ def api_get_record(project):  # noqa: F401
 @login_required
 @project_authorization
 def api_get_record_llm(project, record_id):  # noqa: F401
+    if not _llm_enabled(project):
+        return jsonify(None)
     prompt_hash = _current_prompt_hash(project)
     with project.db as db:
         meta = db.get_llm_meta(int(record_id), prompt_hash)
@@ -2679,6 +2701,8 @@ def api_get_record_llm(project, record_id):  # noqa: F401
 @login_required
 @project_authorization
 def api_reprocess_record(project, record_id):  # noqa: F401
+    if not _llm_enabled(project):
+        return jsonify({"message": "LLM screening is not configured"}), 409
     prompt_hash = _current_prompt_hash(project)
     with project.db as db:
         db.force_requeue(int(record_id), prompt_hash)
@@ -2691,6 +2715,8 @@ def api_reprocess_record(project, record_id):  # noqa: F401
 @project_authorization
 def api_apply_llm(project, record_id):  # noqa: F401
     """Return LLM pre-filled tags and lists for a record, forcing overwrite."""
+    if not _llm_enabled(project):
+        return jsonify({"message": "LLM screening is not configured"}), 409
     prompt_hash = _current_prompt_hash(project)
     with project.db as db:
         payload_json = db.get_llm_payload(int(record_id), prompt_hash)
@@ -2728,13 +2754,14 @@ def api_update_llm_settings(project):  # noqa: F401
     merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
     merged["criteria_text"] = str(merged["criteria_text"])
     merged["api_key"] = str(merged.get("api_key", ""))
-    old_hash = _current_prompt_hash(project)
+    old_hash = _current_prompt_hash(project) if _llm_enabled(project) else None
     project.update_config(llm=merged)
-    new_hash = _current_prompt_hash(project)
-    if new_hash != old_hash:
-        with project.db as db:
-            n = db.requeue_for_prompt_change(new_hash)
-        logging.info("prompt changed; re-queued %s records", n)
+    if _llm_enabled(project) and old_hash is not None:
+        new_hash = _current_prompt_hash(project)
+        if new_hash != old_hash:
+            with project.db as db:
+                n = db.requeue_for_prompt_change(new_hash)
+            logging.info("prompt changed; re-queued %s records", n)
     return jsonify(_llm_settings(project))
 
 

@@ -1,0 +1,207 @@
+========================================================================
+TASK 8 — LLM screening is OFF unless the project has an Anthropic API key
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 7a–7e merged. (7e removed the recheck_pdf route and added
+            delete_missing_pdf_dispatch.)
+
+GOAL
+  The per-project Anthropic API key (config["llm"]["api_key"], set in the
+  project's LLM settings card) is the HARD SWITCH for the whole LLM
+  feature. Without a key:
+    - no record is ever inserted or re-queued into llm_dispatch,
+    - the reviewer gets records in plain ASReview order (no LLM buffer),
+    - no LLM pre-fill is applied,
+    - the LLM info box (LlmResultCard) is not shown in the frontend.
+  With a key, everything behaves exactly as today.
+  Existing llm_dispatch / llm_results rows are NOT deleted when the key is
+  removed; they are just ignored, and used again if a key is added back.
+
+FACTS (verified by reading the code — trust these)
+  - asreview/webapp/_api/projects.py: _llm_settings(project) merges
+    DEFAULT_LLM_SETTINGS (api_key "") with project.config["llm"].
+  - Every write into llm_dispatch from the webapp happens in projects.py,
+    at exactly these six call sites (grep `top_up_dispatch|force_requeue|
+    requeue_for_prompt_change` to confirm, nothing else calls them outside
+    tests and database.py):
+      1. api_get_record         db.top_up_dispatch(...)
+      2. api_get_record         db.requeue_for_prompt_change(...)
+                                (the "ready but no payload" block)
+      3. api_upload_pdf         db.force_requeue(...)
+      4. api_replace_record_pdf db.force_requeue(...)
+      5. api_reprocess_record   db.force_requeue(...)
+      6. api_update_llm_settings db.requeue_for_prompt_change(...)
+    api_delete_record_pdf only calls mark_dispatch_missing_pdf, which is an
+    UPDATE of an existing row (never inserts) — leave it alone.
+    delete_missing_pdf_dispatch (7e; on-screen check and background sync)
+    only DELETEs 'missing_pdf' rows — it queues nothing, leave it ungated.
+  - api_get_record serves records in this order: get_pending →
+    reassign_stale → checkout_oldest_dispatched (serves llm_dispatch rows,
+    including 'queued' ones) → query_top_ranked (plain ASReview).
+  - The frontend LlmResultCard
+    (asreview/webapp/src/ProjectComponents/ReviewComponents/
+    LlmResultCard.js) already renders nothing when its `llm` prop is falsy
+    (`if (!llm) return null;`) and only polls fetchLlmMeta when `llm` is
+    truthy. RecordCard passes `llm={record.llm}`, which comes from
+    item["llm"] in api_get_record. The Collections list (api_get_labeled)
+    does not send `llm` at all. So the box disappears once the backend
+    sends llm = null — the backend is the single source of truth.
+  - RecordCard.js uses record?.llm?.status === "in_flight" to block PDF
+    replacement; with llm null that is simply false (correct).
+  - asreview/webapp/_api/llm_worker.py :: run_worker_once already skips a
+    project with an empty api_key.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - projects.py: DEFAULT_LLM_SETTINGS, _llm_settings, _current_prompt_hash,
+    api_upload_pdf, api_delete_record_pdf, api_replace_record_pdf,
+    api_get_record, api_get_record_llm, api_reprocess_record,
+    api_apply_llm, api_get_llm_settings,
+    api_update_llm_settings.
+  - llm_worker.py: run_worker_once (the api_key check).
+  - LlmResultCard.js and the LlmResultCard usage in RecordCard.js.
+  - asreview/webapp/tests/test_api/test_projects.py around the test that
+    calls au.get_project_current_document and db.add_last_ranking
+    (~line 630-650) — your API tests reuse that setup.
+
+------------------------------------------------------------------------
+PART A — one helper (projects.py, right below _llm_settings)
+------------------------------------------------------------------------
+    def _llm_enabled(project):
+        """Whether LLM screening is enabled for the project.
+
+        The project's Anthropic API key is the hard switch: without a
+        non-blank key nothing is queued for the LLM and no LLM data is
+        served to the frontend.
+        """
+        return bool(str(_llm_settings(project).get("api_key") or "").strip())
+
+------------------------------------------------------------------------
+PART B — gate every queue write and the LLM data in projects.py
+------------------------------------------------------------------------
+  api_get_record:
+    llm_on = _llm_enabled(project) at the top (next to `settings`).
+    When llm_on is False:
+      - do NOT call top_up_dispatch,
+      - do NOT call checkout_oldest_dispatched (go straight from
+        get_pending / reassign_stale to query_top_ranked) — otherwise
+        leftover dispatch rows from a removed key would still dictate the
+        order,
+      - do NOT read llm_meta / payload, do NOT run the
+        requeue_for_prompt_change block, do NOT pre-fill,
+      - set item["llm"] = None,
+      - skip the "llm buffer-miss" log line.
+    Do not compute _current_prompt_hash when llm_on is False (it is only
+    needed for LLM work). Keep the llm_on=True path byte-for-byte the same
+    behaviour as today; restructure only as much as the gate requires.
+
+  api_upload_pdf and api_replace_record_pdf:
+    call db.force_requeue(...) (and compute prompt_hash) only if
+    _llm_enabled(project). Storing the attachment key — and, in replace,
+    db.delete_llm_results(record_id) — still always happens.
+    The in_flight guard (get_llm_meta ... "in_flight" → 409) in replace and
+    delete may stay as is (with no key there are no in_flight rows).
+
+  api_reprocess_record:
+    if not _llm_enabled(project):
+        return jsonify({"message": "LLM screening is not configured"}), 409
+    before touching the database.
+
+  api_get_record_llm:
+    if not _llm_enabled(project): return jsonify(None)
+    (so a card that is still mounted stops showing LLM state).
+
+  api_apply_llm:
+    if not _llm_enabled(project):
+        return jsonify({"message": "LLM screening is not configured"}), 409
+
+  api_update_llm_settings:
+    only run the old_hash/new_hash comparison + requeue_for_prompt_change
+    when _llm_enabled(project) is True AFTER project.update_config(...).
+    (Adding a key later does not need a requeue: the next get_record
+    top-up fills the buffer.)
+
+  llm_worker.run_worker_once:
+    replace the `if not api_key:` check with
+    `if not _llm_enabled(project):` (import it next to the existing local
+    import of _llm_settings), so a whitespace-only key counts as "no key"
+    in both places. Keep the warning log. Nothing else in the worker.
+
+------------------------------------------------------------------------
+PART C — frontend
+------------------------------------------------------------------------
+  No new logic is needed if the facts above hold. Verify by reading:
+    - LlmResultCard returns null for a falsy `llm` BEFORE rendering any
+      box, and its useQuery is `enabled: !!llm`.
+    - No other component renders LLM status/info for a record.
+      (grep -rn "llm" asreview/webapp/src --include=*.js)
+  If you find any LLM info UI that is shown regardless of record.llm,
+  hide it when record.llm is null — and report what you changed. Do NOT
+  add a second "is LLM configured" query to the frontend.
+  RecordCard.js / LlmResultCard.js may contain the user's uncommitted
+  edits (`git diff`) — keep them.
+
+------------------------------------------------------------------------
+TESTS (write, then run)
+------------------------------------------------------------------------
+Create asreview/webapp/tests/test_api/test_llm_gating.py using the
+`client, project` fixtures like test_labeled_pagination.py. Setup per
+test, copied from the test_projects.py pattern (~line 630-650): label one
+relevant and one irrelevant record, then add a last ranking:
+    asr_project = asr.Project(project.project_path)
+    record_ids = asr_project.db.input["record_id"].to_list()
+    with asr_project.db as db:
+        db.add_last_ranking(record_ids, "nb", "max", "double", "tfidf", 2)
+Helper to count queue rows:
+    def _dispatch_count(project):
+        with asr.Project(project.project_path).db as db:
+            return db._conn.execute(
+                "SELECT COUNT(*) FROM llm_dispatch").fetchone()[0]
+pid = au.get_project_id(project).
+
+  1. No key: GET /api/projects/<pid>/get_record → 200, result is a
+     record, result["llm"] is None, _dispatch_count == 0.
+  2. Key set: PUT /api/projects/<pid>/llm_settings json={"api_key":
+     "sk-test"} → then GET get_record → _dispatch_count > 0 and
+     result["llm"] is not None. (Proves the gate opens; a "never queue"
+     implementation fails here.)
+  3. Whitespace key {"api_key": "   "} behaves like no key (as test 1).
+  4. No key: POST /api/projects/<pid>/record/<rid>/reprocess → 409 and
+     _dispatch_count == 0.
+  5. No key, PDF upload: write {"group_id": "1", "api_key": "K"} to
+     Path(project.project_path, "zotero.json"); set an original_id on rid
+     (session pattern used in test_zotero.py's route test); monkeypatch
+     asreview.webapp._api.projects.upload_pdf_to_zotero to return
+     "ABCD1234"; POST /api/projects/<pid>/record/<rid>/upload_pdf with
+     data={"file": (io.BytesIO(b"%PDF-1.4"), "a.pdf")},
+     content_type="multipart/form-data" → 200, the record's attachment is
+     "ABCD1234", _dispatch_count == 0.
+     Then set the LLM key and repeat the upload for another record →
+     _dispatch_count == 1 for that record.
+  6. Key removed after queueing: set key, GET get_record (rows queued),
+     then PUT {"api_key": ""}, GET get_record again → result["llm"] is
+     None and the queue row count did not grow.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_llm_gating.py asreview/webapp/tests/test_api/test_labeled_pagination.py tests/test_llm_worker.py tests/test_llm_db.py -q'
+  Run tests/test_llm_worker.py BEFORE your change too and note which tests
+  already fail; your change must not add failures there.
+  Frontend: cd asreview/webapp && npm run build  (must compile).
+  Paste all outputs.
+
+  In your report, list this manual browser check for the user:
+    a. Project without an API key: open Reviewer → no LLM box on the
+       card; upload a PDF from the card → still no LLM box.
+    b. Add the API key in the project's LLM settings → the next record
+       shows the LLM box ("queued"/"analyzing").
+    c. Remove the key again → the next record has no LLM box.
+
+DONE WHEN
+  - _llm_enabled exists and gates all six queue writes, get_record's
+    dispatch checkout and pre-fill, api_get_record_llm, api_apply_llm.
+  - Without a key: nothing is written to llm_dispatch, get_record returns
+    llm = null, reprocess/apply_llm return 409.
+  - With a key: behaviour unchanged.
+  - Tests green (except failures that existed before), build compiles.
+  - Only projects.py, llm_worker.py, the new test file (and frontend
+    files only if Part C found something) changed.
+========================================================================

@@ -272,19 +272,21 @@ def run_worker_once(project, model, max_concurrent=3, max_attempts=5,
     When *executor* is given it is used to schedule jobs (caller owns the
     pool lifetime); otherwise a fresh ThreadPoolExecutor is created.
     """
+    from asreview.webapp._api.projects import _llm_enabled
     from asreview.webapp._api.projects import _llm_settings
 
     settings = _llm_settings(project)
 
-    # Resolve API key from per-project setting.
-    api_key = settings.get("api_key", "")
-    if not api_key:
+    # The project's API key is the hard switch for LLM screening; a
+    # whitespace-only key counts as "no key" (same rule as the webapp).
+    if not _llm_enabled(project):
         logging.debug(
             "LLM worker: skipping project %s — no API key configured "
             "(configure per project in the UI)",
             project.project_path,
         )
         return 0
+    api_key = settings.get("api_key", "")
     client = anthropic.Anthropic(api_key=api_key)
 
     criteria_text = settings.get("criteria_text", "")
