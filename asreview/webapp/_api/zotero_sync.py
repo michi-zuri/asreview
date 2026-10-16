@@ -95,7 +95,9 @@ def sync_db_attachments(db, config, max_age=BACKGROUND_RECHECK_INTERVAL,
     Records whose cached lookup changed between the initial scan and their
     turn (e.g. a concurrent PDF upload stored an attachment key) are skipped
     without sleeping. A ZoteroLookupError stops this project's pass; the
-    next pass retries.
+    next pass retries. After the lookup loop, records whose llm_dispatch row
+    is 'missing_pdf' but which now have an attachment key lose that row, so
+    the regular top-up can pick them up again.
 
     Parameters
     ----------
@@ -147,9 +149,21 @@ def sync_db_attachments(db, config, max_age=BACKGROUND_RECHECK_INTERVAL,
             )
         sleep(delay)
 
+    # Sweep: a record that has a missing_pdf dispatch row but an attachment
+    # key now no longer needs the row — delete it so the regular top-up
+    # re-queues the record in ranking order. Rows with any other status are
+    # never touched. This also heals rows left over from before this sweep
+    # existed (e.g. a key found by the on-screen check).
+    cleared = 0
+    for rid in db.get_missing_pdf_dispatch_ids():
+        if is_attachment_key(db.input.get_records(rid).attachment):
+            if db.delete_missing_pdf_dispatch(rid):
+                cleared += 1
+
     logging.info(
-        "Zotero sync: %d lookup(s) performed, %d resolved to keys",
-        lookups, keys,
+        "Zotero sync: %d lookup(s) performed, %d resolved to keys, "
+        "%d cleared from missing_pdf",
+        lookups, keys, cleared,
     )
     return lookups
 

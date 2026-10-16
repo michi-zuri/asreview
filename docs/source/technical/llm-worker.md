@@ -132,8 +132,11 @@ queued → in_flight → ready       (success)
 - **ready**: LLM result stored and available for pre-fill.
 - **failed**: All retry attempts exhausted. Use the "Re-screen" button in the
   UI to re-queue for another attempt.
-- **missing_pdf**: No PDF could be found or downloaded. Use the "Recheck PDF"
-  button to try again.
+- **missing_pdf**: No PDF could be found or downloaded. Upload a PDF with the
+  PDF button on the record card; screening starts automatically after the
+  upload. When a PDF is added to Zotero directly, the next attachment check
+  or background sync clears this status and the record is picked up again
+  by the regular queue.
 
 ### Prompt hash and auto-reprocessing
 

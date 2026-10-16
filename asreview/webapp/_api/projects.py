@@ -2326,6 +2326,10 @@ def api_get_record_attachment(project, record_id):  # noqa: F401
             # Transient failure: nothing cached, retried on the next request.
             value = record.attachment
 
+        if is_attachment_key(value) and value != record.attachment:
+            # A PDF was just found: let the regular top-up re-queue it.
+            db.delete_missing_pdf_dispatch(record_id)
+
         if is_attachment_key(value):
             return payload(
                 True, url=build_reader_url(config, record.original_id, value)
@@ -2675,17 +2679,6 @@ def api_get_record_llm(project, record_id):  # noqa: F401
 @login_required
 @project_authorization
 def api_reprocess_record(project, record_id):  # noqa: F401
-    prompt_hash = _current_prompt_hash(project)
-    with project.db as db:
-        db.force_requeue(int(record_id), prompt_hash)
-    return jsonify({"success": True})
-
-
-@bp.route("/projects/<project_id>/record/<record_id>/recheck_pdf",
-          methods=["POST"])
-@login_required
-@project_authorization
-def api_recheck_pdf(project, record_id):  # noqa: F401
     prompt_hash = _current_prompt_hash(project)
     with project.db as db:
         db.force_requeue(int(record_id), prompt_hash)

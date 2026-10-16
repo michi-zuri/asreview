@@ -1130,6 +1130,39 @@ class Database:
         )
         con.commit()
 
+    def delete_missing_pdf_dispatch(self, record_id):
+        """Delete a record's llm_dispatch row if its status is 'missing_pdf'.
+
+        Used when a PDF has been found for the record. The record is not
+        re-queued here; top_up_dispatch picks it up again in ranking order.
+        Rows with any other status are left untouched.
+
+        Returns
+        -------
+        bool
+            True when a row was deleted.
+        """
+        con = self._conn
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM llm_dispatch "
+            "WHERE record_id = ? AND status = 'missing_pdf'",
+            (int(record_id),),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+    def get_missing_pdf_dispatch_ids(self):
+        """Return record_ids whose llm_dispatch row is 'missing_pdf'."""
+        cur = self._conn.cursor()
+        return [
+            r[0]
+            for r in cur.execute(
+                "SELECT record_id FROM llm_dispatch "
+                "WHERE status = 'missing_pdf' ORDER BY record_id"
+            )
+        ]
+
     def delete_llm_results(self, record_id):
         """Delete all cached LLM results for a record.
 

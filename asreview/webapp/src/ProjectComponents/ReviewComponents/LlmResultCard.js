@@ -64,17 +64,6 @@ const LlmResultCard = ({
       .finally(() => setBusy(false));
   };
 
-  const handleRecheckPdf = () => {
-    setBusy(true);
-    ProjectAPI.recheckPdf({ project_id, record_id })
-      .then(() => {
-        queryClient.invalidateQueries({
-          queryKey: ["fetchLlmMeta", { project_id, record_id }],
-        });
-      })
-      .finally(() => setBusy(false));
-  };
-
   const handleApplyClick = () => {
     if (isDirty) {
       setApplyDialogOpen(true);
@@ -242,16 +231,10 @@ const LlmResultCard = ({
                 No PDF available for this record.
               </Typography>
             </Stack>
-            <Stack direction="row" justifyContent="flex-end">
-              <Button
-                size="small"
-                startIcon={<RefreshIcon />}
-                disabled={busy}
-                onClick={handleRecheckPdf}
-              >
-                Recheck PDF
-              </Button>
-            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              Upload the PDF with the PDF button on this card. Full-text
+              screening starts automatically after the upload.
+            </Typography>
           </Stack>
         );
 

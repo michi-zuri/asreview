@@ -293,3 +293,47 @@ def test_attachment_route_caches_failed_lookup(client, project, monkeypatch):
     assert res.status_code == 200
     assert res.get_json()["available"] is False
     assert len(calls) == 2
+
+
+def test_attachment_route_clears_missing_pdf(client, project, monkeypatch):
+    """A PDF found by the on-screen check deletes the 'missing_pdf' row."""
+    Path(project.project_path, "zotero.json").write_text(
+        json.dumps({"group_id": "123", "api_key": "KEY"})
+    )
+
+    asr_project = asr.Project(project.project_path)
+    with asr_project.db as db:
+        store = db.input
+        rid = int(store["record_id"].to_list()[0])
+        with store.Session() as s, s.begin():
+            s.get(store.record_cls, rid).original_id = "ITEMKEY1"
+        db.force_requeue(rid, "H")
+        db.mark_dispatch_missing_pdf(rid)
+
+    url = f"/api/projects/{au.get_project_id(project)}/record/{rid}/attachment"
+
+    def dispatch_row():
+        with asr_project.db as db:
+            cur = db._conn.cursor()
+            return cur.execute(
+                "SELECT status FROM llm_dispatch WHERE record_id = ?", (rid,)
+            ).fetchone()
+
+    # Fetch finds no PDF: the dispatch row stays 'missing_pdf'.
+    _fake_fetch(monkeypatch, None)
+    res = client.get(url)
+    assert res.status_code == 200
+    assert res.get_json()["available"] is False
+    assert dispatch_row() == ("missing_pdf",)
+
+    # Age the cached timestamp past the 5-minute rule and find a PDF: the
+    # row is deleted and nothing is queued in its place.
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
+    with asr_project.db as db:
+        db.input.set_attachment(rid, stale)
+
+    _fake_fetch(monkeypatch, "ABCD1234")
+    res = client.get(url)
+    assert res.status_code == 200
+    assert res.get_json()["available"] is True
+    assert dispatch_row() is None

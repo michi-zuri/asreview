@@ -1,0 +1,208 @@
+========================================================================
+TASK 7e — Drop "Recheck PDF"; a found PDF clears the record's
+          "missing_pdf" queue row so the normal top-up picks it up again
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 7a–7d merged (they are). Do this BEFORE task 8.
+
+BACKGROUND (verified by reading the code — trust this)
+  - When the LLM worker finds no PDF for a record it sets the record's
+    llm_dispatch row to status 'missing_pdf'
+    (llm_worker.screen_record → db.mark_dispatch_missing_pdf).
+  - That row then sits there forever: top_up_dispatch only inserts records
+    that have NO llm_dispatch row (`lr.record_id NOT IN (SELECT record_id
+    FROM llm_dispatch)`), and checkout_oldest_dispatched only serves
+    statuses queued/in_flight/ready.
+  - The only way out today is the "Recheck PDF" button in the LLM info box
+    (LlmResultCard.js, case "missing_pdf") → POST .../recheck_pdf →
+    api_recheck_pdf → db.force_requeue. It is unreliable: the worker's own
+    failed lookup just stored a timestamp, so within 5 minutes the worker
+    skips Zotero and marks the record missing_pdf again.
+  - Uploading/replacing a PDF through ASReview (api_upload_pdf,
+    api_replace_record_pdf) already re-queues the record with
+    force_requeue. KEEP that — it is how an upload starts screening.
+  - Two components discover PDFs that were added in Zotero directly:
+      * the on-screen check: GET .../record/<rid>/attachment →
+        projects.py :: api_get_record_attachment
+      * the background sync thread running inside the llm-worker
+        service: asreview/webapp/_api/zotero_sync.py ::
+        sync_db_attachments
+    Neither touches llm_dispatch today, so the record stays 'missing_pdf'.
+
+GOAL
+  1. Remove the "Recheck PDF" button and everything that exists only for
+     it (frontend handler, ProjectAPI.recheckPdf, the recheck_pdf route).
+     The info box instead tells the user to upload the PDF.
+  2. When the on-screen check or the background sync finds a PDF key for
+     a record whose llm_dispatch row is 'missing_pdf', DELETE that row.
+     Do NOT insert/queue anything. With the row gone, top_up_dispatch
+     picks the record up again the regular way (ranking order, only when
+     the buffer has room, skipping labeled / prior-irrelevant records).
+  Rows with any other status are never touched. Records still without a
+  PDF keep their 'missing_pdf' row (deleting it would make top-up re-queue
+  and fail them in a loop).
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/database/database.py: top_up_dispatch, force_requeue,
+    mark_dispatch_missing_pdf, checkout_oldest_dispatched (status filter).
+  - asreview/webapp/_api/projects.py: api_get_record_attachment,
+    api_recheck_pdf, api_upload_pdf, api_replace_record_pdf.
+  - asreview/webapp/_api/zotero_sync.py (whole file).
+  - asreview/webapp/src/ProjectComponents/ReviewComponents/
+    LlmResultCard.js (whole file) and asreview/webapp/src/api/
+    ProjectAPI.js :: recheckPdf.
+  - RecordCard.js :: ZoteroFullTextButton — the crossed-out PDF icon is
+    the upload button, shown to every user when Zotero is configured and
+    the record has no PDF. The info box text refers to it.
+  - tests/test_llm_db.py, asreview/webapp/tests/test_api/test_zotero.py
+    (the attachment route test from 7a), test_zotero_sync.py.
+  RecordCard.js / LlmResultCard.js may contain the user's uncommitted
+  edits (`git diff`) — keep them.
+
+------------------------------------------------------------------------
+PART A — DAO (database.py, next to mark_dispatch_missing_pdf)
+------------------------------------------------------------------------
+    def delete_missing_pdf_dispatch(self, record_id):
+        """Delete a record's llm_dispatch row if its status is 'missing_pdf'.
+
+        Used when a PDF has been found for the record. The record is not
+        re-queued here; top_up_dispatch picks it up again in ranking order.
+        Rows with any other status are left untouched.
+
+        Returns
+        -------
+        bool
+            True when a row was deleted.
+        """
+        con = self._conn
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM llm_dispatch "
+            "WHERE record_id = ? AND status = 'missing_pdf'",
+            (int(record_id),),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+    def get_missing_pdf_dispatch_ids(self):
+        """Return record_ids whose llm_dispatch row is 'missing_pdf'."""
+        cur = self._conn.cursor()
+        return [
+            r[0]
+            for r in cur.execute(
+                "SELECT record_id FROM llm_dispatch "
+                "WHERE status = 'missing_pdf' ORDER BY record_id"
+            )
+        ]
+
+------------------------------------------------------------------------
+PART B — on-screen check (projects.py :: api_get_record_attachment)
+------------------------------------------------------------------------
+  After `value` is computed and BEFORE returning, add:
+
+        if is_attachment_key(value) and value != record.attachment:
+            # A PDF was just found: let the regular top-up re-queue it.
+            db.delete_missing_pdf_dispatch(record_id)
+
+  Only on a NEWLY found key (not on every view of a record that already
+  had one) so the endpoint, called for every card scrolled into view,
+  stays read-only in the common case. Older stale rows are cleaned by the
+  background sweep in Part C. Do not change the JSON response.
+
+------------------------------------------------------------------------
+PART C — background sync (zotero_sync.py :: sync_db_attachments)
+------------------------------------------------------------------------
+  After the lookup loop (also when the loop was left via the
+  ZoteroLookupError break — the sweep needs no network), add a sweep:
+
+        cleared = 0
+        for rid in db.get_missing_pdf_dispatch_ids():
+            if is_attachment_key(db.input.get_records(rid).attachment):
+                if db.delete_missing_pdf_dispatch(rid):
+                    cleared += 1
+
+  Include `cleared` in the existing per-project summary log line. The
+  function's return value stays the number of Zotero lookups (existing
+  tests rely on it). This also heals records whose PDF was found earlier
+  (before this change, or by the on-screen check) but whose row is still
+  'missing_pdf'.
+
+------------------------------------------------------------------------
+PART D — remove Recheck PDF
+------------------------------------------------------------------------
+  - LlmResultCard.js, case "missing_pdf": remove the Button and the
+    handleRecheckPdf function. Keep the icon + "No PDF available for this
+    record." and add below it, same style as other captions in the file
+    (Typography variant="caption" color="text.secondary"):
+        "Upload the PDF with the PDF button on this card. Full-text
+         screening starts automatically after the upload."
+    Remove imports that become unused (RefreshIcon is still used by
+    Re-screen — check before removing anything).
+  - ProjectAPI.js: delete static recheckPdf(...).
+  - projects.py: delete the api_recheck_pdf route
+    (/projects/<project_id>/record/<record_id>/recheck_pdf).
+  - grep the whole repo (asreview/, tests/, docs/) for recheck_pdf /
+    recheckPdf / "Recheck PDF" and remove any remaining reference that
+    belongs to this feature. Report every hit and what you did with it.
+  Do NOT touch Re-screen (reprocess) — it stays.
+
+------------------------------------------------------------------------
+TESTS (write, then run)
+------------------------------------------------------------------------
+  tests/test_llm_db.py (reuse `db_pool`; the dispatch-status reader that
+  already exists in this file):
+    1. top_up_dispatch(3, "H") → records 0,1,2 queued.
+       mark_dispatch_missing_pdf(0). delete_missing_pdf_dispatch(1)
+       returns False and record 1 is still 'queued' (non-missing rows are
+       untouched). delete_missing_pdf_dispatch(0) returns True and record
+       0 has no dispatch row. get_missing_pdf_dispatch_ids() is [] after,
+       and was [0] before the delete.
+    2. "Regular pickup": continuing from 1, top_up_dispatch(3, "H")
+       re-inserts record 0 as 'queued' (it ranks first and the buffer has
+       room). This is the behaviour the user relies on.
+
+  asreview/webapp/tests/test_api/test_zotero_sync.py — extend with one
+  test using the same Database setup as the existing sync test:
+    records 0 (attachment "ABCD1234" already), 1 (never checked; fetch
+    returns "WXYZ9876"), 2 (never checked; fetch returns None). Give each
+    a 'missing_pdf' row: db.force_requeue(rid, "H") then
+    db.mark_dispatch_missing_pdf(rid). After sync_db_attachments:
+      - records 0 and 1 have NO dispatch row,
+      - record 2 still has a 'missing_pdf' row,
+      - no row exists with status 'queued' (nothing was queued).
+    Plus: when fetch raises ZoteroLookupError on the first lookup, the
+    row of record 0 (which already had a key) is still deleted.
+
+  asreview/webapp/tests/test_api/test_zotero.py — extend the attachment
+  route test from 7a (or add one next to it, same setup): give the record
+  a 'missing_pdf' row; with fetch returning None the GET leaves the row in
+  place; with fetch returning "ABCD1234" the next due GET deletes it and
+  no 'queued' row exists for the record.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_llm_db.py asreview/webapp/tests/test_api/test_zotero_sync.py asreview/webapp/tests/test_api/test_zotero.py tests/test_llm_worker.py -q'
+  Run tests/test_llm_worker.py BEFORE your change too and note which
+  tests already fail; your change must not add failures.
+  Frontend: cd asreview/webapp && npm run build (must compile, no new
+  ESLint warnings in LlmResultCard.js).
+  Paste all outputs.
+
+  In your report, list this manual browser check for the user:
+    a. Reviewer, a record whose LLM box says "No PDF available": no
+       Recheck PDF button; the upload hint is shown.
+    b. Upload a PDF with the card's PDF button → the box switches to
+       queued/analyzing.
+    c. Attach a PDF in Zotero directly to another 'missing_pdf' record and
+       scroll it into view (or wait for the background sync) → its
+       llm_dispatch row is gone (sqlite: SELECT * FROM llm_dispatch WHERE
+       record_id = <id>) and it is screened later when top-up reaches it.
+
+DONE WHEN
+  - Recheck PDF button, handler, ProjectAPI.recheckPdf and the
+    recheck_pdf route are gone; Re-screen still works.
+  - A newly found PDF (on-screen check) and any record with a PDF key
+    (background sweep) lose their 'missing_pdf' row; nothing is inserted
+    or re-queued by these paths.
+  - Upload/replace still re-queue immediately (unchanged).
+  - Tests green (except pre-existing failures), build compiles.
+========================================================================

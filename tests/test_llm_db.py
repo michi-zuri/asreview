@@ -423,6 +423,36 @@ def test_mark_dispatch_missing_pdf(db_pool):
     assert status == "missing_pdf"
 
 
+def test_delete_missing_pdf_dispatch_only_missing(db_pool):
+    """delete_missing_pdf_dispatch deletes only 'missing_pdf' rows."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.mark_dispatch_missing_pdf(0)
+
+    # Rows with any other status are left untouched.
+    assert db_pool.delete_missing_pdf_dispatch(1) is False
+    status, _, _ = _dispatch_status(db_pool, 1)
+    assert status == "queued"
+
+    assert db_pool.get_missing_pdf_dispatch_ids() == [0]
+
+    assert db_pool.delete_missing_pdf_dispatch(0) is True
+    assert _dispatch_status(db_pool, 0) is None
+    assert db_pool.get_missing_pdf_dispatch_ids() == []
+
+
+def test_top_up_picks_up_after_missing_pdf_deleted(db_pool):
+    """With the missing_pdf row gone, top_up_dispatch re-queues the record."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.mark_dispatch_missing_pdf(0)
+    db_pool.delete_missing_pdf_dispatch(0)
+
+    # Record 0 ranks first and the buffer has room again: regular pickup.
+    n = db_pool.top_up_dispatch(3, "H")
+    assert n == 1
+    status, _, _ = _dispatch_status(db_pool, 0)
+    assert status == "queued"
+
+
 def test_increment_dispatch_attempts(db_pool):
     """increment_dispatch_attempts returns new count; two calls give 1 then 2."""
     db_pool.top_up_dispatch(3, "H")
