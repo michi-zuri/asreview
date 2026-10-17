@@ -288,7 +288,14 @@ def run_worker_once(project, model, max_concurrent=3, max_attempts=5,
         )
         return 0
     api_key = settings.get("api_key", "")
-    client = anthropic.Anthropic(api_key=api_key)
+    # Pin the base URL to the real Anthropic API. The developer shell
+    # exports ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN to route Claude Code
+    # through a DeepSeek-compatible endpoint; the worker must not inherit
+    # that. (Passing api_key explicitly already keeps the SDK from reading
+    # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN from the environment.)
+    client = anthropic.Anthropic(
+        api_key=api_key, base_url="https://api.anthropic.com"
+    )
 
     criteria_text = settings.get("criteria_text", "")
     tags = read_tags_data(project.db)

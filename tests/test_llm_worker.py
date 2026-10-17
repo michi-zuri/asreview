@@ -398,6 +398,27 @@ def test_run_worker_once(tmp_path):
     assert result_count == 3
 
 
+def test_worker_client_pins_anthropic_endpoint(tmp_path, monkeypatch):
+    """The worker client passes an explicit base_url, so ANTHROPIC_BASE_URL /
+    ANTHROPIC_AUTH_TOKEN from the environment cannot reroute it."""
+    monkeypatch.setenv(
+        "ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"
+    )
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "deepseek-token")
+    proj = asr.Project.create(Path(tmp_path, "proj"))
+    proj.update_config(llm={"api_key": "sk-ant-test"})
+
+    client_cls = mock.Mock()
+    monkeypatch.setattr(llm_worker.anthropic, "Anthropic", client_cls)
+
+    n = llm_worker.run_worker_once(proj, "claude-opus-4-8")
+
+    assert n == 0  # empty dispatch queue
+    client_cls.assert_called_once_with(
+        api_key="sk-ant-test", base_url="https://api.anthropic.com"
+    )
+
+
 # --- 2d: discover_project_paths, run_worker_all, bad-project skip ---
 
 
