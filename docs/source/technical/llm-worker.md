@@ -39,8 +39,8 @@ populates the screening form before a human reviewer sees the record.
 
 ## Prerequisites
 
-- **Anthropic API key**: Set `ANTHROPIC_API_KEY` in the environment. The worker
-  uses the default Anthropic client which reads this variable automatically.
+- **Anthropic API key**: Configured per project in the LLM Screening settings
+  pane. Projects without a key are skipped by the worker.
 - **ASReview projects**: Projects must exist under `ASREVIEW_PATH` and have
   records with resolvable PDFs (DOIs, URLs, or local attachments).
 
@@ -53,12 +53,10 @@ asreview-llm-worker /path/to/project.asreview
 ```
 
 Options:
-- `--model claude-opus-4-8` — model to use (default from `ASREVIEW_LLM_MODEL`
-  env var, or `claude-opus-4-8`)
-- `--max-concurrent 3` — max parallel LLM calls within this worker (default
-  from `ASREVIEW_LLM_MAX_CONCURRENT` env var, or 3)
 - `--poll-interval 5.0` — seconds to sleep when no queued records are found
-- `-v` — enable DEBUG logging
+
+The screening model is a per-project setting (default `claude-opus-4-6`,
+newest Opus), chosen in the LLM Screening settings pane.
 
 ### All projects (service mode, foreground)
 
@@ -94,17 +92,17 @@ systemd.services.asreview-llm-worker = {
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | *(required)* | Anthropic API key |
 | `ASREVIEW_PATH` | `~/.asreview` | Root directory containing project folders |
-| `ASREVIEW_LLM_MODEL` | `claude-opus-4-8` | Model ID passed to the Anthropic API |
-| `ASREVIEW_LLM_MAX_CONCURRENT` | `3` | Global cap on parallel LLM calls |
+
+The screening model is configured per project in the LLM Screening settings
+pane (default `claude-opus-4-6`, the newest Opus model).
 
 ## What to expect
 
 When the worker starts, it logs:
 
 ```
-ASReview LLM worker starting (model=claude-opus-4-8, max_concurrent=3)
+ASReview LLM worker starting (model=per-project setting, max_concurrent=3)
 ```
 
 During normal operation, each completed record produces a log line:
@@ -145,6 +143,10 @@ prompt (tags + lists + screening criteria). When an admin edits the screening
 criteria text, tags, or lists, the prompt hash changes. All unlabeled dispatch
 rows with the old hash are automatically re-queued so the LLM re-screens them
 under the new prompt on the next worker cycle.
+
+Changing the screening model similarly invalidates the cached results of
+records without a final decision and re-queues them for screening with the
+new model. Records that already have a final decision keep their results.
 
 ## Monitoring
 

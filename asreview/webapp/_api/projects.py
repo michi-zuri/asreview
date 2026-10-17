@@ -113,11 +113,21 @@ except importlib.metadata.PackageNotFoundError:
 
 bp = Blueprint("api", __name__, url_prefix="/api")
 
+# Newest Opus is the default screening model; the catalog is the single
+# source of truth for the model dropdown in the LLM settings pane.
+DEFAULT_LLM_MODEL = "claude-opus-4-6"
+AVAILABLE_LLM_MODELS = [
+    {"id": "claude-opus-4-6", "label": "Opus 4.6"},
+    {"id": "claude-sonnet-4-6", "label": "Sonnet 4.6"},
+    {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5"},
+]
+
 DEFAULT_LLM_SETTINGS = {
     "buffer_size": 20,
     "max_concurrent_llm": 3,
     "criteria_text": "",
     "api_key": "",
+    "model": DEFAULT_LLM_MODEL,
 }
 
 
@@ -344,6 +354,7 @@ def api_create_project():  # noqa: F401
             project.update_review(model_name=model["name"], model=model["value"])
 
             project.label_priors()
+            project.update_config(llm={"model": DEFAULT_LLM_MODEL})
 
         except Exception as err:
             try:
@@ -1338,6 +1349,10 @@ def api_import_project():
                 "The active learning model has been reset to the default model and"
                 " can be changed in the project settings."
             )
+
+        llm_cfg = project.config.get("llm") or {}
+        if not llm_cfg.get("model"):
+            project.update_config(llm={**llm_cfg, "model": DEFAULT_LLM_MODEL})
 
         if authenticated:
             current_user.projects.append(Project(project_id=project.config.get("id")))
@@ -2739,6 +2754,7 @@ def api_get_llm_settings(project):  # noqa: F401
     # Mask the API key — never expose it to the frontend.
     if settings.get("api_key"):
         settings["api_key"] = True
+    settings["models"] = AVAILABLE_LLM_MODELS
     return jsonify(settings)
 
 
@@ -2754,8 +2770,22 @@ def api_update_llm_settings(project):  # noqa: F401
     merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
     merged["criteria_text"] = str(merged["criteria_text"])
     merged["api_key"] = str(merged.get("api_key", ""))
+    # Validate the model only when the request sets it, so legacy stored
+    # ids cannot break api_key-only updates.
+    merged["model"] = str(merged.get("model") or "").strip()
+    if ("model" in body
+            and merged["model"] not in {m["id"] for m in AVAILABLE_LLM_MODELS}):
+        return jsonify({"message": f"Unknown LLM model: {merged['model']}"}), 400
+    model_changed = merged["model"] != current["model"]
     old_hash = _current_prompt_hash(project) if _llm_enabled(project) else None
     project.update_config(llm=merged)
+    if model_changed:
+        # Changing the model invalidates cached pre-fill data for records
+        # without a final decision. Runs even without an API key — pure
+        # database bookkeeping.
+        with project.db as db:
+            n = db.invalidate_llm_results()
+        logging.info("LLM model changed; invalidated %s pre-processed records", n)
     if _llm_enabled(project) and old_hash is not None:
         new_hash = _current_prompt_hash(project)
         if new_hash != old_hash:

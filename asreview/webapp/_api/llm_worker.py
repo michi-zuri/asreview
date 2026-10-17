@@ -260,23 +260,26 @@ def process_with_retry(db, resolver, client, record, prompt, prompt_hash,
             sleep(delay)
 
 
-def run_worker_once(project, model, max_concurrent=3, max_attempts=5,
+def run_worker_once(project, model=None, max_concurrent=3, max_attempts=5,
                     db_factory=None, resolver_factory=None,
                     executor=None):
     """Claim and process all currently-queued dispatch rows once.
 
     Returns the number of records processed.  Builds the current system
-    prompt from the project's tags/lists + stored criteria text.  Each
-    pooled job opens its own Database (db_factory) so sqlite is never
-    shared across threads.
+    prompt from the project's tags/lists + stored criteria text.  The
+    screening model defaults to the project's LLM setting (chosen in the
+    LLM screening settings pane).  Each pooled job opens its own Database
+    (db_factory) so sqlite is never shared across threads.
 
     When *executor* is given it is used to schedule jobs (caller owns the
     pool lifetime); otherwise a fresh ThreadPoolExecutor is created.
     """
+    from asreview.webapp._api.projects import DEFAULT_LLM_MODEL
     from asreview.webapp._api.projects import _llm_enabled
     from asreview.webapp._api.projects import _llm_settings
 
     settings = _llm_settings(project)
+    model = model or settings.get("model") or DEFAULT_LLM_MODEL
 
     # The project's API key is the hard switch for LLM screening; a
     # whitespace-only key counts as "no key" (same rule as the webapp).
@@ -336,7 +339,7 @@ def run_worker_once(project, model, max_concurrent=3, max_attempts=5,
     return len(claimed)
 
 
-def run_worker(project_path, model="claude-opus-4-8", max_concurrent=3,
+def run_worker(project_path, model=None, max_concurrent=3,
                poll_interval=5.0):
     """Continuously drain a project's LLM queue (single-project mode)."""
     with asr.Project(project_path) as project:
@@ -376,7 +379,15 @@ def discover_project_paths():
     paths = []
     for p in sorted(base.glob("*")):
         if p.is_dir() and (p / asr.Project.PATH_CONFIG).exists():
-            if asr.is_project(p):
+            try:
+                ok = asr.is_project(p)
+            except (OSError, ValueError):
+                logging.debug(
+                    "LLM worker: skipping %s — unreadable project config",
+                    p.name,
+                )
+                continue
+            if ok:
                 paths.append(p)
             else:
                 logging.debug("LLM worker: skipping %s — not a v%s project",
@@ -384,7 +395,8 @@ def discover_project_paths():
     return paths
 
 
-def run_worker_all(model, executor=None, max_concurrent=3, max_attempts=5):
+def run_worker_all(model=None, executor=None, max_concurrent=3,
+                   max_attempts=5):
     """Drain the queued dispatch rows of every project once.
 
     Returns the total number of records processed across all projects. A
@@ -439,7 +451,6 @@ def run_worker_service(poll_interval=5.0, port=None, zotero_sync=True):
     Unless *zotero_sync* is False, a daemon thread also refreshes the
     Zotero full-text cache of every project in the background.
     """
-    model = "claude-opus-4-8"
     max_concurrent = 3
     if zotero_sync:
         threading.Thread(
@@ -449,13 +460,14 @@ def run_worker_service(poll_interval=5.0, port=None, zotero_sync=True):
     if port is not None:
         _start_health_server(port)
     logging.info(
-        "ASReview LLM worker starting (model=%s, max_concurrent=%s)",
-        model, max_concurrent,
+        "ASReview LLM worker starting (model=per-project setting, "
+        "max_concurrent=%s)",
+        max_concurrent,
     )
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
         while True:
             n = run_worker_all(
-                model, executor=executor,
+                executor=executor,
                 max_concurrent=max_concurrent,
             )
             if n == 0:

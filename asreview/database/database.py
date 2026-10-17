@@ -1177,6 +1177,38 @@ class Database:
         )
         con.commit()
 
+    def invalidate_llm_results(self):
+        """Delete cached results and re-queue records without a final decision.
+
+        Used when the screening model changes: cached pre-fill payloads were
+        produced by the old model and are no longer valid, so every record
+        that has llm_results rows but no final label (no results row, or
+        label IS NULL) gets its results deleted (all prompt hashes) and its
+        dispatch row reset to 'queued' with attempts=0 and last_error=NULL.
+        The prompt_hash and dispatched_at are preserved. Records with a final
+        label keep their results. Returns the number of records invalidated.
+        """
+        con = self._conn
+        cur = con.cursor()
+        rows = cur.execute(
+            "SELECT DISTINCT lr.record_id FROM llm_results lr "
+            "LEFT JOIN results r ON r.record_id = lr.record_id "
+            "WHERE r.record_id IS NULL OR r.label IS NULL "
+            "ORDER BY lr.record_id"
+        ).fetchall()
+        for (record_id,) in rows:
+            cur.execute(
+                "DELETE FROM llm_results WHERE record_id = ?",
+                (record_id,),
+            )
+            cur.execute(
+                "UPDATE llm_dispatch SET status = 'queued', attempts = 0, "
+                "last_error = NULL WHERE record_id = ?",
+                (record_id,),
+            )
+        con.commit()
+        return len(rows)
+
     def increment_dispatch_attempts(self, record_id):
         """Increment attempts on a dispatch row; return the new count."""
         con = self._conn

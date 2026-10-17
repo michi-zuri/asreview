@@ -9,6 +9,11 @@ import {
   DialogContent,
   DialogTitle,
   Divider,
+  FormControl,
+  FormHelperText,
+  InputLabel,
+  MenuItem,
+  Select,
   Skeleton,
   Stack,
   TextField,
@@ -26,6 +31,7 @@ const EMPTY_SETTINGS = {
   max_concurrent_llm: 3,
   criteria_text: "",
   api_key: "",
+  model: "claude-opus-4-6",
 };
 
 const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
@@ -42,6 +48,7 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
         max_concurrent_llm: initialSettings.max_concurrent_llm ?? 3,
         criteria_text: initialSettings.criteria_text ?? "",
         api_key: typeof rawKey === "string" ? rawKey : "",
+        model: initialSettings.model ?? "claude-opus-4-6",
       });
       setApiKeyTouched(false);
     }
@@ -63,6 +70,7 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
       buffer_size: state.buffer_size,
       max_concurrent_llm: state.max_concurrent_llm,
       criteria_text: state.criteria_text,
+      model: state.model,
     };
     // Only send the API key if the user actually touched the field.
     if (apiKeyTouched) {
@@ -76,6 +84,33 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
       <DialogTitle>LLM screening settings</DialogTitle>
       <DialogContent>
         <Stack spacing={3} sx={{ pt: 1 }}>
+          <FormControl fullWidth>
+            <InputLabel id="llm-model-label">Model</InputLabel>
+            <Select
+              labelId="llm-model-label"
+              label="Model"
+              value={state.model}
+              onChange={(e) => {
+                setState((prev) => ({ ...prev, model: e.target.value }));
+              }}
+            >
+              {initialSettings?.models?.map((m) => (
+                <MenuItem key={m.id} value={m.id}>
+                  {m.label}
+                </MenuItem>
+              ))}
+              {state.model &&
+                !initialSettings?.models?.some((m) => m.id === state.model) && (
+                  <MenuItem key={state.model} value={state.model}>
+                    {state.model}
+                  </MenuItem>
+                )}
+            </Select>
+            <FormHelperText>
+              Changing the model invalidates pre-processed records without a
+              final decision.
+            </FormHelperText>
+          </FormControl>
           <TextField
             label="Buffer size"
             type="number"
@@ -167,6 +202,15 @@ const LlmSettingsCard = () => {
           </Stack>
         ) : (
           <Stack spacing={2}>
+            <Box>
+              <Typography variant="subtitle2">Model</Typography>
+              <Typography variant="body2" color="text.secondary">
+                {settings?.models?.find((m) => m.id === settings?.model)
+                  ?.label ??
+                  settings?.model ??
+                  "claude-opus-4-6"}
+              </Typography>
+            </Box>
             <Box>
               <Typography variant="subtitle2">Buffer size</Typography>
               <Typography variant="body2" color="text.secondary">

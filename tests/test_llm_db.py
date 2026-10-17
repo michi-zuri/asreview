@@ -723,3 +723,81 @@ def test_force_requeue_bypasses_cache(db_pool):
         "SELECT prompt_hash FROM llm_results WHERE record_id=0"
     ).fetchone()
     assert result[0] == "A"
+
+
+# --- Model-change invalidation tests ---
+
+
+def _llm_results_rows(db, record_id):
+    cur = db._conn.cursor()
+    return cur.execute(
+        "SELECT prompt_hash, model FROM llm_results WHERE record_id = ?",
+        (record_id,),
+    ).fetchall()
+
+
+def test_invalidate_llm_results_unlabeled_deleted_and_requeued(db_pool):
+    """A stored result for an unlabeled record is deleted and re-queued."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "H", "claude-opus-4-6", '{"labels":[]}', 10, 20)
+
+    assert db_pool.invalidate_llm_results() == 1
+    assert _llm_results_rows(db_pool, 0) == []
+    assert _dispatch_status(db_pool, 0) == ("queued", None, 0)
+
+
+def test_invalidate_llm_results_keeps_labeled(db_pool):
+    """A labeled record keeps its result and 'ready' status."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "H", "m", '{"labels":[]}', 10, 20)
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(1, "H", "m", '{"labels":[]}', 10, 20)
+    db_pool.label_record(1, 1, user_id=1)
+
+    assert db_pool.invalidate_llm_results() == 1
+
+    assert _llm_results_rows(db_pool, 1) == [("H", "m")]
+    assert _dispatch_status(db_pool, 1)[0] == "ready"
+
+    assert _llm_results_rows(db_pool, 0) == []
+    assert _dispatch_status(db_pool, 0) == ("queued", None, 0)
+
+
+def test_invalidate_llm_results_keeps_prompt_hash_and_time(db_pool):
+    """Re-queue preserves prompt_hash and dispatched_at."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "H", "m", '{"labels":[]}', 10, 20)
+    db_pool.force_requeue(0, "H-old")
+    cur = db_pool._conn.cursor()
+    dispatched_at = cur.execute(
+        "SELECT dispatched_at FROM llm_dispatch WHERE record_id = 0"
+    ).fetchone()[0]
+
+    assert db_pool.invalidate_llm_results() == 1
+
+    row = cur.execute(
+        "SELECT status, prompt_hash, attempts, last_error, dispatched_at "
+        "FROM llm_dispatch WHERE record_id = 0"
+    ).fetchone()
+    assert row == ("queued", "H-old", 0, None, dispatched_at)
+
+
+def test_invalidate_llm_results_deletes_all_prompt_hashes(db_pool):
+    """Results stored under multiple hashes are all deleted; count is per record."""
+    db_pool.top_up_dispatch(3, "H")
+    db_pool.claim_next_queued_dispatch()
+    db_pool.store_llm_result(0, "H", "m", '{"labels":[]}', 10, 20)
+    db_pool.store_llm_result(0, "H2", "m", '{"labels":[]}', 10, 20)
+
+    assert db_pool.invalidate_llm_results() == 1
+    assert _llm_results_rows(db_pool, 0) == []
+
+
+def test_invalidate_llm_results_no_results_zero(db_pool):
+    """Records without cached results are not touched; returns 0."""
+    db_pool.top_up_dispatch(3, "H")
+    assert db_pool.invalidate_llm_results() == 0
+    assert _dispatch_status(db_pool, 0)[0] == "queued"

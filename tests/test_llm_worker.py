@@ -34,6 +34,9 @@ def make_response(text, in_tok=11, out_tok=22):
 class FakeResolver:
     def __init__(self, path):
         self._path = path
+        # screen_record's _ensure_attachment reads resolver.config; disabled
+        # Zotero config makes the lookup a no-op.
+        self.config = types.SimpleNamespace(enabled=False)
 
     def resolve(self, record):
         return self._path
@@ -369,20 +372,22 @@ def _dispatch_status_full(db, record_id):
 # --- run_worker_once test ---
 
 
-def test_run_worker_once(tmp_path):
+def test_run_worker_once(tmp_path, monkeypatch):
     """run_worker_once processes all 3 queued dispatch rows."""
     proj = asr.Project.create(Path(tmp_path, "proj"))
     proj.db.input.add_records([Record(i, "d") for i in range(3)])
     proj.db.add_last_ranking([0, 1, 2], "nb", "max", "balanced", "tfidf", 0)
     proj.db.top_up_dispatch(3, "seed")
+    proj.update_config(llm={"api_key": "sk-ant-test"})
     pdf = tmp_path / "x.pdf"
     pdf.write_bytes(b"%PDF-1.7")
     client = types.SimpleNamespace(messages=types.SimpleNamespace(
         create=mock.Mock(return_value=make_response('{"labels":[],"lists":[]}'))))
+    monkeypatch.setattr(llm_worker.anthropic, "Anthropic",
+                        mock.Mock(return_value=client))
 
     n = llm_worker.run_worker_once(
-        proj, client, "claude-opus-4-8", max_concurrent=1,
-        resolver_factory=lambda: FakeResolver(pdf))
+        proj, max_concurrent=1, resolver_factory=lambda: FakeResolver(pdf))
 
     assert n == 3
     cur = proj.db._conn.cursor()
@@ -411,7 +416,7 @@ def test_worker_client_pins_anthropic_endpoint(tmp_path, monkeypatch):
     client_cls = mock.Mock()
     monkeypatch.setattr(llm_worker.anthropic, "Anthropic", client_cls)
 
-    n = llm_worker.run_worker_once(proj, "claude-opus-4-8")
+    n = llm_worker.run_worker_once(proj)
 
     assert n == 0  # empty dispatch queue
     client_cls.assert_called_once_with(
@@ -428,6 +433,7 @@ def _seed_project(base, name, n=2):
     proj.db.input.add_records([Record(i, "d") for i in range(n)])
     proj.db.add_last_ranking(list(range(n)), "nb", "max", "balanced", "tfidf", 0)
     proj.db.top_up_dispatch(n, "seed")
+    proj.update_config(llm={"api_key": "sk-ant-test"})
     proj.close()
     return proj
 
@@ -459,10 +465,13 @@ def test_run_worker_all_drains_all(tmp_path, monkeypatch):
     monkeypatch.setenv("ASREVIEW_PATH", str(tmp_path))
     _seed_project(tmp_path, "p1", n=2)
     _seed_project(tmp_path, "p2", n=2)
+    # No Zotero config → no API call happens; the client is only built.
+    monkeypatch.setattr(
+        llm_worker.anthropic, "Anthropic", mock.Mock(return_value=mock.Mock())
+    )
 
     total = llm_worker.run_worker_all(
-        client=mock.Mock(), model="claude-opus-4-8",
-        executor=None, max_concurrent=1,
+        model="claude-opus-4-6", executor=None, max_concurrent=1,
     )
 
     assert total == 4
@@ -485,10 +494,12 @@ def test_run_worker_all_bad_project_skipped(tmp_path, monkeypatch):
     broken = tmp_path / "broken"
     broken.mkdir()
     (broken / "project.json").write_text("")
+    monkeypatch.setattr(
+        llm_worker.anthropic, "Anthropic", mock.Mock(return_value=mock.Mock())
+    )
 
     total = llm_worker.run_worker_all(
-        client=mock.Mock(), model="claude-opus-4-8",
-        executor=None, max_concurrent=1,
+        model="claude-opus-4-6", executor=None, max_concurrent=1,
     )
 
     assert total == 4
@@ -497,3 +508,32 @@ def test_run_worker_all_bad_project_skipped(tmp_path, monkeypatch):
         with asr.Project(Path(tmp_path, name)) as proj:
             for rid, status in _all_dispatch_statuses(proj):
                 assert status == "missing_pdf"
+
+
+def test_worker_uses_project_model(tmp_path, monkeypatch):
+    """The worker screens with the project's configured model."""
+    proj = asr.Project.create(Path(tmp_path, "proj"))
+    proj.update_config(llm={
+        "api_key": "sk-ant-test", "model": "claude-sonnet-4-6"})
+    proj.db.input.add_records([Record(0, "d")])
+    proj.db.add_last_ranking([0], "nb", "max", "balanced", "tfidf", 0)
+    proj.db.top_up_dispatch(1, "H")
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.7")
+    client = types.SimpleNamespace(messages=types.SimpleNamespace(
+        create=mock.Mock(return_value=make_response('{"labels":[],"lists":[]}'))))
+    monkeypatch.setattr(llm_worker.anthropic, "Anthropic",
+                        mock.Mock(return_value=client))
+
+    n = llm_worker.run_worker_once(
+        proj, max_concurrent=1, resolver_factory=lambda: FakeResolver(pdf))
+
+    assert n == 1
+    kwargs = client.messages.create.call_args.kwargs
+    assert kwargs["model"] == "claude-sonnet-4-6"
+    # The stored result row records the same model.
+    cur = proj.db._conn.cursor()
+    row = cur.execute(
+        "SELECT model FROM llm_results WHERE record_id = 0"
+    ).fetchone()
+    assert row[0] == "claude-sonnet-4-6"
