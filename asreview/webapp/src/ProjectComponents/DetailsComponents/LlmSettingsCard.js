@@ -1,4 +1,5 @@
 import {
+  Alert,
   Box,
   Button,
   Card,
@@ -34,9 +35,49 @@ const EMPTY_SETTINGS = {
   model: "claude-opus-4-6",
 };
 
-const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
+const LlmSettingsEditDialog = ({
+  open,
+  onClose,
+  initialSettings,
+  onSave,
+  saveError,
+  isSaving,
+  projectId,
+}) => {
   const [state, setState] = React.useState(EMPTY_SETTINGS);
   const [apiKeyTouched, setApiKeyTouched] = React.useState(false);
+  const [models, setModels] = React.useState([]);
+  const [modelsLoading, setModelsLoading] = React.useState(false);
+  const [modelsFailed, setModelsFailed] = React.useState(false);
+  const modelsRequest = React.useRef(0);
+
+  // Fetch the live model listing. apiKey undefined -> the project's
+  // stored key is used; otherwise the given key (never stored).
+  const fetchModels = React.useCallback(
+    (apiKey) => {
+      const requestId = ++modelsRequest.current;
+      setModelsLoading(true);
+      setModelsFailed(false);
+      ProjectAPI.fetchLlmModels(
+        apiKey === undefined
+          ? { project_id: projectId }
+          : { project_id: projectId, api_key: apiKey },
+      )
+        .then((list) => {
+          if (requestId === modelsRequest.current) {
+            setModels(list);
+            setModelsLoading(false);
+          }
+        })
+        .catch(() => {
+          if (requestId === modelsRequest.current) {
+            setModelsFailed(true);
+            setModelsLoading(false);
+          }
+        });
+    },
+    [projectId],
+  );
 
   React.useEffect(() => {
     if (open && initialSettings) {
@@ -51,8 +92,30 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
         model: initialSettings.model ?? "claude-opus-4-6",
       });
       setApiKeyTouched(false);
+      setModels(initialSettings.models ?? []);
+      setModelsFailed(false);
+      setModelsLoading(false);
+      // Refresh the listing every time the dialog opens; with a stored
+      // key the live catalog is fetched.
+      if (initialSettings.api_key) {
+        fetchModels(undefined);
+      } else {
+        // Invalidate any request still in flight from a previous open.
+        modelsRequest.current += 1;
+      }
     }
-  }, [open, initialSettings]);
+  }, [open, initialSettings, fetchModels]);
+
+  // Re-fetch the listing (debounced) as the user types an API key.
+  React.useEffect(() => {
+    if (!open || !apiKeyTouched) {
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      fetchModels(state.api_key.trim());
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [open, apiKeyTouched, state.api_key, fetchModels]);
 
   const handleNumberChange = (field) => (e) => {
     setState((prev) => ({
@@ -94,21 +157,23 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
                 setState((prev) => ({ ...prev, model: e.target.value }));
               }}
             >
-              {initialSettings?.models?.map((m) => (
+              {models.map((m) => (
                 <MenuItem key={m.id} value={m.id}>
                   {m.label}
                 </MenuItem>
               ))}
-              {state.model &&
-                !initialSettings?.models?.some((m) => m.id === state.model) && (
-                  <MenuItem key={state.model} value={state.model}>
-                    {state.model}
-                  </MenuItem>
-                )}
+              {state.model && !models.some((m) => m.id === state.model) && (
+                <MenuItem key={state.model} value={state.model}>
+                  {state.model}
+                </MenuItem>
+              )}
             </Select>
             <FormHelperText>
-              Changing the model invalidates pre-processed records without a
-              final decision.
+              {modelsLoading
+                ? "Loading available models…"
+                : modelsFailed
+                  ? "Could not load the model list; showing the last known options."
+                  : "Changing the model invalidates pre-processed records without a final decision."}
             </FormHelperText>
           </FormControl>
           <TextField
@@ -146,14 +211,19 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
               setApiKeyTouched(true);
               handleTextChange("api_key")(e);
             }}
-            helperText="Leave blank to use the ANTHROPIC_API_KEY environment variable"
+            helperText="Required to enable LLM screening"
             fullWidth
           />
         </Stack>
+        {saveError && (
+          <Alert severity="error" sx={{ mt: 2 }}>
+            {saveError}
+          </Alert>
+        )}
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose}>Cancel</Button>
-        <Button onClick={handleSave} variant="contained">
+        <Button onClick={handleSave} variant="contained" disabled={isSaving}>
           Save
         </Button>
       </DialogActions>
@@ -164,6 +234,8 @@ const LlmSettingsEditDialog = ({ open, onClose, initialSettings, onSave }) => {
 const LlmSettingsCard = () => {
   const projectId = useContext(ProjectContext);
   const queryClient = useQueryClient();
+  const [editDialogOpen, setEditDialogOpen] = React.useState(false);
+  const [saveError, setSaveError] = React.useState(null);
 
   const { data: settings, isLoading } = useQuery(
     ["fetchLlmSettings", { project_id: projectId }],
@@ -179,11 +251,18 @@ const LlmSettingsCard = () => {
     {
       onSuccess: () => {
         queryClient.invalidateQueries(["fetchLlmSettings"]);
+        setSaveError(null);
+        setEditDialogOpen(false);
+      },
+      onError: (error) => {
+        // Keep the dialog open and show the backend's message (e.g. the
+        // model id failed live validation).
+        setSaveError(
+          error?.message || "Could not save the LLM screening settings.",
+        );
       },
     },
   );
-
-  const [editDialogOpen, setEditDialogOpen] = React.useState(false);
 
   return (
     <Card>
@@ -242,7 +321,7 @@ const LlmSettingsCard = () => {
               <Typography variant="body2" color="text.secondary">
                 {settings?.api_key
                   ? "********"
-                  : "(using ANTHROPIC_API_KEY env var)"}
+                  : "(no API key provided, LLM processing is disabled)"}
               </Typography>
             </Box>
           </Stack>
@@ -253,7 +332,10 @@ const LlmSettingsCard = () => {
         <Button
           variant="contained"
           startIcon={<EditIcon />}
-          onClick={() => setEditDialogOpen(true)}
+          onClick={() => {
+            setSaveError(null);
+            setEditDialogOpen(true);
+          }}
           disabled={isLoading || isSaving}
         >
           Edit settings
@@ -263,9 +345,12 @@ const LlmSettingsCard = () => {
         open={editDialogOpen}
         onClose={() => setEditDialogOpen(false)}
         initialSettings={settings}
+        projectId={projectId}
+        saveError={saveError}
+        isSaving={isSaving}
         onSave={(newSettings) => {
+          // The dialog stays open on failure so the error is visible.
           mutate({ project_id: projectId, ...newSettings });
-          setEditDialogOpen(false);
         }}
       />
     </Card>

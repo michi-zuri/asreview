@@ -31,6 +31,7 @@ from dataclasses import asdict
 from pathlib import Path
 from uuid import uuid4
 
+import anthropic
 import datahugger
 import numpy as np
 import pandas as pd
@@ -113,14 +114,21 @@ except importlib.metadata.PackageNotFoundError:
 
 bp = Blueprint("api", __name__, url_prefix="/api")
 
-# Newest Opus is the default screening model; the catalog is the single
-# source of truth for the model dropdown in the LLM settings pane.
+# Newest Opus is the default screening model. The model dropdown is fed by
+# the live Anthropic Models API (client.models.list) with the project's API
+# key; FALLBACK_LLM_MODELS is only served when no key is configured or the
+# Models API cannot be reached.
 DEFAULT_LLM_MODEL = "claude-opus-4-6"
-AVAILABLE_LLM_MODELS = [
-    {"id": "claude-opus-4-6", "label": "Opus 4.6"},
-    {"id": "claude-sonnet-4-6", "label": "Sonnet 4.6"},
-    {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5"},
+FALLBACK_LLM_MODELS = [
+    {"id": "claude-opus-4-6", "label": "Claude Opus 4.6", "lifecycle": "active"},
+    {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "lifecycle": "active"},
+    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5",
+     "lifecycle": "active"},
 ]
+
+# Bounds for the Models API catalog fetch.
+LLM_MODELS_REQUEST_TIMEOUT = 15.0
+LLM_MODELS_CACHE_TTL = 600.0
 
 DEFAULT_LLM_SETTINGS = {
     "buffer_size": 20,
@@ -129,6 +137,92 @@ DEFAULT_LLM_SETTINGS = {
     "api_key": "",
     "model": DEFAULT_LLM_MODEL,
 }
+
+
+def _anthropic_models_client(api_key):
+    """Anthropic client for the Models API, pinned to the real endpoint.
+
+    The developer shell exports ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN to
+    route Claude Code through a DeepSeek-compatible endpoint; the webapp
+    must not inherit that (same rule as the LLM worker).
+    """
+    return anthropic.Anthropic(
+        api_key=api_key,
+        base_url="https://api.anthropic.com",
+        timeout=LLM_MODELS_REQUEST_TIMEOUT,
+    )
+
+
+def _collect_models_page(client, models, lifecycle=None):
+    """Append every model of a listing (all pages) into *models*.
+
+    ``lifecycle=None`` lists active + deprecated models; ``"retired"``
+    lists the retired ones. ``models`` maps id -> ModelInfo, so merging
+    both listings deduplicates.
+    """
+    after_id = None
+    while True:
+        kwargs = {"limit": 1000}
+        if after_id is not None:
+            kwargs["after_id"] = after_id
+        if lifecycle is not None:
+            # The Models API expects a repeated "lifecycle[]" query param
+            # ("lifecycle" alone is rejected with a 400).
+            kwargs["extra_query"] = {"lifecycle[]": lifecycle}
+        page = client.models.list(**kwargs)
+        for model in page.data:
+            models.setdefault(model.id, model)
+        if not page.has_more or not page.last_id:
+            return
+        after_id = page.last_id
+
+
+# Cached live catalogs: api_key -> (monotonic expiry, catalog).
+_LLM_MODELS_CACHE = {}
+
+
+def _fetch_llm_models(api_key):
+    """Live model catalog for *api_key*, or None when it can't be fetched.
+
+    Returns the newest-first list of {id, label, lifecycle} dicts for
+    every model the key can see (active, deprecated and retired); None
+    when no key is given or the Models API is unreachable. Results are
+    cached per API key.
+    """
+    api_key = str(api_key or "").strip()
+    if not api_key:
+        return None
+    now = time.monotonic()
+    # Tests bypass the cache entirely so mocked catalogs don't leak
+    # between tests that share an API key.
+    testing = current_app.testing
+    cached = None if testing else _LLM_MODELS_CACHE.get(api_key)
+    if cached is not None and cached[0] > now:
+        return cached[1]
+    try:
+        client = _anthropic_models_client(api_key)
+        models = {}
+        _collect_models_page(client, models)
+    except Exception as err:
+        logging.warning("could not fetch the Anthropic model catalog: %s", err)
+        return cached[1] if cached is not None else None
+    # Retired models come from a separate listing; merge them so a stored
+    # retired id stays visible in the dropdown. Best-effort: a failure here
+    # must never hide the main listing.
+    try:
+        _collect_models_page(client, models, lifecycle="retired")
+    except Exception as err:
+        logging.debug("could not fetch the retired model listing: %s", err)
+    catalog = []
+    for model in models.values():
+        label = getattr(model, "display_name", None) or model.id
+        lifecycle = getattr(model, "lifecycle", None)
+        if lifecycle in ("deprecated", "retired"):
+            label = f"{label} ({lifecycle})"
+        catalog.append({"id": model.id, "label": label, "lifecycle": lifecycle})
+    if not testing:
+        _LLM_MODELS_CACHE[api_key] = (now + LLM_MODELS_CACHE_TTL, catalog)
+    return catalog
 
 
 def _llm_settings(project):
@@ -2751,11 +2845,34 @@ def api_apply_llm(project, record_id):  # noqa: F401
 @project_authorization
 def api_get_llm_settings(project):  # noqa: F401
     settings = _llm_settings(project)
+    # Feed the model dropdown from the live Models API; fall back to the
+    # hardcoded short list when there is no key or the API is unreachable.
+    catalog = _fetch_llm_models(settings.get("api_key"))
+    settings["models"] = catalog if catalog is not None else FALLBACK_LLM_MODELS
     # Mask the API key — never expose it to the frontend.
     if settings.get("api_key"):
         settings["api_key"] = True
-    settings["models"] = AVAILABLE_LLM_MODELS
     return jsonify(settings)
+
+
+@bp.route("/projects/<project_id>/llm_models", methods=["POST"])
+@login_required
+@project_authorization
+def api_list_llm_models(project):  # noqa: F401
+    """Live Anthropic model catalog for the given (or stored) API key.
+
+    Used by the LLM settings dialog to refresh the model dropdown: with
+    an ``api_key`` in the body the listing is fetched with that key,
+    otherwise with the project's stored key. The key is never stored.
+    """
+    body = request.get_json(silent=True) or {}
+    if "api_key" in body:
+        api_key = str(body.get("api_key") or "").strip()
+    else:
+        api_key = _llm_settings(project).get("api_key")
+    catalog = _fetch_llm_models(api_key)
+    return jsonify({"models": catalog if catalog is not None
+                    else FALLBACK_LLM_MODELS})
 
 
 @bp.route("/projects/<project_id>/llm_settings", methods=["PUT"])
@@ -2771,11 +2888,15 @@ def api_update_llm_settings(project):  # noqa: F401
     merged["criteria_text"] = str(merged["criteria_text"])
     merged["api_key"] = str(merged.get("api_key", ""))
     # Validate the model only when the request sets it, so legacy stored
-    # ids cannot break api_key-only updates.
+    # ids cannot break api_key-only updates. The check uses the live Models
+    # API (the same listing that feeds the dropdown); without a key or
+    # while the API is unreachable the id is accepted as-is.
     merged["model"] = str(merged.get("model") or "").strip()
-    if ("model" in body
-            and merged["model"] not in {m["id"] for m in AVAILABLE_LLM_MODELS}):
-        return jsonify({"message": f"Unknown LLM model: {merged['model']}"}), 400
+    if "model" in body:
+        catalog = _fetch_llm_models(merged.get("api_key"))
+        if catalog is not None and \
+                merged["model"] not in {m["id"] for m in catalog}:
+            return jsonify({"message": f"Unknown LLM model: {merged['model']}"}), 400
     model_changed = merged["model"] != current["model"]
     old_hash = _current_prompt_hash(project) if _llm_enabled(project) else None
     project.update_config(llm=merged)

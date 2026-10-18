@@ -1173,6 +1173,26 @@ class ProjectAPI {
     });
   }
 
+  static fetchLlmModels({ project_id, api_key }) {
+    // api_key undefined -> list with the project's stored key; otherwise
+    // with the given key (never stored).
+    const url = api_url + `projects/${project_id}/llm_models`;
+    return new Promise((resolve, reject) => {
+      axios({
+        method: "post",
+        url: url,
+        data: api_key === undefined ? {} : { api_key },
+        withCredentials: true,
+      })
+        .then((result) => {
+          resolve(result["data"]["models"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
   static reprocessRecord({ project_id, record_id }) {
     const url =
       api_url + `projects/${project_id}/record/${record_id}/reprocess`;
