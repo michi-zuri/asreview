@@ -166,14 +166,16 @@ const LlmResultCard = ({
                 </Typography>
               </Alert>
             )}
-            <Stack direction="row" spacing={1} alignItems="center">
-              <CheckCircleOutlineIcon fontSize="small" color="success" />
-              <Typography variant="body2" fontWeight="medium">
-                {justLanded
-                  ? "An automated LLM appraisal just became available. You can apply it with the button below."
-                  : "Pre-processing of full-text by LLM complete, please review automated suggestions with care."}
-              </Typography>
-            </Stack>
+            {!pdfMismatch && (
+              <Stack direction="row" spacing={1} alignItems="center">
+                <CheckCircleOutlineIcon fontSize="small" color="success" />
+                <Typography variant="body2" fontWeight="medium">
+                  {justLanded
+                    ? "An automated LLM appraisal just became available. You can apply it with the button below."
+                    : "Pre-processing of full-text by LLM complete, please review automated suggestions with care."}
+                </Typography>
+              </Stack>
+            )}
             <Stack
               direction="row"
               spacing={1}
