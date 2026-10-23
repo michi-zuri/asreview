@@ -1,0 +1,267 @@
+========================================================================
+TASK 10g — Spec 0001 Part 4a (backend): labeled/changes, labeled/ids,
+           records?ids= and change-log pruning
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10f merged (Part 3 verified by the user).
+SPEC: specs/0001-collection-snapshot.md, "Part 4", D3, D4, D11, the
+      implementer's defaults, and the implementation notes. The spec
+      wins. STOP and report if it disagrees with this prompt.
+
+WHY
+  The Collection shows a snapshot (everything loaded so far, D3). The
+  client needs three cheap questions answered:
+    - "What changed since version V, and does each changed record belong
+      in my view at or before my boundary?" → labeled/changes (polled
+      every 15 s)
+    - "Give me these rows in /labeled shape" → records?ids=
+    - "What is the full ordered membership down to my boundary?" →
+      labeled/ids (Refresh = reconcile, D4)
+  All three MUST filter and order exactly like /labeled. That is why 10b
+  extracted _parse_labeled_query and _iter_labeled_matches: reuse them,
+  never copy them.
+
+FACTS (verified — trust these)
+  - asreview/webapp/_api/projects.py (after 10b/10f):
+    _labeled_filter_signature, _encode_cursor(time, rid, sig),
+    _decode_cursor(param, sig) → (time|None, rid) | None (ValueError on
+    bad input), _parse_labeled_query(project) → q dict,
+    _iter_labeled_matches(db, q, cursor, batch_size) → yields
+    (state, key) with key = (time|None, rid) in display order,
+    _users_map(project), _build_rows(db, project, states) (adds
+    "version"), _collection_forms. api_get_labeled reads
+    db.get_project_state() first.
+  - Display order (database.py get_results_page / get_unlabeled_page):
+      labeled, latest_first:  (time IS NULL) ASC, time DESC, record_id DESC
+      labeled, oldest first:  (time IS NULL) ASC, time ASC,  record_id ASC
+      unlabeled:              record_id DESC (latest_first) / ASC
+    q["subset"] == "unlabeled" selects the unlabeled path. For unlabeled
+    rows the key's time is always None.
+  - Route decorators of /labeled: @bp.route(...), @login_required,
+    @project_authorization; the view takes `project`.
+    No route /projects/<project_id>/records exists yet. The
+    /labeled/<…> paths are free.
+  - get_unlabeled_page builds its SELECT from `rec.record_id AS
+    record_id` plus an explicit results_columns list over
+    `record rec LEFT JOIN results r`, then parses tags with _load_tags.
+    get_results_page returns SELECT * FROM results (same columns).
+  - project_state (10d) has pruned_version and last_pruned_at.
+    change_log has PRIMARY KEY (project_id, version) and an index on
+    (project_id, changed_at).
+
+DESIGN (decided — follow it)
+  Database (database.py), next to get_project_state:
+    def get_changes_since(self, since, until):
+        """[(record_id, version)] for change_log rows with
+        since < version <= until: one entry per record (its max version),
+        ordered by that version."""
+        SELECT record_id, MAX(version) AS v FROM change_log
+         WHERE version > ? AND version <= ?
+         GROUP BY record_id ORDER BY v
+    def count_changed_records_since(self, since, until):  (optional; you
+        may instead fetch with LIMIT 201 and test the length)
+    def prune_change_log(self, older_than_s=7*86400, min_interval_s=3600,
+                         now=None):
+        """Delete change_log rows older than `older_than_s`, at most once
+        per `min_interval_s`. Records the highest deleted version in
+        project_state.pruned_version. Returns the number of rows deleted."""
+        In one transaction:
+          read last_pruned_at; if it is not None and now - last_pruned_at
+          < min_interval_s → return 0
+          cutoff = now - older_than_s
+          SELECT MAX(version) FROM change_log WHERE changed_at < cutoff
+          DELETE FROM change_log WHERE changed_at < cutoff
+          UPDATE project_state SET last_pruned_at = now,
+                 pruned_version = MAX(pruned_version, COALESCE(:maxdel, 0))
+          commit
+    def get_record_states(self, record_ids):
+        """Results state for arbitrary base records, in the same columns as
+        get_unlabeled_page (record LEFT JOIN results, NULLs when there is
+        no results row), with ``tags`` parsed. Order follows record_ids;
+        unknown ids are skipped. No filter, no duplicate_of condition."""
+        Reuse get_unlabeled_page's results_columns list: move it to a
+        module-level constant _PAGE_RESULTS_COLUMNS and use it in both
+        places. Chunk the IN list at 900.
+
+  projects.py helpers (after _iter_labeled_matches):
+    def _sort_tuple(q, key):
+        """Total-order tuple of a (time, record_id) key in display order;
+        smaller sorts first."""
+        t, rid = key
+        if q["subset"] == "unlabeled":
+            return (-rid,) if q["latest_first"] else (rid,)
+        if q["latest_first"]:
+            return (t is None, -(t or 0.0), -rid)
+        return (t is None, t or 0.0, rid)
+    def _parse_boundary(q):
+        """request.args["boundary"]: "end" → None (no limit); otherwise a
+        cursor → its decoded key. Missing or invalid → ValueError."""
+    def _scan_to_boundary(db, q, boundary_key):
+        """Return (matches, has_more): every (state, key) at or before the
+        boundary (all when boundary_key is None) and whether at least one
+        match exists beyond it."""
+        Iterate _iter_labeled_matches(db, q, None, 500). Stop at the first
+        key whose _sort_tuple > _sort_tuple(boundary_key), and report
+        has_more=True in that case.
+    def _sort_key_json(q, key):
+        rid for unlabeled; [time, rid] for labeled (time may be None)
+
+  Endpoints (same decorators as /labeled; same subset/filter/latest_first
+  params, parsed with _parse_labeled_query):
+
+  1. GET /projects/<project_id>/labeled/changes?since=<int>&boundary=…
+       since missing / not an int / < 0 → 400.
+       boundary invalid → 400 (spec: cursor errors stay 400).
+       with project.db as db:
+         db.prune_change_log()                 # opportunistic, ≤ 1/hour
+         ps = db.get_project_state()           # the watermark, read FIRST (D11)
+         wm = ps["version"]
+         if since > wm or since < ps["pruned_version"]:
+             return {"reset": True, "watermark": wm}
+         changes = db.get_changes_since(since, wm)
+         if len(changes) > 200:
+             return {"reset": True, "watermark": wm}
+         out = []
+         if changes:
+             matches, _ = _scan_to_boundary(db, q, boundary_key)
+             keys = {int(s["record_id"]): k for s, k in matches}
+             for rid, v in changes:
+                 in_view = rid in keys
+                 out.append({"record_id": rid, "version": v,
+                             "in_view": in_view,
+                             "sort_key": _sort_key_json(q, keys[rid])
+                                         if in_view else None})
+       return {"watermark": wm, "config_version": ps["config_version"],
+               "changes": out}
+     The membership scan only runs when there ARE changes (most polls are
+     empty and cost two small SELECTs).
+     sort_key is null when in_view is false (the client does not need
+     it then; flagged in the spec notes).
+
+  2. GET /projects/<project_id>/records?ids=1,2,3
+       Parse the comma-separated ints. Empty → result []. More than 500
+       ids or a non-int → 400.
+       with project.db as db:
+         wm = db.get_project_state()["version"]   # first (D11)
+         states = [row for _, row in db.get_record_states(ids).iterrows()]
+         result = _build_rows(db, project, states)
+       return {"result": result, "watermark": wm,
+               "users": _users_map(project)}
+     ("users" is an addition to the spec's shape: patched rows may carry a
+     user_id the client has never seen. It is flagged in the spec notes.)
+     Check that each state passed to _build_rows looks exactly like an
+     _iter_labeled_matches state (same keys). Compare the row keys in a
+     test.
+
+  3. GET /projects/<project_id>/labeled/ids?boundary=…
+       with project.db as db:
+         ps = db.get_project_state()          # first (D11)
+         matches, has_more = _scan_to_boundary(db, q, boundary_key)
+         ids = [int(s["record_id"]) for s, _ in matches]
+         versions = db.get_record_versions(ids)
+         items = [[rid, int(versions.get(rid, 0)), _sort_key_json(q, k)]
+                  for (s, k), rid in zip(matches, ids)]
+         if not has_more:
+             next_cursor = None
+         elif matches:
+             next_cursor = _encode_cursor(*matches[-1][1], q["filter_sig"])
+         else:
+             # Every loaded row left the view, but matches exist beyond the
+             # old boundary: hand the boundary back so scrolling resumes there.
+             next_cursor = request.args["boundary"]
+       return {"watermark": ps["version"],
+               "config_version": ps["config_version"],
+               "items": items, "next_cursor": next_cursor}
+     next_cursor lets the client keep scrolling from its (possibly
+     shifted) boundary with the normal /labeled?cursor=. It is null
+     exactly when nothing matches beyond the boundary.
+
+  Numpy-style docstrings on the three views, like api_get_labeled's.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/webapp/_api/projects.py: everything from
+    _labeled_filter_signature to the end of api_get_labeled_stats
+  - asreview/database/database.py: get_project_state,
+    get_record_versions, get_results_page, get_unlabeled_page, _load_tags
+  - asreview/webapp/tests/test_api/test_labeled_pagination.py
+  - tests/test_change_tracking.py
+
+------------------------------------------------------------------------
+TESTS
+------------------------------------------------------------------------
+  A. tests/test_change_tracking.py (DB level):
+     1. get_changes_since: 3 writes to record 1 and 1 to record 2 →
+        [(2, v2), (1, v_last)] ordered by version. The `until` bound is
+        respected.
+     2. prune_change_log with now = changed_at + 8 days: deletes the
+        rows, pruned_version = max deleted version, last_pruned_at set.
+        A second call within the hour deletes nothing even with new old
+        rows.
+     3. get_record_states: an unlabeled id, a labeled id and an unknown
+        id → 2 rows in the requested order, label None / 1.
+
+  B. New file asreview/webapp/tests/test_api/test_collection_sync.py
+     (Flask; reuse the fixtures and _labeled pattern of
+     test_labeled_pagination.py; copy _labeled into this file instead of
+     importing it from another test module):
+     1. test_ids_equal_concatenated_pages (THE KEY EQUIVALENCE TEST):
+        label ~30 records with varied times, plus notes on some. For each
+        of subset in ("relevant", "irrelevant", "all", "unlabeled") ×
+        latest_first in (1, 0) × filter in ([], ["has_note"],
+        ["pdf=false"]):
+          page through /labeled with per_page=7 for 3 pages, and let B
+          be the third page's next_cursor (or "end" if it is None);
+          GET labeled/ids?boundary=B with the same params;
+          assert [i[0] for i in items] == the ids of the 3 pages
+          concatenated; and next_cursor is non-null iff the 3rd page
+          had a next_cursor.
+        Also with boundary="end": items == all pages until exhaustion.
+        Also: when every record of the loaded pages leaves the filter but
+        more matches exist beyond the boundary, items == [] and
+        next_cursor == the boundary that was sent.
+     2. test_changes_in_view_left_filter: "pdf=false", unlabeled, 2
+        pages loaded (boundary = page 2's cursor). Set an attachment key
+        on a record from page 1 via db.input.set_attachment. changes
+        since the old watermark contains that record with in_view False.
+     3. test_changes_entered_above_and_below_boundary: relevant, >= 10
+        labeled records, per_page=5, 1 page loaded. Label a new record now → it sorts first
+        (latest_first) → in_view True with sort_key [time, rid]. Then
+        use latest_first=0 (oldest first, boundary after page 1) → the
+        same new record is in_view False (it sorts beyond the boundary).
+     4. test_changes_empty_poll: since = watermark → changes == [] and no
+        reset.
+     5. test_changes_reset_over_200: 201 records changed → reset.
+     6. test_changes_reset_after_prune: write, then prune with a forced
+        `now` (call db.prune_change_log directly), then poll with since
+        below pruned_version → reset.
+     7. test_changes_note_edit_in_view: note edit on a loaded relevant
+        record → in_view True and sort_key unchanged compared with the
+        snapshot (time is not changed by a note).
+     8. test_records_same_shape: for a few ids, the rows of
+        records?ids= are equal (==) to the same rows in /labeled
+        (labeled and unlabeled cases). Requests with 501 ids or "a,b" →
+        400.
+     9. test_unlabeled_user_filter_checkout: the spec's risk "Unlabeled +
+        user filter means assigned to". Check out a record for user X
+        (db.checkout_oldest_dispatched or a direct update_result with
+        user_id; see test_llm_db.py). changes for subset=unlabeled with
+        filter user_<X> report in_view True.
+     10. bad params: since missing → 400; boundary "garbage" → 400; a
+         boundary made for another filter → 400.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_collection_sync.py asreview/webapp/tests/test_api/test_labeled_pagination.py tests/test_change_tracking.py -q'
+  Paste the output.
+  Measure the in_view cost (spec risk): in the test fixture, time one
+  labeled/changes call with "pdf=false" and boundary "end" on the
+  largest subset, and report the time.
+
+DONE WHEN
+  - The three endpoints exist, reuse the /labeled helpers and pass the
+    tests (above all the equivalence test).
+  - Only these files changed:
+      asreview/webapp/_api/projects.py
+      asreview/database/database.py
+      asreview/webapp/tests/test_api/test_collection_sync.py (new)
+      tests/test_change_tracking.py
+========================================================================

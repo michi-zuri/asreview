@@ -1,0 +1,221 @@
+========================================================================
+TASK 10b — Spec 0001 Part 2 (backend): slim /labeled rows; forms and
+           users once per response; reusable Collection query helpers;
+           edit routes return the updated row
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10a merged.
+SPEC: specs/0001-collection-snapshot.md, "Part 2", D5, D13 and the
+      implementation notes. The spec wins. STOP and report if it
+      disagrees with this prompt.
+
+WHY
+  Every /labeled row embeds the full tags_form, the full lists_form and a
+  user summary, so one 50-row page carries 50 copies of both forms. Forms
+  are a single current definition (tags are stored by option id), so
+  sending them once per response is pure de-duplication.
+  This task also cuts api_get_labeled into helpers, because Part 4 adds
+  three endpoints (labeled/ids, labeled/changes, records) that must filter,
+  order and build rows EXACTLY like /labeled. Copies would drift.
+  Finally, the two edit routes the Collection uses (PUT record, PUT note)
+  return the updated row in the same shape, so the client can patch one
+  card instead of reloading the list (D13).
+
+FACTS (verified — trust these)
+  - asreview/webapp/_api/projects.py :: api_get_labeled (~lines 844–1098)
+    does all of these inline: query-param parsing, reading tags_form
+    (read_tags_data), tag_filters, cursor decode (400 on ValueError), a
+    users map (AUTHENTICATION only: collaborators + owner, summarize(),
+    "owner" and "current_user" flags), pdf_ids/abstract_ids sets, a
+    `passes()` closure, a batch scan loop over db.get_results_page /
+    db.get_unlabeled_page, next_cursor, and the row building. Each row
+    gets `tags_form`, `lists_form` and `state.user`, and `state.user_id`
+    is deleted.
+    Response today: {"count", "next_cursor", "result"}.
+  - api_label_record (PUT branch, ~line 2367) returns {"result": item} with
+    tags_form/lists_form and state.user = None. Its frontend caller
+    (mutateClassification) uses the PUT result only for `discarded`. The
+    POST branch returns {"success": True} and must not change.
+  - api_update_note (~line 2399) returns {"success": True}. `record_id` is
+    the URL string there.
+  - The search route (api_search_data) also embeds tags_form/lists_form
+    per row. LEAVE IT UNCHANGED: other pages use it and RecordCard keeps a
+    fallback to record.tags_form (task 10c).
+  - db.get_results_record(record_id) returns a DataFrame (SELECT * FROM
+    results ... plus parsed `tags`).
+  - asreview/webapp/tests/test_api/test_projects.py::test_label_with_lists
+    (~line 438) asserts `record["lists_form"] is None` on a /labeled row.
+    That assertion moves to the response-level `forms`.
+  - _is_missing_scalar(v) returns False for lists (pd.isna on a list
+    raises and is caught), so it is safe to apply it to every state value.
+
+DESIGN (decided — follow it)
+  New /labeled response:
+      {
+        "count": <len(result)>,
+        "next_cursor": <str|None>,
+        "result": [rows],
+        "forms": {"tags_form": [...], "lists_form": [...]|None},
+        "users": {<user_id>: summary, ...}       # {} without AUTHENTICATION
+      }
+  Row = asdict(record) + "state" (all results columns incl. "user_id",
+  "lists"; missing values → None). NO "tags_form", "lists_form" or
+  "state.user".
+
+  Helpers (module-level functions in projects.py, placed right before
+  api_get_labeled, numpy-style docstrings like the neighbours):
+
+  1. _parse_labeled_query(project) -> dict
+     Moves the parameter parsing out of api_get_labeled unchanged:
+     subset, filters, latest_first, parsed_filters, label, priors,
+     has_note, include_users, exclude_users, tags_form (read_tags_data),
+     tag_filters, invalid_filter, filter_pdf, filter_abstract, post_scan,
+     filter_sig. Return them as a dict with exactly these keys:
+       "subset", "filters", "latest_first", "label", "priors", "has_note",
+       "include_users", "exclude_users", "tags_form", "tag_filters",
+       "invalid_filter", "filter_pdf", "filter_abstract", "post_scan",
+       "filter_sig"
+     It does NOT read per_page or cursor (those belong to the route).
+
+  2. _iter_labeled_matches(db, q, cursor=None, batch_size=500)
+     A generator. It yields (state, key) for every record matching q, in
+     display order, starting after `cursor` (a DECODED cursor tuple or
+     None). `state` is the pd.Series row of the page DataFrame (tags
+     parsed). key = (None if pd.isna(time) else float(time),
+     int(record_id)), which is the same tuple _encode_cursor takes.
+     It contains the pdf_ids / abstract_ids computation, `passes()` and
+     the batch loop exactly as today. It stops when a batch is empty or
+     shorter than batch_size. The caller must consume it inside the
+     `with project.db as db:` block.
+
+  3. _users_map(project) -> dict
+     The current users block moved out unchanged. Returns {} when
+     AUTHENTICATION is off.
+
+  4. _build_rows(db, project, states) -> list[dict]
+     states: an iterable of pd.Series results/unlabeled rows.
+         ids = [int(s["record_id"]) for s in states]   (return [] if empty)
+         records = db.input.get_records(ids)
+         lists_by_record = db.get_lists_for_records(ids)
+         for state, record in zip(states, records):
+             record_d = asdict(record)
+             state_d = {k: (None if _is_missing_scalar(v) else v)
+                        for k, v in state.to_dict().items()}
+             state_d["lists"] = lists_by_record.get(int(state["record_id"]), [])
+             record_d["state"] = state_d
+     (`project` is unused for now. Keep the parameter: Part 3 adds the
+     record version here and Part 4 reuses the function.) Materialize
+     `states` into a list first, because it is iterated twice.
+
+  5. _collection_forms(project, tags_form) -> dict
+         {"tags_form": tags_form, "lists_form": read_lists_data(project)}
+
+  api_get_labeled becomes:
+      per_page / cursor_param from request.args (as today)
+      q = _parse_labeled_query(project)
+      decode the cursor with q["filter_sig"] (400 on ValueError, as today)
+      users = _users_map(project)
+      with project.db as db:
+          batch_size = (per_page + 1) if not q["post_scan"] \
+                       else max(per_page + 1, 500)
+          matched, has_next = [], False
+          for state, key in _iter_labeled_matches(db, q, cursor, batch_size):
+              if len(matched) == per_page:
+                  has_next = True
+                  break
+              matched.append((state, key))
+          next_cursor = (_encode_cursor(*matched[-1][1], q["filter_sig"])
+                         if has_next and matched else None)
+          result = _build_rows(db, project, [s for s, _ in matched])
+      return jsonify({count, next_cursor, result,
+                      forms: _collection_forms(project, q["tags_form"]),
+                      users: users})
+  Keep the docstring of api_get_labeled and add one line describing the
+  new "forms"/"users" keys.
+
+  api_label_record, PUT branch only: replace the item building with
+      with project.db as db:
+          state = db.get_results_record(record_id).iloc[0]
+          row = _build_rows(db, project, [state])[0]
+      return jsonify({"result": row})
+
+  api_update_note: after update_note,
+      with project.db as db:
+          state = db.get_results_record(int(record_id)).iloc[0]
+          row = _build_rows(db, project, [state])[0]
+      return jsonify({"success": True, "result": row})
+  (Keep "success" for compatibility.)
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/webapp/_api/projects.py: lines 1–120 (imports), 682–1160
+    (search, cursor helpers, api_get_labeled, api_get_labeled_stats),
+    2302–2410 (api_label_record, heartbeat, api_update_note).
+  - asreview/database/database.py :: get_results_page, get_unlabeled_page,
+    get_results_record, get_lists_for_records.
+  - asreview/webapp/tests/test_api/test_labeled_pagination.py (whole file).
+  - asreview/webapp/tests/test_api/test_projects.py :: test_label_with_lists
+  - asreview/webapp/tests/utils/api_utils.py (helpers you will use:
+    search_project_data, label_project_record, get_labeled_project_data).
+
+------------------------------------------------------------------------
+BASELINE FIRST
+------------------------------------------------------------------------
+  Before changing anything, run
+    devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_labeled_pagination.py asreview/webapp/tests/test_api/test_projects.py -q'
+  and write down which tests fail already (test_projects.py has some
+  known failures). Your change must not add any. These tests download
+  synergy:van_der_Valk_2021 on first use and need the network.
+
+------------------------------------------------------------------------
+TESTS (add to asreview/webapp/tests/test_api/test_labeled_pagination.py,
+       using the existing `client` / `project` fixtures and _labeled())
+------------------------------------------------------------------------
+  1. test_labeled_rows_are_slim: label 3 records (au.label_project_record).
+     GET /labeled. For every row: "tags_form" not in row, "lists_form"
+     not in row, "user" not in row["state"], "user_id" in row["state"].
+     The response has "forms" with keys "tags_form" and "lists_form", and
+     a dict "users". When client.application.config["AUTHENTICATION"] is
+     true, every non-None row["state"]["user_id"] appears as str(user_id)
+     in the users keys (JSON object keys are strings).
+  2. test_labeled_unlabeled_rows_are_slim: the same shape checks for
+     subset="unlabeled" (rows have state.user_id None and no NaN; check
+     that response.get_json() succeeds and state["label"] is None).
+  3. test_put_label_returns_row: label a record with POST, then PUT the
+     same record with label 0 (client.put on
+     /api/projects/<id>/record/<rid> with data={"record_id": rid,
+     "label": 0}). json["result"]["record_id"] == rid,
+     json["result"]["state"]["label"] == 0, "tags_form" not in
+     json["result"], "user_id" in json["result"]["state"].
+  4. test_put_note_returns_row: label a record, PUT
+     /api/projects/<id>/record/<rid>/note with data={"note": "hello"}.
+     json["success"] is True, json["result"]["state"]["note"] == "hello".
+  5. Update test_projects.py::test_label_with_lists: replace
+         assert record["lists_form"] is None
+     with
+         assert labeled.json["forms"]["lists_form"] is None
+         assert "lists_form" not in record
+  All existing test_labeled_pagination.py tests must still pass unchanged:
+  they prove that the helper extraction kept order, filters and cursors
+  intact.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_labeled_pagination.py asreview/webapp/tests/test_api/test_projects.py -q'
+  Paste the output and compare it with the baseline.
+  Also run `ruff check asreview/webapp/_api/projects.py` through devbox
+  if ruff is available, and paste the result.
+
+  NOTE: until 10c ships, the Collection page shows no tags/lists in its
+  cards (the frontend still reads the per-row forms). 10b and 10c are
+  merged together. Say this in your report.
+
+DONE WHEN
+  - /labeled rows no longer carry tags_form, lists_form or state.user;
+    they keep state.user_id. The response carries forms and users.
+  - PUT record and PUT note return the updated row in the /labeled shape.
+  - api_get_labeled is built from the five helpers; behaviour otherwise
+    unchanged (all existing pagination tests green).
+  - Only these files changed:
+      asreview/webapp/_api/projects.py
+      asreview/webapp/tests/test_api/test_labeled_pagination.py
+      asreview/webapp/tests/test_api/test_projects.py
+========================================================================

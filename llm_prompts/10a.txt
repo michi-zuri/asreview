@@ -1,0 +1,122 @@
+========================================================================
+TASK 10a — Spec 0001 Part 1: Collection cursor fix (interim) + outdated
+           list-cleaning test + the first real Jest test
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: nothing (first task of Spec 0001).
+SPEC: specs/0001-collection-snapshot.md, "Part 1" and the implementation
+      notes below the Amp line. The spec wins if this prompt and the
+      spec disagree. STOP and report the disagreement.
+
+WHY
+  In the Collection page (LabeledRecord.js) an invalidated infinite query
+  refetches every loaded page. react-query 3.39.3 computes each page's
+  param with getNextPageParam and stops only on `undefined`. Our function
+  returns `false` when there is no next page, so after the list has
+  shrunk the client requests `/labeled?...&cursor=false`. The server
+  cannot base64-decode "false", answers 400, and the whole list shows an
+  error.
+  Separately, test_list_item_cleaning expects list items containing "," or
+  ";" to be dropped. The user decided (2026-10-19) that they ARE allowed.
+  The code is right and the test is outdated.
+
+FACTS (verified — trust these)
+  - asreview/webapp/src/ProjectComponents/HistoryComponents/LabeledRecord.js
+    has, inside useInfiniteQuery's options:
+        getNextPageParam: (lastPage) => lastPage.next_cursor ?? false,
+  - `undefined` from getNextPageParam means "no next page" in react-query
+    v3, so hasNextPage stays correct.
+  - The frontend is a CRA app with a jsconfig baseUrl of "src". Jest runs via
+    `react-scripts test` and needs no new dependency (verified: a trivial
+    test passes). Today the only test is the CRA stub src/App.test.js.
+  - asreview/webapp/tests/test_api/test_llm_mapping.py::test_list_item_cleaning
+    (around line 257) asserts:
+        assert "bad,comma" not in names
+        assert "bad;semicolon" not in names
+        assert "comma" in caplog.text or "',' or ';'" in caplog.text
+    asreview/webapp/_api/llm_mapping.py keeps such items and logs no
+    comma warning. Do NOT change llm_mapping.py.
+
+DESIGN (decided — follow it)
+  - Move getNextPageParam into a new pure module so that Jest can test it
+    without React:
+      asreview/webapp/src/ProjectComponents/HistoryComponents/labeledPaging.js
+    Later tasks (10c) add more pure helpers to the same file.
+  - Change nothing else in LabeledRecord.js (the bigger rework comes in
+    10c and 10i).
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/webapp/src/ProjectComponents/HistoryComponents/LabeledRecord.js
+  - asreview/webapp/src/App.test.js (to see the test file style)
+  - asreview/webapp/tests/test_api/test_llm_mapping.py :: test_list_item_cleaning
+  - asreview/webapp/_api/llm_mapping.py :: the list-item part of
+    map_llm_payload_to_asreview (to confirm which items are dropped:
+    empty/whitespace-only are dropped and non-strings are coerced with str()).
+
+------------------------------------------------------------------------
+PART A — labeledPaging.js (new file)
+------------------------------------------------------------------------
+    // Pure helpers for the Collection list (no React, no network).
+
+    /**
+     * Next-page param for react-query's useInfiniteQuery.
+     *
+     * Must return `undefined` (not `false` or `null`) when there is no next
+     * page: react-query v3 refetches every loaded page on invalidation and
+     * only stops at `undefined`; anything else is sent as `cursor=...`.
+     */
+    export const getNextPageParam = (lastPage) =>
+      lastPage?.next_cursor ?? undefined;
+
+  In LabeledRecord.js import it
+      import { getNextPageParam } from "./labeledPaging";
+  and use `getNextPageParam,` in the useInfiniteQuery options instead of
+  the inline arrow function.
+
+------------------------------------------------------------------------
+PART B — labeledPaging.test.js (new file, same directory)
+------------------------------------------------------------------------
+  Tests (plain Jest `describe`/`it`/`expect`, no extra libraries):
+    1. getNextPageParam({ next_cursor: null }) === undefined
+    2. getNextPageParam({}) === undefined   (key missing)
+    3. getNextPageParam(undefined) === undefined
+    4. getNextPageParam({ next_cursor: "abc" }) === "abc"
+    5. none of the cases above returns false (use `not.toBe(false)`).
+
+------------------------------------------------------------------------
+PART C — test_list_item_cleaning
+------------------------------------------------------------------------
+  Update the docstring to: "Empty and whitespace-only items are dropped;
+  commas and semicolons are allowed (user decision 2026-10-19)."
+  Replace the three assertions quoted in FACTS with:
+        assert "bad,comma" in names
+        assert "bad;semicolon" in names
+  Keep the other assertions. Keep the `caplog` fixture and the
+  `with caplog.at_level(...)` block as they are; just drop the comma
+  assertion on caplog.text.
+
+------------------------------------------------------------------------
+TESTS / RUN (from the git root)
+------------------------------------------------------------------------
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_llm_mapping.py -q'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && CI=true npx react-scripts test --watchAll=false src/ProjectComponents/HistoryComponents'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && npm run build'
+  (The build must compile with no new ESLint warnings in the two touched
+  JS files.) Paste all outputs.
+
+  Manual check for the user (report it, do not claim you did it):
+    In "Relevant + Full text: false" with 3 pages loaded, attach a PDF in
+    Zotero for one visible record and scroll until the card detects it.
+    The list refetches (that is fixed in 10c) but no request carries
+    `cursor=false` and no error appears.
+
+DONE WHEN
+  - getNextPageParam returns undefined when there is no next cursor and
+    lives in labeledPaging.js with a passing Jest test.
+  - test_list_item_cleaning passes and expects "," / ";" items to be kept.
+  - Only these files changed:
+      asreview/webapp/src/ProjectComponents/HistoryComponents/LabeledRecord.js
+      asreview/webapp/src/ProjectComponents/HistoryComponents/labeledPaging.js (new)
+      asreview/webapp/src/ProjectComponents/HistoryComponents/labeledPaging.test.js (new)
+      asreview/webapp/tests/test_api/test_llm_mapping.py
+========================================================================

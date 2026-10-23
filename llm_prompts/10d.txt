@@ -1,0 +1,203 @@
+========================================================================
+TASK 10d — Spec 0001 Part 3a: the fork migration ledger and revision
+           0001_change_tracking (tables only, no triggers yet)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: Part 2 (10b + 10c) merged and verified by the user.
+SPEC: specs/0001-collection-snapshot.md, "Part 3", D7, D8, D9 and the
+      implementation notes. The spec wins. STOP and report if it
+      disagrees with this prompt.
+
+WHY
+  Part 4 needs a per-project version counter, a per-record version and a
+  change log. Upstream owns `PRAGMA user_version` (_is_valid requires
+  exactly 4), so the fork gets its own ledger of named revisions. Several
+  processes open the same results.db (Flask, the LLM worker, the Zotero
+  sync), so each revision must be applied exactly once, under
+  BEGIN IMMEDIATE.
+
+FACTS (verified — trust these)
+  - asreview/database/database.py
+    * open_db(fp, read_only) (~96) calls db._is_valid(). On ValueError it
+      calls db.create_tables() (new DB).
+    * Database.__init__: self.fp (str | Path, or ":memory:"),
+      self.read_only, self._in_memory.
+    * _conn (~197) is a cached sqlite3 connection with the DEFAULT
+      (legacy) isolation_level "": Python opens a transaction implicitly
+      before INSERT/UPDATE/DELETE, not before SELECT or CREATE. WAL mode
+      is set when not read-only. The default busy timeout is 5 s.
+    * create_tables (~240): user_version, input.create_tables(), CREATE
+      results/last_ranking/decision_changes, commit, then
+      _set_results_changes_triggers(), _ensure_results_indexes(),
+      _ensure_* tables (… _ensure_llm_results_table() is last).
+    * _is_valid (~513): version check, required tables/columns, then
+      `if not self.read_only:` runs the _fix_* functions and the
+      _ensure_* functions (… _ensure_llm_results_table() is last).
+    * Style: methods take `cur = self._conn.cursor()`, execute
+      triple-quoted SQL, then `self._conn.commit()`.
+  - Project databases live at <projects>/<project_id>/results.db
+    (asreview/project/api.py: PATH_DB = "results.db").
+  - tests/test_database.py has the fixture
+        @pytest.fixture
+        def db(tmpdir):
+            with asr.Database(Path(tmpdir, "test.db")) as db:
+                db.create_tables()
+                yield db
+    Schema tests use set(REQUIRED_TABLES).issubset(...), so new tables
+    do not break them. Do NOT add the new tables to REQUIRED_TABLES
+    (_is_valid would then reject old DBs before migrating them).
+
+DESIGN (decided — follow it)
+  New module asreview/database/fork_migrations.py:
+
+    """Fork-owned schema migrations (Spec 0001, D8).
+
+    `PRAGMA user_version` belongs to upstream ASReview, so fork schema
+    changes are tracked in their own ledger table, `fork_migrations`.
+    Each revision is applied once, in order, inside BEGIN IMMEDIATE so
+    that concurrent processes opening the same database cannot apply it
+    twice. Revision ids follow Alembic style ("0001_<slug>") to keep a
+    later move to Alembic mechanical.
+    """
+
+    def _rev_0001_change_tracking(cur, project_id):
+        cur.execute("""CREATE TABLE IF NOT EXISTS project_state (
+            project_id TEXT PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 0,
+            config_version INTEGER NOT NULL DEFAULT 0,
+            pruned_version INTEGER NOT NULL DEFAULT 0,
+            last_pruned_at REAL)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS record_versions (
+            project_id TEXT NOT NULL,
+            record_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            PRIMARY KEY (project_id, record_id))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS change_log (
+            project_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            record_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            changed_at REAL NOT NULL,
+            PRIMARY KEY (project_id, version))""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_change_log_changed_at
+            ON change_log (project_id, changed_at)""")
+        cur.execute(
+            "INSERT OR IGNORE INTO project_state (project_id) VALUES (?)",
+            (project_id,))
+
+    REVISIONS = [
+        ("0001_change_tracking", _rev_0001_change_tracking),
+    ]
+
+    def apply_fork_migrations(conn, project_id):
+        """Apply missing revisions; return the list of ids applied now."""
+        Steps:
+        1. CREATE TABLE IF NOT EXISTS fork_migrations (
+               revision TEXT PRIMARY KEY, applied_at REAL NOT NULL); commit.
+        2. Fast path: applied = {r for (r,) in SELECT revision FROM
+           fork_migrations}. If every REVISIONS id is in it → return [].
+        3. Slow path:
+             conn.commit()                    # end any implicit txn
+             conn.execute("BEGIN IMMEDIATE")  # waits up to the busy timeout
+             try:
+                 re-read `applied` (another process may have finished)
+                 cur = conn.cursor()
+                 for rev_id, fn in REVISIONS:
+                     if rev_id in applied: continue
+                     fn(cur, project_id)
+                     cur.execute("INSERT INTO fork_migrations
+                                  (revision, applied_at) VALUES (?, ?)",
+                                 (rev_id, time.time()))
+                     done.append(rev_id)
+                 conn.commit()
+             except BaseException:
+                 conn.rollback(); raise
+             return done
+     Use `logging.info("Applied fork migration %s", rev_id)` per revision.
+
+  NOTE on pruned_version / last_pruned_at: the spec lists project_state
+  with (project_id, version, config_version). The two extra columns are
+  a planner ADDITION, flagged to the user in the spec notes: the
+  changes endpoint (10g) needs them to detect "since is older than the
+  oldest retained entry" and "at most once per hour". If the user
+  rejects them, they are dropped together with 10g's prune logic.
+
+  Database changes (database.py):
+    - `from asreview.database.fork_migrations import apply_fork_migrations`
+    - New property
+          @property
+          def project_id(self):
+              """Project id stored in ``project_state`` (informational).
+
+              The folder name of the database file, or "memory".
+              """
+              if self._in_memory:
+                  return "memory"
+              return Path(self.fp).parent.name
+      (Check that Path is imported; it is used elsewhere in the module.)
+    - New method
+          def _apply_fork_migrations(self):
+              apply_fork_migrations(self._conn, self.project_id)
+    - Call self._apply_fork_migrations() as the LAST line of
+      create_tables() and as the LAST line inside `if not self.read_only:`
+      in _is_valid(). (10e adds _ensure_change_tracking_triggers() right
+      after it in both places.)
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/database/database.py lines 1–300 and 500–720
+  - tests/test_database.py lines 1–120 (fixtures, schema tests)
+  - tests/test_migrate_project.py (it opens migrated projects. It must
+    keep passing.)
+
+------------------------------------------------------------------------
+BASELINE FIRST
+------------------------------------------------------------------------
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_database.py tests/test_migrate_project.py tests/test_llm_db.py tests/test_data_store.py -q'
+  Note the failures BEFORE your change (test_database.py has about 12
+  known failures). Your change must not add any.
+
+------------------------------------------------------------------------
+TESTS — new file tests/test_change_tracking.py (DB level, no Flask)
+------------------------------------------------------------------------
+  Fixture, as in test_database.py:
+      @pytest.fixture
+      def db(tmpdir):
+          with asr.Database(Path(tmpdir, "test.db")) as db:
+              db.create_tables()
+              yield db
+  Tests:
+  1. test_ledger_applied_on_create: fork_migrations has exactly one row
+     "0001_change_tracking". project_state has exactly one row with
+     version 0, config_version 0, and project_id == Path(tmpdir).name.
+  2. test_ledger_idempotent_on_reopen: close, reopen with
+     asr.open_db(path) twice. There is still one ledger row and one
+     project_state row.
+  3. test_ledger_applied_on_legacy_open: build a DB with create_tables,
+     then DROP TABLE fork_migrations, project_state, record_versions and
+     change_log (to simulate a pre-fork database) and close. open_db(path)
+     re-applies the revision (one ledger row, the tables exist).
+  4. test_ledger_concurrent_openers: as in test 3, simulate a legacy DB.
+     Start 4 threads, each running
+         with asr.open_db(path) as d: pass
+     behind a threading.Barrier(4) so that they start together. Join them
+     and re-raise any thread exception. Exactly one ledger row, one
+     project_state row.
+  5. test_read_only_open_does_not_migrate: legacy DB (as in test 3),
+     open_db(path, read_only=True) succeeds, and fork_migrations does not
+     exist afterwards (check through a plain sqlite3 connection).
+  6. test_in_memory_project_id: asr.Database() + create_tables() →
+     project_state.project_id == "memory".
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_change_tracking.py tests/test_database.py tests/test_migrate_project.py tests/test_llm_db.py tests/test_data_store.py -q'
+  Paste the output and compare it with the baseline.
+
+DONE WHEN
+  - New DBs and every read-write open have the ledger and the four
+    tables. A read-only open changes nothing.
+  - The six tests pass, with no new failures elsewhere.
+  - Only these files changed:
+      asreview/database/fork_migrations.py (new)
+      asreview/database/database.py
+      tests/test_change_tracking.py (new)
+========================================================================

@@ -1,0 +1,257 @@
+========================================================================
+TASK 10c — Spec 0001 Part 2 (frontend): forms and users from the
+           response; stable card keys; own edits patch one row; no more
+           whole-list reloads
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10b (backend). 10b and 10c ship TOGETHER: after 10b alone,
+            Collection cards show no tags/lists.
+SPEC: specs/0001-collection-snapshot.md, "Part 2", D1, D2, D5, D13 and
+      the implementation notes. The spec wins. STOP and report if it
+      disagrees with this prompt.
+
+WHY
+  Today every edit and every PDF found by the live check calls
+  invalidateQueries(["fetchLabeledRecord", …]), which refetches EVERY
+  loaded page (several MB per minute while scrolling a "Full text: false"
+  view). The card key embeds JSON of the note, the tags_form, the
+  lists_form and the lists, so every change remounts the card (an open
+  abstract collapses). After this task:
+    - /labeled is requested only on mount, on filter/subset change and
+      when scrolling (fetchNextPage).
+    - An own edit replaces just that row in the cached pages.
+    - A PDF found by the live check updates only that card's attachment
+      display.
+    - Records never vanish by themselves (D1). Membership changes show
+      after a reload until Part 4 adds the banner.
+
+FACTS (verified — trust these)
+  Files: src = asreview/webapp/src
+  - src/ProjectComponents/HistoryComponents/LabeledRecord.js
+    useInfiniteQuery key ["fetchLabeledRecord", {project_id, subset: label,
+    filter}], ProjectAPI.fetchLabeledRecord, getNextPageParam (from
+    ./labeledPaging since 10a). It renders page.result.map(record =>
+    <RecordCard … disabled={true} transitionType="collapse"
+    transitionSpeed={…} key={"record-card-"+project_id+"-"+record_id+"-"+
+    note+JSON(tags_form)+JSON(lists_form)+JSON(state.lists)} />).
+    LabeledRecord is used by LabelHistory.js and LabelHistoryPrior.js.
+  - After 10b each /labeled page is
+    {count, next_cursor, result, forms: {tags_form, lists_form}, users}.
+    `users` keys are strings (JSON). Rows carry state.user_id, and no
+    tags_form, lists_form or state.user.
+  - src/ProjectComponents/ReviewComponents/RecordCard.js
+    * ZoteroFullTextButton (~line 46). The effect at ~86–92 invalidates
+      fetchLabeledRecord when the live check finds a PDF that the list row
+      did not have (`listHadPdf`). invalidateAttachment (~98–108)
+      invalidates fetchRecordAttachment, fetchLlmMeta AND
+      fetchLabeledRecord.
+    * RecordCard props end at ~509 with `transitionType = "fade"`. It has
+      `isDirty` state (~514) fed by the labeler's onDirtyChange.
+    * RecordCardLabeler is rendered at ~616 with
+      user={record.state?.user}, tagsForm={record.tags_form},
+      listsForm={record.lists_form}, and
+      onDecisionClose={transitionType ? () => setOpen(false) : afterDecision}.
+    * With transitionType neither "fade" nor "collapse", the card renders
+      without a transition wrapper (~675).
+    * Other RecordCard callers: ReviewPage.js:155 and
+      SetupComponents/SearchComponents/PriorSearch.js:59. They pass rows
+      that STILL embed tags_form/lists_form/state.user (fetchRecord,
+      search). They must keep working unchanged.
+  - src/ProjectComponents/ReviewComponents/RecordCardLabeler.js
+    * ListsDialog mutation onSuccess (~655): invalidateQueries
+      fetchLabeledRecord; onSave(localListValues); onClose().
+    * NoteDialog mutation onSuccess (~735): invalidateQueries
+      fetchLabeledRecord; setQueryData(["fetchRecord",{project_id}], …).
+      That updater spreads data.result and CRASHES when the fetchRecord
+      query is not in the cache (the Collection never loads it).
+    * TagsDialog mutation onSuccess (~864): invalidateQueries
+      fetchLabeledRecord; onSave(localTagValues); onClose().
+    * All three dialogs mutate with post: false (PUT). After 10b,
+      mutateClassification resolves a PUT with the response body
+      {result: row}, and mutateNote resolves {success, result: row}.
+    * The main labeler (~930) takes props including user, tagsForm,
+      tagValues, listsForm, listValues, note, label, onDecisionClose,
+      onDirtyChange, resetKey and disabled. It holds
+      tagValuesState/listValuesState from useState(initTags/initLists)
+      ONCE. Only `resetKey` (~975) re-initialises them, so a prop change
+      (a patched row) does not show in the labeler.
+    * The main mutation (~996) onSuccess handles `discarded`, then calls
+      onDecisionClose(). makeDecision (~1091) PUTs when editState is
+      false (labeled card). The "Change to …" menu item (~1433) calls it.
+
+DESIGN (decided — follow it)
+  A. labeledPaging.js gains
+       /**
+        * Return a copy of react-query infinite data with the row whose
+        * record_id equals row.record_id replaced by `row` (merged over the
+        * old row, so client-only fields survive). Pages and other rows
+        * are kept by reference. Unknown id → data unchanged (same object).
+        */
+       export const patchRowInPages = (data, row) => …
+       // Forms from the LAST loaded page (the most recent server answer);
+       // users merged over all pages (later pages win).
+       export const formsOf = (data) => …   // → {tags_form, lists_form} | {tags_form: null, lists_form: null}
+       export const usersOf = (data) => …   // → {} when no pages
+     No React imports in this file.
+
+  B. LabeledRecord.js
+     - Query options:
+         getNextPageParam,
+         refetchOnWindowFocus: false,
+         refetchOnReconnect: false,
+         refetchOnMount: "always",
+         cacheTime: 0,          // no snapshot reuse after navigating away
+     - const queryClient = useQueryClient();
+       const queryKey = [ "fetchLabeledRecord", {…same object as today…} ];
+       (Build it once and use it for useInfiniteQuery and setQueryData.)
+       const onRowUpdated = React.useCallback((row) => {
+         if (!row) return;
+         queryClient.setQueryData(queryKey, (old) =>
+           old ? patchRowInPages(old, row) : old);
+         queryClient.invalidateQueries(["fetchLabeledStats", { project_id }]);
+       }, [...]);
+       (queryKey changes identity every render: memoise it with
+       React.useMemo on [project_id, label, JSON.stringify(filter values)].)
+     - const forms = formsOf(data); const users = usersOf(data);
+     - RecordCard gets these new props:
+         tagsForm={forms.tags_form}
+         listsForm={forms.lists_form}
+         users={users}
+         onRowUpdated={onRowUpdated}
+         transitionType={null}
+         key={"record-card-" + project_id + "-" + record?.record_id}
+       Remove transitionSpeed (unused without a transition).
+       transitionType={null} is the D1 change: a decision change in the
+       Collection no longer collapses the card away. The card stays and
+       shows its new label.
+
+  C. RecordCard.js
+     - New optional props (default undefined): tagsForm, listsForm,
+       users, onRowUpdated.
+       const tagsFormEff = tagsForm !== undefined ? tagsForm : record.tags_form;
+       const listsFormEff = listsForm !== undefined ? listsForm : record.lists_form;
+       const userEff = users
+         ? users[String(record.state?.user_id)] ?? null
+         : record.state?.user;
+       Pass tagsFormEff / listsFormEff / userEff to RecordCardLabeler, and
+       pass onRowUpdated through to it.
+     - onDecisionClose: keep the expression as it is (with
+       transitionType null it becomes afterDecision, which the Collection
+       does not pass, so nothing happens). Add one guard: call
+       afterDecision only if it is a function (check how it is defaulted
+       in the props and guard if needed).
+     - ZoteroFullTextButton: remove the effect that invalidates
+       fetchLabeledRecord, and remove the fetchLabeledRecord line from
+       invalidateAttachment. The button already shows the live result
+       (`data?.available`). Keep the comment updated: "The live check
+       result is shown on this card only; membership changes surface via
+       the Collection's staleness banner (Spec 0001 Part 4)." If removing
+       the effect leaves `listHadPdf` or `queryClient` unused, remove
+       those too (no ESLint warnings).
+
+  D. RecordCardLabeler.js
+     - New optional prop `onRowUpdated = null` on the main labeler, also
+       passed to NoteDialog, TagsDialog and ListsDialog.
+     - In all three dialog mutations remove
+       queryClient.invalidateQueries(["fetchLabeledRecord", …]) and call
+           if (onRowUpdated && data?.result) onRowUpdated(data.result);
+       before onSave/onClose (onSuccess receives `data`).
+     - NoteDialog: guard the fetchRecord updater:
+           (data) => data?.result ? {…as today…} : data
+     - Main mutation onSuccess: after the `discarded` early return and
+       before onDecisionClose, add
+           if (onRowUpdated && data?.result) onRowUpdated(data.result);
+       (POST resolves the axios object, which has no .result, so the
+       review page is unaffected.)
+     - Prop sync: patched rows must show in the labeler without a
+       remount. Add
+           const propsSig = JSON.stringify([tagsForm, tagValues, listsForm, listValues]);
+           React.useEffect(() => {
+             if (isDirty || showTagsDialog || showListsDialog) return;
+             setTagValuesState(initTags());
+             setListValuesState(initLists());
+           }, [propsSig]); // eslint-disable-line react-hooks/exhaustive-deps
+       Place it next to the resetKey effect. It must not run on the
+       first render in a way that changes state, so check that initTags()
+       on mount equals the useState initial value (it does: same function).
+       Do NOT add the sync to `note` (NoteDialog re-reads `note` when it
+       opens) or to `label` (it is a prop that is read directly).
+     - Leave the remaining queryClient uses (fetchRecord etc.) alone.
+
+  E. PriorSearch.js and ReviewPage.js: NO changes. They do not pass the
+     new props, so the fallbacks keep today's behaviour.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - src/ProjectComponents/HistoryComponents/LabeledRecord.js
+  - src/ProjectComponents/HistoryComponents/labeledPaging.js (+ test)
+  - src/ProjectComponents/ReviewComponents/RecordCard.js
+  - src/ProjectComponents/ReviewComponents/RecordCardLabeler.js
+  - src/api/ProjectAPI.js :: fetchLabeledRecord, mutateClassification,
+    mutateNote
+  - grep -rn "fetchLabeledRecord" src  → after your change it may only
+    appear in LabeledRecord.js and ProjectAPI.js. Report every other hit
+    and decide with the rules above (remove invalidations of the
+    Collection list; patch instead).
+
+------------------------------------------------------------------------
+TESTS (Jest, extend labeledPaging.test.js)
+------------------------------------------------------------------------
+  Build infinite data like react-query does:
+    const data = { pageParams: [undefined, "c1"], pages: [
+      { result: [{record_id: 1, state: {note: "a"}}, {record_id: 2, state: {}}],
+        next_cursor: "c1", forms: {tags_form: ["t1"], lists_form: null},
+        users: {"5": {name: "A"}} },
+      { result: [{record_id: 3, state: {}, extra: "keep"}], next_cursor: null,
+        forms: {tags_form: ["t2"], lists_form: ["l"]},
+        users: {"6": {name: "B"}} } ] };
+  1. patchRowInPages(data, {record_id: 3, state: {note: "x"}}): page 2
+     row 3 has state.note "x" AND extra "keep"; data.pages[0] is the same
+     object (toBe); pageParams unchanged; the input is not mutated.
+  2. patchRowInPages(data, {record_id: 99}) returns `data` itself (toBe).
+  3. formsOf(data) deep-equals {tags_form: ["t2"], lists_form: ["l"]}.
+  4. usersOf(data) deep-equals {"5": {...}, "6": {...}}.
+  5. formsOf(undefined) / usersOf(undefined) give the empty defaults.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && CI=true npx react-scripts test --watchAll=false src/ProjectComponents/HistoryComponents'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && npm run build'
+  The build must show no new ESLint warnings in the touched files. Paste
+  both outputs.
+
+  Measurement (spec Part 2: the before/after bytes go in the commit
+  message):
+    You cannot open a real project. Instead, run the 10b test fixture
+    with per_page=50 on subset=relevant (label 50 records first) and
+    print len(response.data) before (git stash of 10b) and after. Report
+    both numbers and say they come from the test fixture. The user
+    measures the real project in the browser devtools and amends the
+    commit message.
+
+  Manual checks for the user (report them, do not claim you did them):
+    1. "Full text: false" with 150 cards loaded: let the live check find
+       PDFs while scrolling. In devtools/Network, no /labeled request is
+       made except the scroll pages. Cards show their PDF and stay put.
+    2. Relevant view: open an abstract, edit the tags, save. The card
+       shows the new tags at once, the abstract stays open and no
+       /labeled request is made.
+    3. "Change to irrelevant" on a card in Relevant: the card stays and
+       shows its new label (D1). After F5 it is gone.
+    4. Review page and the prior search still show tags, lists and the
+       "by <name>" line as before.
+    5. Admin renames a tag option → after F5 every card shows the new
+       name.
+
+DONE WHEN
+  - No invalidateQueries of fetchLabeledRecord remains anywhere.
+  - Collection cards take forms/users from the response and have the key
+    record-card-<project_id>-<record_id>.
+  - Own edits in the Collection patch exactly one row.
+  - Jest + build green.
+  - Only these files changed:
+      src/ProjectComponents/HistoryComponents/LabeledRecord.js
+      src/ProjectComponents/HistoryComponents/labeledPaging.js
+      src/ProjectComponents/HistoryComponents/labeledPaging.test.js
+      src/ProjectComponents/ReviewComponents/RecordCard.js
+      src/ProjectComponents/ReviewComponents/RecordCardLabeler.js
+    (all under asreview/webapp/)
+========================================================================

@@ -1,0 +1,222 @@
+========================================================================
+TASK 10e — Spec 0001 Part 3b: change-tracking triggers + one test per
+           write path
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10d merged.
+SPEC: specs/0001-collection-snapshot.md, "Part 3", D6, D9, D10 and the
+      implementation notes. The spec wins. STOP and report if it
+      disagrees with this prompt.
+
+WHY
+  Every writer must bump versions: the Flask app, the LLM worker and the
+  Zotero sync (separate processes), and the SQLAlchemy DataStore, which
+  writes record.attachment through its own connection. Only triggers
+  inside the database catch all of them (D6). SQLite drops a table's
+  triggers when the table is dropped, and _fix_tags_schema rebuilds
+  `tags`, so the triggers are re-asserted on every read-write open (D9).
+
+FACTS (verified — trust these)
+  - After 10d: tables project_state (one row: project_id, version,
+    config_version, pruned_version, last_pruned_at), record_versions,
+    change_log, fork_migrations. Database._apply_fork_migrations() is the
+    last call in create_tables() and in the read-write branch of
+    _is_valid().
+  - Tracked tables and their record-id columns:
+      results(record_id, label, time, note, user_id, assigned_at,
+              last_active, …)
+      tags(tag_id PK, record_id, option_id, checked, additional_text)
+      lists(item_id PK, record_id, list_id, name, sorted_at)
+      record table: name from self.record_table_name ("record"); column
+              `attachment` holds a Zotero key (8 chars [A-Z0-9]) when a
+              full text exists, or an ISO timestamp of the last FAILED
+              lookup, or NULL (store.py::set_attachment docstring).
+      config: tag_groups, tag_options, list_containers.
+  - Existing triggers trg_results_delete and trg_results_label_update
+    (database.py::_set_results_changes_triggers) write to
+    decision_changes. Keep them. The new triggers are separate.
+  - SQLite trigger facts (verified on 3.53 in a prototype):
+    * `INSERT OR REPLACE` / `ON CONFLICT` inside a trigger body, fired by
+      an outer UPSERT, raised a UNIQUE error. Use UPDATE, then
+      INSERT … WHERE NOT EXISTS (below), which works.
+    * A trigger referencing a missing table fails when it FIRES. It does
+      not fail when it is created.
+  - Write paths (database.py): label_record (~818), update_result
+    (~1451, group-wide), update_note (~1491), _save_tags (~1736:
+    deletes then inserts tag rows), replace_lists (~1592),
+    delete_result (~1932, group-wide), checkout_oldest_dispatched
+    (~1281), reassign_stale (~1370), touch_last_active (~1432: only
+    last_active), DataStore.set_attachment (store.py ~309, SQLAlchemy
+    session).
+
+DESIGN (decided — follow it)
+  database.py, new method placed after _set_results_changes_triggers:
+
+    def _ensure_change_tracking_triggers(self):
+        """(Re)create the Spec 0001 change-tracking triggers.
+
+        Runs on every read-write open: SQLite drops a table's triggers
+        with the table, and some ``_fix_*`` functions rebuild tables.
+        """
+
+  Build the SQL with two small module-level helpers so that the bodies
+  are written once:
+
+    _ATTACHMENT_KEY_GLOB = "'" + "[A-Z0-9]" * 8 + "'"
+
+    def _record_change_sql(rid, source):
+        # rid is "NEW.record_id" or "OLD.record_id"
+        return f"""
+            UPDATE project_state SET version = version + 1;
+            UPDATE record_versions
+               SET version = (SELECT version FROM project_state)
+             WHERE project_id = (SELECT project_id FROM project_state)
+               AND record_id = {rid};
+            INSERT INTO record_versions (project_id, record_id, version)
+            SELECT project_id, {rid}, version FROM project_state
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM record_versions
+                  WHERE project_id = (SELECT project_id FROM project_state)
+                    AND record_id = {rid});
+            INSERT INTO change_log
+                (project_id, version, record_id, source, changed_at)
+            SELECT project_id, version, {rid}, '{source}',
+                   (julianday('now') - 2440587.5) * 86400.0
+              FROM project_state;"""
+
+    _CONFIG_CHANGE_SQL = """
+            UPDATE project_state
+               SET version = version + 1, config_version = version + 1;"""
+    (In an UPDATE every right-hand side sees the OLD row, so
+    config_version becomes the NEW version. A test checks this.)
+
+  Triggers (all `CREATE TRIGGER IF NOT EXISTS`, `FOR EACH ROW`, names
+  prefixed trg_ct_):
+    results:
+      trg_ct_results_insert  AFTER INSERT ON results       → NEW, 'results'
+      trg_ct_results_delete  AFTER DELETE ON results       → OLD, 'results'
+      trg_ct_results_update  AFTER UPDATE OF label, time, note, user_id,
+                             assigned_at ON results
+                             WHEN OLD.label IS NOT NEW.label
+                               OR OLD.time IS NOT NEW.time
+                               OR OLD.note IS NOT NEW.note
+                               OR OLD.user_id IS NOT NEW.user_id
+                               OR OLD.assigned_at IS NOT NEW.assigned_at
+                                                           → NEW, 'results'
+      (NOT last_active, D10. The WHEN clause skips no-op writes. That is
+      a planner refinement, flagged in the spec notes.)
+    tags:  trg_ct_tags_insert (NEW), trg_ct_tags_update (NEW),
+           trg_ct_tags_delete (OLD), source 'tags'
+    lists: trg_ct_lists_insert (NEW), trg_ct_lists_update (NEW),
+           trg_ct_lists_delete (OLD), source 'lists'
+    record: trg_ct_record_attachment
+            AFTER UPDATE OF attachment ON <record_table_name>
+            WHEN OLD.attachment IS NOT NEW.attachment
+             AND (COALESCE(OLD.attachment GLOB {K}, 0)
+                  OR COALESCE(NEW.attachment GLOB {K}, 0))
+                                                → NEW, 'attachment'
+      (K = _ATTACHMENT_KEY_GLOB. Only changes that make a full text
+      appear or disappear are tracked. Rewriting the failed-lookup
+      timestamp is not. That is a planner refinement, flagged in the spec
+      notes. If the user rejects it, drop the second AND line.)
+    config: trg_ct_<table>_insert/_update/_delete for tag_groups,
+            tag_options, list_containers → _CONFIG_CHANGE_SQL.
+  Execute each CREATE with cur.execute (one statement per call, with a
+  BEGIN … END body). Commit at the end.
+
+  Call self._ensure_change_tracking_triggers() right AFTER
+  self._apply_fork_migrations() in create_tables() and in _is_valid()'s
+  read-write branch (it must run after the _fix_* functions).
+
+  Read helpers (also used by 10f/10g), in database.py near
+  get_results_record:
+    def get_project_state(self):
+        """Return {"version", "config_version", "pruned_version",
+        "last_pruned_at"}; zeros/None when the tables do not exist yet
+        (a read-only open of an unmigrated database)."""
+        Catch sqlite3.OperationalError ("no such table") → defaults.
+    def get_record_versions(self, record_ids):
+        """Return {record_id: version} (records without a row: absent)."""
+        Chunk the IN (...) list at 900 ids (the SQLite variable limit).
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/database/database.py: create_tables, _is_valid,
+    _set_results_changes_triggers, _fix_tags_schema, and every write path
+    listed in FACTS
+  - asreview/database/store.py: set_attachment
+  - tests/test_llm_db.py (how llm_dispatch rows are set up for
+    checkout_oldest_dispatched / reassign_stale; copy its setup)
+  - asreview/database/database.py :: _ensure_tag_groups_table,
+    _ensure_tag_options_table, _ensure_list_containers_table (the
+    columns your config tests must insert)
+  - tests/test_change_tracking.py (from 10d)
+
+------------------------------------------------------------------------
+TESTS — extend tests/test_change_tracking.py
+------------------------------------------------------------------------
+  Add a fixture db_with_records (Records 0–9, as test_database.py's
+  db_with_data does) and helpers:
+      def state(db): (version, config_version) from project_state
+      def rv(db, rid): record_versions.version or 0
+      def log(db): list of (version, record_id, source) ordered by version
+  Tests:
+  1. test_label_record_tracked: the spec example. Fresh DB, label record 7
+     relevant → version 1, rv(7) == 1, log == [(1, 7, "results")].
+  2. One test per write path. Each asserts that the version increases,
+     rv(rid) equals the new version, and the new log rows carry the
+     expected source:
+       update_result (label change)        → "results"
+       update_note                         → "results"
+       _save_tags (via update_result with tags, or directly) → "tags"
+         (needs one tag_groups + tag_options row inserted with raw SQL)
+       replace_lists                       → "lists"
+         (needs one list_containers row)
+       DataStore.set_attachment(rid, "ABCD1234")  → "attachment"
+       delete_result                       → "results" (OLD record id)
+       checkout_oldest_dispatched          → "results"
+       reassign_stale                      → "results"
+  3. test_touch_last_active_not_tracked: a labeled or checked-out record,
+     touch_last_active 10× → version unchanged, no new log rows (D10).
+  4. test_noop_update_not_tracked: update_note with the same note twice →
+     only the first write bumps the version.
+  5. test_attachment_failed_lookup_not_tracked: set_attachment(rid,
+     "2026-10-20T10:00:00") then again with another timestamp → no
+     version change. Then "ABCD1234" → tracked. Then back to a
+     timestamp → tracked (the full text disappeared).
+  6. test_config_changes: insert a tag_groups row with raw SQL + commit →
+     version +1, config_version == version, no change_log rows, no
+     record_versions rows. Same for tag_options and list_containers.
+  7. test_triggers_after_create_tables: every trg_ct_* name exists in
+     sqlite_master (list them all in the test).
+  8. test_triggers_after_fix_tags_schema: create a DB, close it, and
+     rebuild the tags table in the OLD layout the _fix_tags_schema
+     function detects (read the function to see what triggers it). That
+     DROP also removes the tags triggers. open_db(path) read-write →
+     every trg_ct_* trigger exists again.
+  9. test_version_order_equals_commit_order: two threads, each with its
+     own asr.open_db(path), label 20 different records each. Afterwards
+     the change_log versions are exactly 1..40 with no gaps, each
+     record_versions value equals its log version, and project_state
+     version == 40.
+  10. test_ledger tests from 10d that simulate a legacy DB by dropping
+      tables must ALSO drop the trg_ct_* triggers (a trigger on a missing
+      project_state fails when it fires). Update them if needed.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_change_tracking.py tests/test_database.py tests/test_migrate_project.py tests/test_llm_db.py tests/test_data_store.py tests/test_llm_worker.py -q'
+  Compare with the 10d baseline. Paste the output.
+
+  Also measure the bulk-write cost the spec calls a risk: in a scratch
+  script (NOT committed), time db._replace_results_from_df on a DB with
+  10 000 labeled results, once with and once without the triggers
+  (DROP them in the scratch copy). Report both timings.
+
+DONE WHEN
+  - All tracked writes bump versions and log the right source.
+    last_active, no-op updates and failed-lookup timestamps do not.
+  - The triggers survive _fix_tags_schema.
+  - get_project_state / get_record_versions exist.
+  - Only these files changed:
+      asreview/database/database.py
+      tests/test_change_tracking.py
+========================================================================

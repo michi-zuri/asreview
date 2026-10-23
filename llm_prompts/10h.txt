@@ -1,0 +1,184 @@
+========================================================================
+TASK 10h — Spec 0001 Part 4b (frontend, pure): collectionModel.js +
+           Jest tests
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10g merged (the endpoint shapes below are what 10g returns).
+SPEC: specs/0001-collection-snapshot.md, "Part 4 → Client model module",
+      D1–D4, D12 and the implementation notes. The spec wins. STOP and
+      report if it disagrees with this prompt.
+
+WHY
+  All snapshot logic lives in pure functions: no React, no network, no
+  Date.now(), no mutation of inputs (D12). The module ports almost line
+  by line to Elm, and these Jest tests become the specification for that
+  port. 10i only wires the functions to React.
+
+FACTS (verified — trust these; the shapes come from 10b/10f/10g)
+  /labeled page:   {count, next_cursor: str|null, result: [row],
+                    forms: {tags_form, lists_form}, users: {"<id>": …},
+                    watermark: int, config_version: int}
+  row:             {record_id, …record fields, version: int,
+                    state: {label, time: float|null, note, user_id, tags,
+                            lists, …}}
+  labeled/changes: {watermark, config_version,
+                    changes: [{record_id, version, in_view: bool,
+                               sort_key: [time|null, rid] | rid | null}]}
+                   or {reset: true, watermark}
+  labeled/ids:     {watermark, config_version,
+                    items: [[record_id, version, sort_key], …],
+                    next_cursor: str|null}
+  records?ids=:    {result: [row], watermark, users}
+  sort_key: for subset "unlabeled" it is the bare record_id. Otherwise it
+  is [state.time ?? null, record_id]. JSON numbers round-trip Python
+  floats exactly, so equality comparison is safe.
+  Jest runs with:
+    devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && CI=true npx react-scripts test --watchAll=false src/ProjectComponents/HistoryComponents'
+
+DESIGN (decided — follow it)
+  File: asreview/webapp/src/ProjectComponents/HistoryComponents/collectionModel.js
+  Header comment: purpose, "pure — no React, no network (Spec 0001 D12)",
+  and a pointer to the spec.
+
+  State (plain objects; never mutate, always return new objects; maps
+  are plain objects keyed by String(record_id)):
+    {
+      subset,                 // "relevant" | "irrelevant" | "all" | "unlabeled" | …
+      order: [record_id],     // display order of the snapshot
+      rows: {id: row},        // may lack an id in `order` until it is fetched
+      versions: {id: int},
+      sortKeys: {id: key},    // the key at the position the card is SHOWN at
+      boundary: null | "end" | cursor string,  // null = nothing loaded
+      hasMore: bool,
+      watermark: int | null,
+      configVersion: int | null,
+      forms: {tags_form: null, lists_form: null},
+      users: {},
+      stale: false,
+    }
+
+  Exports:
+    emptyState(subset)
+    sortKeyOf(subset, row)
+    sameSortKey(a, b)        // deep-equal for arrays, === otherwise; null-safe
+    appendPage(state, page)
+      - For each row in page.result: if its id is not in order, push it.
+        Set rows/versions/sortKeys for it (a re-delivered id updates its
+        row and version but keeps its position).
+      - boundary = page.next_cursor ?? "end"; hasMore = page.next_cursor != null
+      - watermark = state.watermark == null ? page.watermark
+                    : Math.min(state.watermark, page.watermark)
+        (keep the LOWEST watermark: every loaded row is at least that
+        new, so polling from it can miss nothing, D11)
+      - configVersion = page.config_version; forms = page.forms;
+        users = {...state.users, ...page.users}
+    applyRowUpdates(state, rows, users = {})
+      - For each row whose id is in `order`: replace rows[id] and set
+        versions[id] = max(old ?? 0, row.version). Do NOT touch sortKeys
+        or order: the card stays where it is (D1/D2). If its sort key
+        changed, the next poll marks the snapshot stale.
+      - Rows whose id is not in `order` are ignored.
+      - users merged in.
+    markChanges(state, response) → {state, idsToPatch, configChanged}
+      - response.reset → stale = true, watermark = response.watermark,
+        idsToPatch = [], configChanged = false.
+      - Otherwise, for each change c:
+          inSnap = order includes c.record_id
+          if inSnap and c.version > (versions[id] ?? 0) → idsToPatch
+          if c.in_view !== inSnap → stale
+          if c.in_view and inSnap and !sameSortKey(c.sort_key, sortKeys[id])
+             → stale
+        stale is sticky (state.stale || found). watermark =
+        response.watermark. configChanged = response.config_version !==
+        state.configVersion; the new state stores the new configVersion.
+      - idsToPatch has no duplicates and follows the order of the changes.
+    reconcile(state, idsResponse, dirtyIds = []) → {state, idsToFetch, configChanged}
+      - server = idsResponse.items, in order. dirty = set of dirty ids
+        that are in state.order.
+      - newOrder = server ids without the dirty ones. Then insert each
+        dirty id (taking them in their old order) right after its nearest
+        PREVIOUS neighbour in the old order that is already in newOrder,
+        or at the front if there is none. Dirty ids keep their place
+        whether or not the server still lists them (spec: removed only
+        by a Refresh after saving).
+      - sortKeys: server sort_key for non-dirty ids; old key for dirty.
+      - idsToFetch: server ids that are not dirty and either have no row
+        or have item version > versions[id]. In server order.
+      - rows/versions: keep only the ids in newOrder (versions of ids to
+        fetch stay old until applyRowUpdates sets them).
+      - boundary = idsResponse.next_cursor ?? "end"; hasMore =
+        idsResponse.next_cursor != null.
+      - watermark = idsResponse.watermark; stale = false;
+        configChanged as in markChanges, then configVersion updated.
+    visibleRows(state) → rows in `order` that have a row (for rendering)
+    snapshotParams(state) → {boundary: state.boundary ?? "end"} (helper
+      for 10i; trivial, but keep it here so that the rule is tested)
+
+  No default export. JSDoc on every export.
+
+------------------------------------------------------------------------
+TESTS — collectionModel.test.js (same directory)
+------------------------------------------------------------------------
+  Write small builders at the top:
+    row(id, {version = 1, time = 100 - id, label = 1, note = null} = {})
+    page(rows, {next = null, wm = 10, cv = 0} = {})
+    ids(items, {next = null, wm = 10, cv = 0} = {})
+  Tests (each one is a separate `it`):
+  appendPage
+    1. two pages → order is concatenated, boundary = 2nd next_cursor or
+       "end", hasMore set, watermark = min of the two, users merged,
+       forms from the last page.
+    2. a re-delivered id keeps its position and updates its version.
+  applyRowUpdates
+    3. patches the row and version in place; order and sortKeys
+       unchanged even if the row's time changed; ids not in order are
+       ignored.
+  markChanges
+    4. a newer version of a snapshot id → idsToPatch, not stale.
+    5. same or older version → nothing to patch.
+    6. in_view true for an id not in the snapshot → stale (entered
+       above the boundary).
+    7. in_view false for an id in the snapshot → stale (left the view).
+    8. in_view true, in snapshot, different sort_key → stale; the same
+       sort_key → not stale (a note edit).
+    9. in_view false for an id not in the snapshot → nothing (beyond the
+       boundary or never matching).
+    10. reset → stale, watermark updated, no patches.
+    11. stale stays true after a later empty poll.
+    12. config_version change → configChanged true, no stale.
+  reconcile
+    13. drops ids the server no longer lists.
+    14. inserts a new id at its server position and fetches it.
+    15. reorders to server order.
+    16. fetches only missing or newer ids (an id with the same version
+        is not fetched).
+    17. a dirty id that the server dropped stays, right after its old
+        previous neighbour; a dirty id at the old front stays at the
+        front; dirty ids are never in idsToFetch.
+    18. stale cleared, boundary/hasMore from next_cursor, watermark from
+        the response.
+    19. EQUIVALENCE (spec): build the server truth as a list of rows. A
+        stale snapshot from old data + reconcile(ids built from the
+        truth) + applyRowUpdates(rows the truth has for idsToFetch)
+        gives the same {order, rows, versions, sortKeys, boundary,
+        hasMore} as emptyState + appendPage(one page with the truth).
+        Use toEqual.
+    20. The inputs are not mutated (deep-freeze the state with a small
+        recursive Object.freeze helper before every call in this test).
+  sortKeyOf / sameSortKey
+    21. unlabeled → record_id; labeled → [time, id]; time null →
+        [null, id]; sameSortKey([1.5, 2], [1.5, 2]) true,
+        ([1.5, 2], [1.5, 3]) false, (3, 3) true, (null, 3) false.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && CI=true npx react-scripts test --watchAll=false src/ProjectComponents/HistoryComponents'
+  Paste the output (all suites in the directory, including the 10a/10c
+  tests, green).
+
+DONE WHEN
+  - collectionModel.js exists with the exports above, pure and immutable.
+  - All 21 tests pass.
+  - Only these files changed:
+      asreview/webapp/src/ProjectComponents/HistoryComponents/collectionModel.js (new)
+      asreview/webapp/src/ProjectComponents/HistoryComponents/collectionModel.test.js (new)
+========================================================================

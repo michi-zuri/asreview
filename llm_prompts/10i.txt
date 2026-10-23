@@ -1,0 +1,208 @@
+========================================================================
+TASK 10i — Spec 0001 Part 4c (frontend wiring): useCollection hook,
+           15 s poll, in-place patches, "out of date" banner, Refresh
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10h merged.
+SPEC: specs/0001-collection-snapshot.md, "Part 4 → Behaviour", the
+      implementer's defaults, and the implementation notes. The spec
+      wins. STOP and report if it disagrees with this prompt.
+
+WHY
+  collectionModel.js (10h) holds the logic. This task replaces the
+  Collection's useInfiniteQuery with a small hook that does only these
+  things: load pages, poll labeled/changes, patch cards via records?ids=,
+  show the banner and run Refresh = labeled/ids → reconcile →
+  records?ids= for idsToFetch. Nothing anywhere refetches pages.
+
+FACTS (verified — trust these)
+  - src/ProjectComponents/HistoryComponents/LabeledRecord.js (after 10c):
+    useInfiniteQuery over ProjectAPI.fetchLabeledRecord with
+    getNextPageParam/formsOf/usersOf/patchRowInPages from
+    ./labeledPaging; onRowUpdated patches via setQueryData and
+    invalidates ["fetchLabeledStats", {project_id}]. It renders
+    RecordCard with tagsForm/listsForm/users/onRowUpdated/
+    transitionType={null}/key "record-card-<pid>-<rid>", and an InView
+    "load more" sentinel. Used by LabelHistory.js and
+    LabelHistoryPrior.js with props label (the subset), filterQuery etc.
+  - src/api/ProjectAPI.js :: fetchLabeledRecord sends subset, filter
+    (array, qs arrayFormat "repeat") and cursor. latest_first is not
+    sent (server default 1). Follow the same style for the new calls.
+  - Endpoints (10g): GET projects/<id>/labeled/changes?since&boundary&
+    subset&filter…, GET projects/<id>/labeled/ids?boundary&subset&
+    filter…, GET projects/<id>/records?ids=1,2,3 (≤ 500 ids). /labeled
+    takes per_page.
+  - collectionModel.js exports emptyState, appendPage, applyRowUpdates,
+    markChanges, reconcile, visibleRows, snapshotParams, sortKeyOf,
+    sameSortKey.
+  - RecordCardLabeler holds isDirty and showNotesDialog / showTagsDialog
+    / showListsDialog (useToggle, ~956–959). RecordCard passes
+    onDirtyChange={setIsDirty} to it (internal use; leave that alone).
+  - MUI v6 is available (Alert, Button). react-query 3.39.3
+    (useQueryClient) stays for the stats invalidation only.
+
+DESIGN (decided — follow it)
+  A. ProjectAPI.js: four static methods, each resolving result.data:
+       fetchLabeledPage({project_id, subset, filter, cursor, per_page})
+       fetchLabeledChanges({project_id, subset, filter, since, boundary})
+       fetchLabeledIds({project_id, subset, filter, boundary})
+       fetchRecordsByIds({project_id, ids})       // ids.join(",")
+     Leave fetchLabeledRecord in place (other callers may exist. grep it,
+     and remove it only if nothing else uses it).
+
+  B. collectionModel.js: add
+       applyForms(state, page) → {...state, forms: page.forms,
+         users: {...state.users, ...page.users},
+         configVersion: page.config_version}
+     plus one Jest test in collectionModel.test.js.
+
+  C. New hook src/ProjectComponents/HistoryComponents/useCollection.js
+       export const POLL_MS = 15000;
+       export const PATCH_CHUNK = 200;
+       export default function useCollection({project_id, subset, filter})
+         returns {state, isLoading, error, loadMore, refresh,
+                  onRowUpdated, onEditingChange}
+     Internals:
+     - stateRef + useState: commit(next) sets both. Async code always
+       reads stateRef.current at the moment it applies a result.
+     - snapshotKey = JSON.stringify([project_id, subset, filter]). On
+       change (and on mount): gen.current += 1, commit(emptyState(subset)),
+       load the first page. Every async step captures `g = gen.current`
+       and drops its result if gen.current !== g. Navigating away
+       unmounts the hook, and F5 starts empty: no cache (spec default).
+     - One operation at a time: busy ref. loadMore, poll, patch and
+       refresh each run with busy = true. A poll tick while busy is
+       skipped (the next tick retries). loadMore while busy sets
+       wantMore = true and runs as soon as the current operation ends.
+     - loadMore: if !hasMore return. fetchLabeledPage with cursor =
+       (boundary is a cursor string ? boundary : undefined), per_page 50
+       → appendPage.
+     - poll: skipped if document.hidden, busy, or nothing is loaded yet.
+       fetchLabeledChanges({since: state.watermark, boundary:
+       snapshotParams(state).boundary}) → markChanges.
+         if the response is a reset or has ≥ 1 change:
+           queryClient.invalidateQueries(["fetchLabeledStats", {project_id}])
+         idsToPatch → fetchRecordsByIds in chunks of PATCH_CHUNK →
+           applyRowUpdates(rows, users)
+         configChanged → fetchLabeledPage({per_page: 1}) → applyForms
+           (forms and users only; its rows are ignored)
+       Timer: setInterval(poll, POLL_MS) in an effect bound to
+       snapshotKey. A visibilitychange listener calls poll() at once
+       when the tab becomes visible. Clean both up.
+     - refresh: fetchLabeledIds({boundary}) → reconcile(state, resp,
+       [...dirtyIds]) → fetch idsToFetch in chunks → applyRowUpdates;
+       configChanged → applyForms as above. Also invalidate the stats.
+     - onRowUpdated(row): commit(applyRowUpdates(stateRef.current,
+       [row])) and invalidate the stats (D13: no other special handling).
+     - onEditingChange(record_id, editing): add to / remove from a
+       dirtyIds Set ref.
+     - Errors: keep the last good state; expose `error` (the latest
+       failure message) and clear it on the next success. A failed poll
+       does not show anything (the next tick retries). A failed
+       loadMore or refresh sets error.
+
+  D. LabeledRecord.js: replace useInfiniteQuery and the labeledPaging
+     imports with useCollection({project_id, subset: label, filter:
+     filterQuery.map((f) => f.value)}). Render:
+       - while state.stale: a banner ABOVE the cards, sticky at the top
+         of the list (position: "sticky", top: 0, zIndex 2):
+           <Alert severity="info" action={<Button color="inherit"
+             size="small" onClick={refresh}>Refresh</Button>}>
+             This view is out of date.
+           </Alert>
+         Exact texts from the spec. No counts, no details.
+       - visibleRows(state).map(record => <RecordCard … same props as
+         after 10c, with tagsForm={state.forms.tags_form},
+         listsForm={state.forms.lists_form}, users={state.users},
+         onRowUpdated={onRowUpdated}, onEditingChange={onEditingChange}
+         … />)
+       - the InView sentinel calls loadMore() when in view and
+         state.hasMore. Keep today's "Load more"/spinner/empty look.
+       - error → the existing InlineErrorHandler.
+     Delete labeledPaging.js and labeledPaging.test.js if nothing else
+     imports them (grep). Their behaviour is covered by
+     collectionModel.test.js now. Say so in the report.
+
+  E. RecordCard.js: new optional prop onEditingChange (default null).
+     Pass it to RecordCardLabeler as
+       onEditingChange={onEditingChange
+         ? (editing) => onEditingChange(record.record_id, editing)
+         : null}
+  F. RecordCardLabeler.js: new optional prop onEditingChange = null.
+       const editing = isDirty || showNotesDialog || showTagsDialog ||
+                       showListsDialog;
+       const editingCb = React.useRef(onEditingChange);
+       editingCb.current = onEditingChange;
+       React.useEffect(() => {
+         if (editingCb.current) editingCb.current(editing);
+       }, [editing]);
+       React.useEffect(() => () => {
+         if (editingCb.current) editingCb.current(false);
+       }, []);
+     (The ref keeps the effect from firing on every render, because the
+     card creates a new arrow function each time.)
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - src/ProjectComponents/HistoryComponents/LabeledRecord.js,
+    LabelHistory.js, LabelHistoryPrior.js
+  - src/ProjectComponents/HistoryComponents/collectionModel.js (+ test)
+  - src/ProjectComponents/HistoryComponents/labeledPaging.js (+ test)
+  - src/api/ProjectAPI.js :: fetchLabeledRecord and its neighbours
+  - src/ProjectComponents/ReviewComponents/RecordCard.js
+  - src/ProjectComponents/ReviewComponents/RecordCardLabeler.js
+    (props block ~930–1000, the dialogs ~1498–1531)
+
+------------------------------------------------------------------------
+TESTS
+------------------------------------------------------------------------
+  - collectionModel.test.js: the applyForms test (B).
+  - No test for the hook itself is required (there is no
+    @testing-library/react-hooks and the spec forbids new libraries).
+    Keep the hook thin so that the logic stays in the tested module.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && CI=true npx react-scripts test --watchAll=false src/ProjectComponents/HistoryComponents'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && npm run build'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_collection_sync.py asreview/webapp/tests/test_api/test_labeled_pagination.py -q'
+  Paste all three outputs. The build must show no new ESLint warnings.
+
+  Manual checks for the user (from the spec examples; report them, do
+  not claim you did them). Use two browsers (A and B) on one project:
+    1. A: "Unlabeled + Full text: false", 100 loaded. A PDF is found for
+       record 42 → card 42 shows its PDF at once and stays; within 15 s
+       the banner appears. Refresh → 42 is gone, nothing else moves,
+       and the network shows one labeled/ids call and no records call.
+    2. B labels record 88 relevant; 88 sorts above A's boundary in
+       Relevant → banner in A. Refresh inserts 88 at its place with one
+       records call for one id.
+    3. B edits a note on a card that A has loaded → the note updates in
+       A within one poll, with no banner.
+    4. B labels a record that sorts below A's boundary → nothing visible
+       in A until scrolling.
+    5. A edits tags on card 15 (dialog open or unsaved) and it stops
+       matching → Refresh keeps 15. After saving, the next Refresh
+       removes it.
+    6. A's tab hidden for an hour with > 200 changes → on return the
+       banner appears at once. Refresh gives the same view as F5 down to
+       the same boundary.
+    7. F5 → everything fresh; the network shows no polling while the tab
+       is hidden.
+    8. An admin renames a tag option → within one poll A's cards show
+       the new name, with no banner.
+
+DONE WHEN
+  - The Collection uses useCollection. No useInfiniteQuery and no page
+    refetch remain in LabeledRecord.js.
+  - The banner, poll, patch and Refresh behave as in the spec.
+  - Jest, build and pytest are green.
+  - Only these files changed:
+      asreview/webapp/src/api/ProjectAPI.js
+      asreview/webapp/src/ProjectComponents/HistoryComponents/LabeledRecord.js
+      asreview/webapp/src/ProjectComponents/HistoryComponents/useCollection.js (new)
+      asreview/webapp/src/ProjectComponents/HistoryComponents/collectionModel.js
+      asreview/webapp/src/ProjectComponents/HistoryComponents/collectionModel.test.js
+      asreview/webapp/src/ProjectComponents/HistoryComponents/labeledPaging.js (deleted)
+      asreview/webapp/src/ProjectComponents/HistoryComponents/labeledPaging.test.js (deleted)
+      asreview/webapp/src/ProjectComponents/ReviewComponents/RecordCard.js
+      asreview/webapp/src/ProjectComponents/ReviewComponents/RecordCardLabeler.js
+========================================================================

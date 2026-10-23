@@ -1,0 +1,85 @@
+========================================================================
+TASK 10f — Spec 0001 Part 3c: version on every row; watermark and
+           config_version on /labeled
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10e merged.
+SPEC: specs/0001-collection-snapshot.md, "Part 3 → API additions", D11
+      and the implementation notes. The spec wins. STOP and report if it
+      disagrees with this prompt.
+
+WHY
+  Part 4's client compares row versions with the change feed. Every row
+  must therefore carry its version, and every list response must carry
+  the project version (`watermark`) read BEFORE the rows. /labeled reads
+  results through sqlite3 and records through the SQLAlchemy DataStore
+  (two connections, two snapshots). Reading the watermark first means a
+  concurrent write can only make the rows NEWER than the watermark. The
+  next poll then re-checks harmlessly and never misses a change (D11).
+
+FACTS (verified — trust these)
+  - After 10b, asreview/webapp/_api/projects.py has _build_rows(db,
+    project, states), which is used by api_get_labeled, by the PUT branch
+    of api_label_record and by api_update_note.
+  - After 10e, Database has get_project_state() → {"version",
+    "config_version", "pruned_version", "last_pruned_at"} and
+    get_record_versions(ids) → {record_id: version}.
+  - A record without a record_versions row has version 0 (spec).
+
+DESIGN (decided — follow it)
+  - _build_rows: after collecting ids,
+        versions = db.get_record_versions(ids)
+    and set record_d["version"] = int(versions.get(rid, 0)) as a
+    TOP-LEVEL row key (next to "state").
+  - api_get_labeled: inside `with project.db as db:`, as the FIRST
+    statement (before any scan),
+        ps = db.get_project_state()
+    and add to the response
+        "watermark": ps["version"],
+        "config_version": ps["config_version"],
+    Add a comment that points to D11: "read before the rows".
+  - PUT record / PUT note responses: no new keys besides the row's
+    version (they already return the row via _build_rows).
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/webapp/_api/projects.py :: _build_rows, api_get_labeled,
+    api_label_record (PUT), api_update_note
+  - asreview/database/database.py :: get_project_state, get_record_versions
+  - asreview/webapp/tests/test_api/test_labeled_pagination.py (the tests
+    10b added)
+
+------------------------------------------------------------------------
+TESTS (add to test_labeled_pagination.py)
+------------------------------------------------------------------------
+  1. test_labeled_rows_have_versions: label 3 records. GET /labeled
+     (relevant or all labeled). Every row has an int "version" > 0, and
+     the response "watermark" >= max(row versions). "config_version" is
+     an int.
+  2. test_unlabeled_rows_version_zero_or_more: subset=unlabeled. Every
+     row has "version" (int >= 0).
+  3. test_put_note_bumps_version: label record r and read its version v1
+     from /labeled. PUT a note. json["result"]["version"] > v1, and a new
+     GET /labeled shows the same version for r and a watermark >= it.
+  4. test_watermark_read_before_rows: monkeypatch
+     Database.get_project_state to record the call order, and
+     db.input.get_records too (or patch _iter_labeled_matches), then
+     assert that get_project_state was called first. Keep this test
+     simple; if patching gets complicated, assert the ordering through a
+     wrapper around _build_rows instead and explain how in the docstring.
+
+RUN (from the git root)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_labeled_pagination.py asreview/webapp/tests/test_api/test_projects.py tests/test_change_tracking.py -q'
+  Paste the output. There must be no new failures compared with the 10b
+  baseline.
+
+  Manual check for the user (report it, do not claim you did it): with
+  the Zotero sync running, a record whose PDF is found gets a higher
+  "version" in /labeled (devtools → Network → response).
+
+DONE WHEN
+  - Every /labeled, PUT record and PUT note row has a top-level version.
+  - /labeled carries watermark (read first) and config_version.
+  - Only these files changed:
+      asreview/webapp/_api/projects.py
+      asreview/webapp/tests/test_api/test_labeled_pagination.py
+========================================================================
