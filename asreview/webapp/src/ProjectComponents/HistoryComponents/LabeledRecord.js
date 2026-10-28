@@ -11,6 +11,8 @@ import { ProjectAPI } from "api";
 import { useMediaQuery } from "@mui/material";
 import { useReviewSettings } from "context/ReviewSettingsContext";
 
+import { getNextPageParam } from "./labeledPaging";
+
 const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
   const { orientation, modelLogLevel, expandAbstract } = useReviewSettings();
 
@@ -50,7 +52,7 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
     ],
     ProjectAPI.fetchLabeledRecord,
     {
-      getNextPageParam: (lastPage) => lastPage.next_cursor ?? false,
+      getNextPageParam,
     },
   );
 

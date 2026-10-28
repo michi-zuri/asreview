@@ -256,7 +256,7 @@ def test_list_item_dedupe():
 
 
 def test_list_item_cleaning(caplog):
-    """Empty strings, whitespace, commas, semicolons all dropped with warnings."""
+    """Empty and whitespace-only items are dropped; commas and semicolons are allowed (user decision 2026-10-19)."""
     payload = {
         "lists": [
             {
@@ -279,11 +279,10 @@ def test_list_item_cleaning(caplog):
     names = [item["name"] for item in result["lists"]]
     assert "good_item" in names
     assert "123" in names  # str(123).strip() = "123"
-    assert "bad,comma" not in names
-    assert "bad;semicolon" not in names
+    assert "bad,comma" in names
+    assert "bad;semicolon" in names
     assert "" not in names
     assert "   " not in names
-    assert "comma" in caplog.text or "',' or ';'" in caplog.text
 
 
 def test_payload_none():
