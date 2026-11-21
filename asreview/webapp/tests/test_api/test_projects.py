@@ -402,9 +402,10 @@ def test_lists_crud(client, project):
         },
     )
     assert r.status_code == 200
-    assert r.json["name"] == "Populations"
-    assert r.json["id"] == list_id
-    assert r.json["required_for_relevant"] is False
+    # The update returns all lists.
+    updated = next(lst for lst in r.json if lst["id"] == list_id)
+    assert updated["name"] == "Populations"
+    assert updated["required_for_relevant"] is False
 
     r = client.get(f"/api/projects/{project_id}/lists")
     assert r.json[0]["name"] == "Populations"
@@ -434,13 +435,14 @@ def test_label_with_lists(client, project):
     # Ordered by sorted_at timestamp.
     names = [item["name"] for item in record["state"]["lists"]]
     assert names == ["alpha", "beta"]
-    # No lists.json configured for this project, so lists_form is None.
-    assert labeled.json["forms"]["lists_form"] is None
+    # No lists configured for this project, so lists_form is empty.
+    assert labeled.json["forms"]["lists_form"] == []
     assert "lists_form" not in record
 
 
-# Test that illegal list item names are rejected
-def test_label_with_invalid_list_name(client, project):
+# Test that commas and semicolons are allowed in list item names
+# (user decision 2026-10-19)
+def test_label_with_comma_in_list_name(client, project):
     project_id = au.get_project_id(project)
 
     search = au.search_project_data(client, project, query="The&n_max=10")
@@ -448,12 +450,19 @@ def test_label_with_invalid_list_name(client, project):
 
     items = [
         {"list_id": "L1", "item_id": "i1", "name": "a,b", "sorted_at": 1.0},
+        {"list_id": "L1", "item_id": "i2", "name": "c;d", "sorted_at": 2.0},
     ]
     r = client.post(
         f"/api/projects/{project_id}/record/{record_id}",
         data={"record_id": record_id, "label": 1, "lists": json.dumps(items)},
     )
-    assert r.status_code == 400
+    assert r.status_code == 200
+
+    labeled = au.get_labeled_project_data(client, project)
+    record = next(
+        rec for rec in labeled.json["result"] if rec["record_id"] == record_id
+    )
+    assert [item["name"] for item in record["state"]["lists"]] == ["a,b", "c;d"]
 
 
 # Test that duplicate item names within a list are rejected with a clear message

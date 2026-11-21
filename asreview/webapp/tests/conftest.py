@@ -13,15 +13,12 @@
 # limitations under the License.
 
 import os
-import shutil
-import socket
 from pathlib import Path
 
 import pytest
 from sqlalchemy.orm import close_all_sessions
 
 import asreview.webapp.tests.utils.api_utils as au
-from asreview.datasets import SynergyDataSet
 from asreview.webapp import DB
 from asreview.webapp.app import create_app
 from asreview.webapp.tests.utils import crud
@@ -41,42 +38,6 @@ PROJECTS = [
         "description": "hello world",
     },
 ]
-
-
-SYNERGY_CACHE_DIR = Path.home() / ".cache" / "asreview_tests" / "synergy"
-SYNERGY_DOWNLOAD_TIMEOUT = 60  # seconds without data before a download fails
-
-
-@pytest.fixture(autouse=True, scope="session")
-def cached_synergy_datasets():
-    """Download each Synergy dataset once and reuse it across test runs.
-
-    Every project fixture adds ``synergy:van_der_Valk_2021``, which otherwise
-    downloads from dataverse.nl each time (no timeout, so a stalled connection
-    hangs the run). The CSV is cached in ``~/.cache/asreview_tests/synergy``;
-    delete that folder to force a fresh download.
-    """
-    original_to_file = SynergyDataSet.to_file
-
-    def to_file(self, path=None):
-        cached = SYNERGY_CACHE_DIR / self.filename
-        if not cached.exists():
-            SYNERGY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = cached.with_suffix(f".{os.getpid()}.tmp")
-            old_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(SYNERGY_DOWNLOAD_TIMEOUT)
-            try:
-                original_to_file(self, tmp)
-            finally:
-                socket.setdefaulttimeout(old_timeout)
-            os.replace(tmp, cached)  # atomic: parallel runs never see half a file
-        if path is None:
-            return cached.read_text()
-        shutil.copyfile(cached, path)
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(SynergyDataSet, "to_file", to_file)
-        yield
 
 
 def _get_app(app_type="auth-basic", path=None):

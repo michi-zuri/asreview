@@ -17,8 +17,9 @@ def osf_fg93a_path():
     """Return a local path to the OSF fg93a dataset, downloading it if needed."""
     _OSF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Return cached file without making any network requests
-    cached_files = list(_OSF_CACHE_DIR.iterdir())
+    # Return cached file without making any network requests. Only files:
+    # the directory also holds the synergy/ cache (see the root conftest.py).
+    cached_files = [f for f in _OSF_CACHE_DIR.iterdir() if f.is_file()]
     if cached_files:
         return cached_files[0]
 

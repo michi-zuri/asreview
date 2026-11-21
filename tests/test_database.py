@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -770,8 +771,8 @@ def test_fix_old_v2_decision_changes_schema(tmpdir):
         cur = db._conn.cursor()
         columns = [row[1] for row in cur.execute("PRAGMA table_info(decision_changes)")]
         assert "label" in columns
-        assert "new_label" not in columns
         assert "user_id" in columns
+        assert "change_id" in columns
 
         # Verify existing data was preserved
         rows = cur.execute(
@@ -961,11 +962,12 @@ def test_replace_lists_clears_previous(db_with_data):
     assert db.get_lists(2) == []
 
 
-def test_replace_lists_rejects_illegal_names(db_with_data):
+def test_replace_lists_allows_commas_and_semicolons(db_with_data):
+    """Commas and semicolons are allowed in item names (user decision 2026-10-19)."""
     db = db_with_data
-    for bad in ["with,comma", "with;semicolon"]:
-        with pytest.raises(ValueError):
-            db.replace_lists(2, [{"list_id": "L1", "item_id": "x", "name": bad}])
+    for name in ["with,comma", "with;semicolon"]:
+        db.replace_lists(2, [{"list_id": "L1", "item_id": "x", "name": name}])
+        assert db.get_lists_for_records([2])[2][0]["name"] == name
 
 
 def test_get_lists_for_records(db_with_data):
@@ -987,3 +989,146 @@ def test_ensure_lists_table_is_idempotent(db):
         for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
     ]
     assert "lists" in tables
+
+
+UUID7_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+
+
+def test_decision_log_events(db):
+    """Every way a results row changes is logged as its own event."""
+    db.input.add_records([Record(i, "foo") for i in range(4)])
+    db.input.set_groups([(0, 0), (0, 1)])
+    db.add_last_ranking([2, 0, 1], "nb", "max", "balanced", "tfidf", 0)
+
+    db.query_top_ranked(user_id=1)  # checks out 2
+    db._conn.execute("UPDATE results SET last_active = 0")
+    db.reassign_stale(user_id=2, older_than=60)
+    db.query_top_ranked(user_id=1)  # checks out the group 0, 1
+    db.label_record(0, 1, user_id=1)
+    db.update_result(0, label=0)
+    db.update_result(0, label=1)  # a second change of the same records
+    db.label_record(2, 1, user_id=2)
+    db.label_record(3, 0)  # labeled without a checkout
+    db.delete_result(2)
+
+    log = db.get_decision_log().astype(object).where(lambda df: df.notna(), None)
+    events = log[["record_id", "event", "label", "user_id", "new_label", "new_user_id"]]
+    assert events.values.tolist() == [
+        [2, "checkout", None, None, None, 1],
+        [2, "reassign", None, 1, None, 2],
+        [0, "checkout", None, None, None, 1],
+        [1, "checkout", None, None, None, 1],
+        [0, "decision", None, 1, 1, 1],
+        [1, "decision", None, 1, 1, 1],
+        [0, "change", 1, 1, 0, 1],
+        [1, "change", 1, 1, 0, 1],
+        [0, "change", 0, 1, 1, 1],
+        [1, "change", 0, 1, 1, 1],
+        [2, "decision", None, 2, 1, 2],
+        [3, "decision", None, None, 0, None],
+        [2, "delete", 1, 2, None, None],
+    ]
+    assert log["change_id"].str.match(UUID7_PATTERN).all()
+    assert log["change_id"].is_unique
+    assert log["changed_at"].notna().all()
+    assert log["changed_at"].sub(time.time()).abs().max() < 60
+
+    # get_decision_changes keeps its meaning: changes and deletes only, with
+    # the state before them.
+    assert_changes_state(db, [[0, 1, 1], [1, 1, 1], [0, 0, 1], [1, 0, 1], [2, 1, 2]])
+
+
+def test_sql_uuid7_matches_python_layout(db):
+    """The trigger-generated id has the uuid7() layout and the current time."""
+    db.input.add_records([Record(0, "foo")])
+    db.label_record(0, 1)
+    change_id = db.get_decision_log()["change_id"].iloc[0]
+    ref = uuid7()
+
+    assert len(change_id) == len(ref) == 36
+    assert pd.Series([change_id, ref]).str.match(UUID7_PATTERN).all()
+    sql_ms = int(change_id.replace("-", "")[:12], 16)
+    ref_ms = int(ref.replace("-", "")[:12], 16)
+    assert abs(sql_ms - ref_ms) < 60_000
+
+
+def test_upgrade_record_id_pk_decision_changes(tmpdir):
+    """A table with record_id as primary key is rebuilt, keeping its rows.
+
+    That layout allowed one row per record, so a record's second logged
+    change failed with a UNIQUE constraint error.
+    """
+    db_path = Path(tmpdir, "test.db")
+    with asr.Database(db_path) as db:
+        db.create_tables()
+        db.input.add_records([Record(0, "foo"), Record(1, "foo")])
+
+    conn = sqlite3.connect(db_path)
+    for name in [
+        "trg_dc_results_insert",
+        "trg_dc_results_label_update",
+        "trg_dc_results_user_update",
+        "trg_dc_results_delete",
+    ]:
+        conn.execute(f"DROP TRIGGER {name}")
+    conn.execute("DROP TABLE decision_changes")
+    conn.execute(
+        """CREATE TABLE decision_changes
+        (record_id INTEGER PRIMARY KEY, label INTEGER, time FLOAT, user_id INTEGER)"""
+    )
+    conn.execute("""
+        CREATE TRIGGER trg_results_label_update
+        AFTER UPDATE OF label ON results
+        FOR EACH ROW
+        WHEN OLD.label IS NOT NEW.label
+        BEGIN
+            INSERT INTO decision_changes (record_id, label, time, user_id)
+            VALUES (OLD.record_id, OLD.label, OLD.time, OLD.user_id);
+        END
+    """)
+    conn.execute("INSERT INTO decision_changes VALUES (1, NULL, NULL, 3)")
+    conn.execute("INSERT INTO decision_changes VALUES (0, 1, 10.0, 3)")
+    conn.commit()
+    conn.close()
+
+    with asr.Database(db_path) as db:
+        db._is_valid()
+
+        triggers = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+        assert "trg_results_label_update" not in triggers
+        assert "trg_dc_results_label_update" in triggers
+
+        # rowid equals record_id in this layout, so rows come back by record.
+        log = db.get_decision_log()
+        assert log["record_id"].tolist() == [0, 1]
+        assert log["event"].tolist() == ["change", "decision"]
+        assert log["label"].tolist()[0] == 1
+        assert log["user_id"].tolist() == [3, 3]
+        assert log["change_id"].str.match(UUID7_PATTERN).all()
+        assert log["changed_at"].isna().all()
+
+        db.label_record(0, 1)
+        db.update_result(0, label=0)
+        db.update_result(0, label=1)
+        assert db.get_decision_log()["record_id"].tolist() == [0, 1, 0, 0, 0]
+
+
+def test_reassign_stale_group(db):
+    """Reassigning a checkout moves the whole group to the new user."""
+    db.input.add_records([Record(0, "foo"), Record(1, "foo")])
+    db.input.set_groups([(0, 0), (0, 1)])
+    db.add_last_ranking([0, 1], "nb", "max", "balanced", "tfidf", 0)
+    db.query_top_ranked(user_id=1)
+    db._conn.execute("UPDATE results SET last_active = 0")
+    db._conn.commit()
+
+    pending = db.reassign_stale(user_id=2, older_than=60)
+
+    assert pending["record_id"].tolist() == [0]  # one row per group
+    users = db.get_results_table(["user_id"], pending=True, groups=True)["user_id"]
+    assert users.tolist() == [2, 2]
