@@ -613,8 +613,8 @@ const ListsDialog = ({
   open,
   onClose,
   onSave,
+  onRowUpdated = null,
 }) => {
-  const queryClient = useQueryClient();
   const [localListValues, setLocalListValues] = React.useState(
     withTrailingEmptyItems(structuredClone(listValues || []), listsForm),
   );
@@ -653,8 +653,8 @@ const ListsDialog = ({
   const { isError, isLoading, mutate } = useMutation(
     ProjectAPI.mutateClassification,
     {
-      onSuccess: () => {
-        queryClient.invalidateQueries(["fetchLabeledRecord", { project_id }]);
+      onSuccess: (data) => {
+        if (onRowUpdated && data?.result) onRowUpdated(data.result);
         onSave(localListValues);
         onClose();
       },
@@ -720,7 +720,14 @@ const ListsDialog = ({
   );
 };
 
-const NoteDialog = ({ project_id, record_id, open, onClose, note = null }) => {
+const NoteDialog = ({
+  project_id,
+  record_id,
+  open,
+  onClose,
+  note = null,
+  onRowUpdated = null,
+}) => {
   const queryClient = useQueryClient();
 
   const [noteState, setNoteState] = React.useState(note);
@@ -732,19 +739,21 @@ const NoteDialog = ({ project_id, record_id, open, onClose, note = null }) => {
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { isError, isLoading, mutate } = useMutation(ProjectAPI.mutateNote, {
-    onSuccess: () => {
-      queryClient.invalidateQueries(["fetchLabeledRecord", { project_id }]);
-      queryClient.setQueryData(["fetchRecord", { project_id }], (data) => {
-        return {
-          ...data,
-          result: {
-            ...data.result,
-            state: {
-              ...data.result.state,
-              note: noteState,
-            },
-          },
-        };
+    onSuccess: (data) => {
+      if (onRowUpdated && data?.result) onRowUpdated(data.result);
+      queryClient.setQueryData(["fetchRecord", { project_id }], (cached) => {
+        return cached?.result
+          ? {
+              ...cached,
+              result: {
+                ...cached.result,
+                state: {
+                  ...cached.result.state,
+                  note: noteState,
+                },
+              },
+            }
+          : cached;
       });
       onClose();
     },
@@ -811,8 +820,8 @@ const TagsDialog = ({
   open,
   onClose,
   onSave,
+  onRowUpdated = null,
 }) => {
-  const queryClient = useQueryClient();
   const [localTagValues, setLocalTagValues] = React.useState(
     mergeTagValues(tagsForm, tagValues),
   );
@@ -861,8 +870,8 @@ const TagsDialog = ({
   const { isError, isLoading, mutate } = useMutation(
     ProjectAPI.mutateClassification,
     {
-      onSuccess: () => {
-        queryClient.invalidateQueries(["fetchLabeledRecord", { project_id }]);
+      onSuccess: (data) => {
+        if (onRowUpdated && data?.result) onRowUpdated(data.result);
         onSave(localTagValues);
         onClose();
       },
@@ -952,6 +961,7 @@ const RecordCardLabeler = ({
   resetKey = 0,
   onDirtyChange = null,
   disabled = false,
+  onRowUpdated = null,
 }) => {
   const [editState] = useToggle(!(label === 1 || label === 0) && !disabled);
   const [showNotesDialog, toggleShowNotesDialog] = useToggle(false);
@@ -978,6 +988,16 @@ const RecordCardLabeler = ({
     setIsDirty(false);
   }, [resetKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Re-initialise tag/list inputs when the row is patched (own edit or a
+  // colleague's edit), so the new values show without a card remount. Skipped
+  // while the user has unsaved edits or a dialog open.
+  const propsSig = JSON.stringify([tagsForm, tagValues, listsForm, listValues]);
+  React.useEffect(() => {
+    if (isDirty || showTagsDialog || showListsDialog) return;
+    setTagValuesState(initTags());
+    setListValuesState(initLists());
+  }, [propsSig]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Notify parent when dirty state changes.
   React.useEffect(() => {
     if (onDirtyChange) onDirtyChange(isDirty);
@@ -1003,6 +1023,7 @@ const RecordCardLabeler = ({
           );
           return;
         }
+        if (onRowUpdated && data?.result) onRowUpdated(data.result);
         if (onDecisionClose) {
           onDecisionClose();
         }
@@ -1501,6 +1522,7 @@ const RecordCardLabeler = ({
             open={showNotesDialog}
             onClose={toggleShowNotesDialog}
             note={note}
+            onRowUpdated={onRowUpdated}
           />
           {Array.isArray(tagsForm) && tagsForm.length > 0 && (
             <TagsDialog
@@ -1513,6 +1535,7 @@ const RecordCardLabeler = ({
               open={showTagsDialog}
               onClose={toggleShowTagsDialog}
               onSave={setTagValuesState}
+              onRowUpdated={onRowUpdated}
             />
           )}
           {Array.isArray(listsForm) && listsForm.length > 0 && (
@@ -1527,6 +1550,7 @@ const RecordCardLabeler = ({
               open={showListsDialog}
               onClose={toggleShowListsDialog}
               onSave={setListValuesState}
+              onRowUpdated={onRowUpdated}
             />
           )}
         </CardActions>

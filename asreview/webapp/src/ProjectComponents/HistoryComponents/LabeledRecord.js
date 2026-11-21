@@ -2,7 +2,7 @@ import { Box, ButtonBase, Fade, Stack, Typography } from "@mui/material";
 import { grey } from "@mui/material/colors";
 import React from "react";
 import { InView } from "react-intersection-observer";
-import { useInfiniteQuery, useQuery } from "react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "react-query";
 
 import { InlineErrorHandler } from "Components";
 import { RecordCard } from "ProjectComponents/ReviewComponents";
@@ -11,7 +11,12 @@ import { ProjectAPI } from "api";
 import { useMediaQuery } from "@mui/material";
 import { useReviewSettings } from "context/ReviewSettingsContext";
 
-import { getNextPageParam } from "./labeledPaging";
+import {
+  formsOf,
+  getNextPageParam,
+  patchRowInPages,
+  usersOf,
+} from "./labeledPaging";
 
 const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
   const { orientation, modelLogLevel, expandAbstract } = useReviewSettings();
@@ -32,6 +37,21 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
     },
   );
 
+  const queryClient = useQueryClient();
+  const filterValues = filterQuery.map((filter) => filter.value);
+
+  // The query key is memoised on the filter VALUES (JSON), not the array
+  // identity, so a parent re-render with the same filters keeps the same key
+  // and `setQueryData` patching (below) targets the right query.
+  const queryKey = React.useMemo(
+    () => [
+      "fetchLabeledRecord",
+      { project_id: project_id, subset: label, filter: filterValues },
+    ],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [project_id, label, JSON.stringify(filterValues)],
+  );
+
   const {
     data,
     error,
@@ -41,20 +61,28 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
     isFetched,
     isFetchingNextPage,
     isLoading,
-  } = useInfiniteQuery(
-    [
-      "fetchLabeledRecord",
-      {
-        project_id: project_id,
-        subset: label,
-        filter: filterQuery.map((filter) => filter.value),
-      },
-    ],
-    ProjectAPI.fetchLabeledRecord,
-    {
-      getNextPageParam,
+  } = useInfiniteQuery(queryKey, ProjectAPI.fetchLabeledRecord, {
+    getNextPageParam,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    refetchOnMount: "always",
+    cacheTime: 0, // no snapshot reuse after navigating away
+  });
+
+  // Patch exactly one row (an own edit) instead of refetching every page.
+  const onRowUpdated = React.useCallback(
+    (row) => {
+      if (!row) return;
+      queryClient.setQueryData(queryKey, (old) =>
+        old ? patchRowInPages(old, row) : old,
+      );
+      queryClient.invalidateQueries(["fetchLabeledStats", { project_id }]);
     },
+    [queryClient, queryKey, project_id],
   );
+
+  const forms = formsOf(data);
+  const users = usersOf(data);
 
   /**
    * Check if this component is mounted
@@ -90,27 +118,17 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
                     allowMemberReplace={
                       projectInfo?.allow_member_replace === true
                     }
-                    transitionType="collapse"
-                    transitionSpeed={{ enter: 500, exit: 800 }}
+                    transitionType={null}
                     landscape={
                       orientation === "landscape" && !landscapeDisabled
                     }
                     modelLogLevel={modelLogLevel}
                     changeDecision={mode === "oracle"}
-                    key={
-                      "record-card-" +
-                      project_id +
-                      "-" +
-                      record?.record_id +
-                      "-" +
-                      record?.state?.note +
-                      "-" +
-                      JSON.stringify(record?.tags_form) +
-                      "-" +
-                      JSON.stringify(record?.lists_form) +
-                      "-" +
-                      JSON.stringify(record?.state?.lists)
-                    }
+                    tagsForm={forms.tags_form}
+                    listsForm={forms.lists_form}
+                    users={users}
+                    onRowUpdated={onRowUpdated}
+                    key={"record-card-" + project_id + "-" + record?.record_id}
                   />
                 )),
               )}

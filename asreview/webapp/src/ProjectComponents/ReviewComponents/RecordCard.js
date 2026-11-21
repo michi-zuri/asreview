@@ -81,15 +81,8 @@ const ZoteroFullTextButton = ({
   const [replacing, setReplacing] = React.useState(false);
   const queryClient = useQueryClient();
 
-  // The list row was loaded without a PDF, but the live check found
-  // one: refresh the Collections list so a "no full text" filter
-  // drops this record.
-  const listHadPdf = /^[A-Z0-9]{8}$/.test(record?.attachment ?? "");
-  React.useEffect(() => {
-    if (data?.available && !listHadPdf) {
-      queryClient.invalidateQueries(["fetchLabeledRecord", { project_id }]);
-    }
-  }, [data?.available, listHadPdf, project_id, queryClient]);
+  // The live check result is shown on this card only; membership changes
+  // surface via the Collection's staleness banner (Spec 0001 Part 4).
 
   // Replace confirmation dialog state
   const [replaceDialogOpen, setReplaceDialogOpen] = React.useState(false);
@@ -104,7 +97,6 @@ const ZoteroFullTextButton = ({
       "fetchLlmMeta",
       { project_id, record_id: record?.record_id },
     ]);
-    queryClient.invalidateQueries(["fetchLabeledRecord", { project_id }]);
   };
 
   const handleUpload = (event) => {
@@ -507,7 +499,17 @@ const RecordCard = ({
   landscape = false,
   changeDecision = true,
   disabled = false,
+  tagsForm,
+  listsForm,
+  users,
+  onRowUpdated,
 }) => {
+  const tagsFormEff = tagsForm !== undefined ? tagsForm : record.tags_form;
+  const listsFormEff = listsForm !== undefined ? listsForm : record.lists_form;
+  const userEff = users
+    ? (users[String(record.state?.user_id)] ?? null)
+    : record.state?.user;
+
   const [open, setOpen] = React.useState(true);
   const theme = useTheme();
   const [highlightOn, toggleHighlight] = useHighlightToggle();
@@ -628,11 +630,11 @@ const RecordCard = ({
               retrainAfterDecision={retrainAfterDecision}
               note={record.state?.note}
               labelTime={record.state?.time}
-              user={record.state?.user}
+              user={userEff}
               showNotes={showNotes}
-              tagsForm={record.tags_form}
+              tagsForm={tagsFormEff}
               tagValues={displayTagValues}
-              listsForm={record.lists_form}
+              listsForm={listsFormEff}
               listValues={displayListValues}
               landscape={landscape}
               hotkeys={hotkeys}
@@ -643,6 +645,7 @@ const RecordCard = ({
               resetKey={resetKey}
               onDirtyChange={setIsDirty}
               disabled={disabled}
+              onRowUpdated={onRowUpdated}
             />
           </Grid>
         </Grid>
