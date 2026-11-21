@@ -841,30 +841,29 @@ def _is_missing_scalar(value):
         return False
 
 
-@bp.route("/projects/<project_id>/labeled", methods=["GET"])
-@login_required
-@project_authorization
-def api_get_labeled(project):  # noqa: F401
-    """Get a page of labeled (or unlabeled) records using keyset pagination.
+def _parse_labeled_query(project):
+    """Parse the Collection list/filter parameters into a single dict.
 
-    Cheap filters (subset, prior, note, user) are pushed into SQL and the page
-    is read with ``ORDER BY ... LIMIT n+1`` (the extra row signals whether more
-    pages exist). Filters that require parsing the tags JSON (``tag_*``,
-    ``invalid_tags``) and the Zotero ``pdf`` filter are applied as a bounded
-    Python scan over the ordered candidates, so the whole table is never loaded
-    or parsed at once.
+    Centralises the query-string parsing shared by ``/labeled`` and the
+    Part 4 endpoints (``labeled/ids``, ``labeled/changes``). It does not read
+    ``per_page`` or ``cursor``, which belong to the route.
 
-    The ``subset`` "unlabeled" lists base records without a decision (no
-    results row, or a pending row with ``label IS NULL``), ordered by
-    record_id. On this subset the "prior" filter (``is_prior``) refers to the
-    dataset label (``included``) and the user filters mean "assigned to".
-    "note" applies.
+    Parameters
+    ----------
+    project : asreview.project.Project
+        The open project.
+
+    Returns
+    -------
+    dict
+        The parsed query with keys ``subset``, ``filters``, ``latest_first``,
+        ``label``, ``priors``, ``has_note``, ``include_users``,
+        ``exclude_users``, ``tags_form``, ``tag_filters``, ``invalid_filter``,
+        ``filter_pdf``, ``filter_abstract``, ``post_scan`` and ``filter_sig``.
     """
-    per_page = request.args.get("per_page", default=50, type=int)
     subset = request.args.get("subset", default="all", type=str)
     filters = request.args.getlist("filter", type=str)
     latest_first = request.args.get("latest_first", default=1, type=int) == 1
-    cursor_param = request.args.get("cursor", default=None, type=str)
 
     # Parse boolean filters. Supported formats:
     #   "is_prior" / "is_prior=true"   → only priors;   "is_prior=false" → exclude
@@ -890,7 +889,9 @@ def api_get_labeled(project):  # noqa: F401
     has_note = parsed_filters.get("has_note")
 
     user_filters = {
-        k[len("user_") :]: v for k, v in parsed_filters.items() if k.startswith("user_")
+        k[len("user_") :]: v
+        for k, v in parsed_filters.items()
+        if k.startswith("user_")
     }
     include_users = {int(uid) for uid, want in user_filters.items() if want}
     exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
@@ -923,14 +924,152 @@ def api_get_labeled(project):  # noqa: F401
         or invalid_filter is not None
     )
 
-    # ---- Decode / validate cursor ----
     filter_sig = _labeled_filter_signature(subset, filters, latest_first)
-    try:
-        cursor = _decode_cursor(cursor_param, filter_sig)
-    except ValueError as err:
-        return jsonify(message=str(err)), 400
 
-    # Users for output (authenticated mode only).
+    return {
+        "subset": subset,
+        "filters": filters,
+        "latest_first": latest_first,
+        "label": label,
+        "priors": priors,
+        "has_note": has_note,
+        "include_users": include_users,
+        "exclude_users": exclude_users,
+        "tags_form": tags_form,
+        "tag_filters": tag_filters,
+        "invalid_filter": invalid_filter,
+        "filter_pdf": filter_pdf,
+        "filter_abstract": filter_abstract,
+        "post_scan": post_scan,
+        "filter_sig": filter_sig,
+    }
+
+
+def _iter_labeled_matches(db, q, cursor=None, batch_size=500):
+    """Yield ``(state, key)`` for every record matching ``q`` in display order.
+
+    ``state`` is the ``pd.Series`` row of the page DataFrame (``tags`` parsed);
+    ``key`` is the ``(time, record_id)`` sort tuple (the same shape
+    ``_encode_cursor`` takes). The cheap filters are pushed into SQL by the
+    ``get_*_page`` calls; the post-scan filters (pdf, abstract, tags,
+    invalid_tags) are applied here in Python. Yields every match from the top,
+    resuming after ``cursor`` (a decoded cursor tuple or ``None``).
+
+    Parameters
+    ----------
+    db : asreview.database.database.Database
+        An open database connection (caller holds ``with project.db as db``).
+    q : dict
+        The parsed query from :func:`_parse_labeled_query`.
+    cursor : tuple[float | None, int] | None
+        Decoded cursor (``(time, record_id)``) or ``None`` to start at the top.
+    batch_size : int
+        Number of rows fetched per SQL page.
+
+    Yields
+    ------
+    tuple[pd.Series, tuple[float | None, int]]
+        Each matching record's state row and its sort key.
+    """
+    filter_pdf = q["filter_pdf"]
+    filter_abstract = q["filter_abstract"]
+    tag_filters = q["tag_filters"]
+    invalid_filter = q["invalid_filter"]
+    tags_form = q["tags_form"]
+
+    # PDF (Zotero attachment) availability set, computed once.
+    pdf_ids = None
+    if filter_pdf is not None:
+        attachments = db.input[["record_id", "attachment"]]
+        pdf_ids = set(
+            attachments.loc[
+                attachments["attachment"].apply(
+                    lambda v: is_attachment_key(v) if isinstance(v, str) else False
+                ),
+                "record_id",
+            ]
+        )
+
+    # Abstract availability set, computed once.
+    abstract_ids = None
+    if filter_abstract is not None:
+        abstracts = db.input[["record_id", "abstract"]]
+        # A record "has abstract" when the field is non-null and non-empty.
+        abstract_ids = set(
+            abstracts.loc[
+                abstracts["abstract"].apply(
+                    lambda v: isinstance(v, str) and bool(v.strip())
+                ),
+                "record_id",
+            ]
+        )
+
+    def passes(saved_tags, record_id, label):
+        if pdf_ids is not None:
+            in_pdf = record_id in pdf_ids
+            if filter_pdf != in_pdf:
+                return False
+        if abstract_ids is not None:
+            in_abstract = record_id in abstract_ids
+            if filter_abstract != in_abstract:
+                return False
+        for group_export, tag_export, want in tag_filters:
+            if _tag_is_checked(saved_tags, group_export, tag_export) != want:
+                return False
+        if invalid_filter is not None:
+            if _record_tags_invalid(saved_tags, tags_form, label) != invalid_filter:
+                return False
+        return True
+
+    scan_cursor = cursor
+    while True:
+        if q["subset"] == "unlabeled":
+            # Unlabeled records have no decision: order by record_id. The
+            # prior filter refers to the dataset label (included), and the
+            # user filters mean "assigned to" here.
+            page_df = db.get_unlabeled_page(
+                priors=q["priors"],
+                has_note=q["has_note"],
+                include_users=q["include_users"] or None,
+                exclude_users=q["exclude_users"] or None,
+                cursor=scan_cursor,
+                limit=batch_size,
+                latest_first=q["latest_first"],
+            )
+        else:
+            page_df = db.get_results_page(
+                label=q["label"],
+                priors=q["priors"],
+                has_note=q["has_note"],
+                include_users=q["include_users"] or None,
+                exclude_users=q["exclude_users"] or None,
+                cursor=scan_cursor,
+                limit=batch_size,
+                latest_first=q["latest_first"],
+            )
+        if page_df.empty:
+            break
+
+        for _, state in page_df.iterrows():
+            t = state["time"]
+            scan_cursor = (
+                None if pd.isna(t) else float(t),
+                int(state["record_id"]),
+            )
+            row_label = state["label"]
+            row_label = None if pd.isna(row_label) else int(row_label)
+            if passes(state["tags"], int(state["record_id"]), row_label):
+                yield state, scan_cursor
+
+        if len(page_df) < batch_size:
+            break
+
+
+def _users_map(project):
+    """Build the ``{user_id: summary}`` map for a response.
+
+    Only populated in authenticated mode; returns ``{}`` otherwise.
+    """
     users = {}
     if current_app.config.get("AUTHENTICATION", True):
         project_entry = Project.query.filter(
@@ -947,153 +1086,115 @@ def api_get_labeled(project):  # noqa: F401
             i: {**u, "current_user": current_user.id == u["id"]}
             for i, u in users.items()
         }
+    return users
+
+
+def _build_rows(db, project, states):
+    """Build ``/labeled``-shaped rows from result/unlabeled state rows.
+
+    A row is ``asdict(record)`` plus a ``state`` dict with every results
+    column (missing values converted to ``None``) and the record's ``lists``.
+    It does NOT embed ``tags_form``, ``lists_form`` or a ``user`` object; the
+    caller adds those once per response.
+
+    Parameters
+    ----------
+    db : asreview.database.database.Database
+        An open database connection.
+    project : asreview.project.Project
+        The open project (unused for now; Part 3 adds the record version).
+    states : iterable[pd.Series]
+        The state rows to materialise.
+
+    Returns
+    -------
+    list[dict]
+        One row dict per state, in the same order.
+    """
+    states = list(states)
+    if not states:
+        return []
+    ids = [int(s["record_id"]) for s in states]
+    records = db.input.get_records(ids)
+    lists_by_record = db.get_lists_for_records(ids)
+    result = []
+    for state, record in zip(states, records):
+        record_d = asdict(record)
+        state_d = {
+            k: (None if _is_missing_scalar(v) else v)
+            for k, v in state.to_dict().items()
+        }
+        state_d["lists"] = lists_by_record.get(int(state["record_id"]), [])
+        record_d["state"] = state_d
+        result.append(record_d)
+    return result
+
+
+def _collection_forms(project, tags_form):
+    """Return the response-level ``forms`` object (once per response, not row)."""
+    return {"tags_form": tags_form, "lists_form": read_lists_data(project)}
+
+
+@bp.route("/projects/<project_id>/labeled", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_labeled(project):  # noqa: F401
+    """Get a page of labeled (or unlabeled) records using keyset pagination.
+
+    Cheap filters (subset, prior, note, user) are pushed into SQL and the page
+    is read with ``ORDER BY ... LIMIT n+1`` (the extra row signals whether more
+    pages exist). Filters that require parsing the tags JSON (``tag_*``,
+    ``invalid_tags``) and the Zotero ``pdf`` filter are applied as a bounded
+    Python scan over the ordered candidates, so the whole table is never loaded
+    or parsed at once.
+
+    The ``subset`` "unlabeled" lists base records without a decision (no
+    results row, or a pending row with ``label IS NULL``), ordered by
+    record_id. On this subset the "prior" filter (``is_prior``) refers to the
+    dataset label (``included``) and the user filters mean "assigned to".
+    "note" applies.
+
+    The response carries ``forms`` (a single ``tags_form`` and ``lists_form``)
+    and ``users`` (a ``user_id`` → summary map) once, rather than per row.
+    """
+    per_page = request.args.get("per_page", default=50, type=int)
+    cursor_param = request.args.get("cursor", default=None, type=str)
+
+    q = _parse_labeled_query(project)
+
+    try:
+        cursor = _decode_cursor(cursor_param, q["filter_sig"])
+    except ValueError as err:
+        return jsonify(message=str(err)), 400
+
+    users = _users_map(project)
 
     with project.db as db:
-        # PDF (Zotero attachment) availability set, computed once.
-        pdf_ids = None
-        if filter_pdf is not None:
-            attachments = db.input[["record_id", "attachment"]]
-            pdf_ids = set(
-                attachments.loc[
-                    attachments["attachment"].apply(
-                        lambda v: is_attachment_key(v) if isinstance(v, str) else False
-                    ),
-                    "record_id",
-                ]
-            )
-
-        # Abstract availability set, computed once.
-        abstract_ids = None
-        if filter_abstract is not None:
-            abstracts = db.input[["record_id", "abstract"]]
-            # A record "has abstract" when the field is non-null and non-empty.
-            abstract_ids = set(
-                abstracts.loc[
-                    abstracts["abstract"].apply(
-                        lambda v: isinstance(v, str) and bool(v.strip())
-                    ),
-                    "record_id",
-                ]
-            )
-
-        def passes(saved_tags, record_id, label):
-            if pdf_ids is not None:
-                in_pdf = record_id in pdf_ids
-                if filter_pdf != in_pdf:
-                    return False
-            if abstract_ids is not None:
-                in_abstract = record_id in abstract_ids
-                if filter_abstract != in_abstract:
-                    return False
-            for group_export, tag_export, want in tag_filters:
-                if _tag_is_checked(saved_tags, group_export, tag_export) != want:
-                    return False
-            if invalid_filter is not None:
-                if _record_tags_invalid(saved_tags, tags_form, label) != invalid_filter:
-                    return False
-            return True
-
-        batch_size = (per_page + 1) if not post_scan else max(per_page + 1, 500)
+        batch_size = (
+            (per_page + 1) if not q["post_scan"] else max(per_page + 1, 500)
+        )
         matched = []
-        scan_cursor = cursor
         has_next = False
-
-        while True:
-            if subset == "unlabeled":
-                # Unlabeled records have no decision: order by record_id. The
-                # prior filter refers to the dataset label (included), and the
-                # user filters mean "assigned to" here.
-                page_df = db.get_unlabeled_page(
-                    priors=priors,
-                    has_note=has_note,
-                    include_users=include_users or None,
-                    exclude_users=exclude_users or None,
-                    cursor=scan_cursor,
-                    limit=batch_size,
-                    latest_first=latest_first,
-                )
-            else:
-                page_df = db.get_results_page(
-                    label=label,
-                    priors=priors,
-                    has_note=has_note,
-                    include_users=include_users or None,
-                    exclude_users=exclude_users or None,
-                    cursor=scan_cursor,
-                    limit=batch_size,
-                    latest_first=latest_first,
-                )
-            if page_df.empty:
+        for state, key in _iter_labeled_matches(db, q, cursor, batch_size):
+            if len(matched) == per_page:
+                has_next = True
                 break
+            matched.append((state, key))
 
-            for _, state in page_df.iterrows():
-                t = state["time"]
-                scan_cursor = (
-                    None if pd.isna(t) else float(t),
-                    int(state["record_id"]),
-                )
-                row_label = state["label"]
-                row_label = None if pd.isna(row_label) else int(row_label)
-                if passes(state["tags"], int(state["record_id"]), row_label):
-                    matched.append(state)
-                    if len(matched) > per_page:
-                        has_next = True
-                        break
-
-            if has_next or len(page_df) < batch_size:
-                break
-
-        if has_next:
-            matched = matched[:per_page]
-
-        next_cursor = None
-        if has_next and matched:
-            last = matched[-1]
-            t = last["time"]
-            next_cursor = _encode_cursor(
-                None if pd.isna(t) else float(t),
-                int(last["record_id"]),
-                filter_sig,
-            )
-
-        matched_ids = [int(s["record_id"]) for s in matched]
-        records = db.input.get_records(matched_ids)
-        lists_by_record = db.get_lists_for_records(matched_ids)
-        lists_form = read_lists_data(project)
-
-        result = []
-        for state, record in zip(matched, records):
-            record_d = asdict(record)
-            state_d = state.to_dict()
-            if subset == "unlabeled":
-                # Results columns are NULL for these rows; JSON cannot carry
-                # NaN/NA, so convert them to None before jsonify.
-                state_d = {
-                    k: (None if _is_missing_scalar(v) else v)
-                    for k, v in state_d.items()
-                }
-            record_d["state"] = state_d
-            record_d["state"]["lists"] = lists_by_record.get(
-                int(state["record_id"]), []
-            )
-            record_d["tags_form"] = tags_form
-            record_d["lists_form"] = lists_form
-
-            if current_app.config.get("AUTHENTICATION", True):
-                record_d["state"]["user"] = users.get(
-                    record_d["state"]["user_id"], None
-                )
-            else:
-                record_d["state"]["user"] = None
-
-            del record_d["state"]["user_id"]
-            result.append(record_d)
+        next_cursor = (
+            _encode_cursor(*matched[-1][1], q["filter_sig"])
+            if has_next and matched
+            else None
+        )
+        result = _build_rows(db, project, [s for s, _ in matched])
 
     return jsonify(
         {
             "count": len(result),
             "next_cursor": next_cursor,
             "result": result,
+            "forms": _collection_forms(project, q["tags_form"]),
+            "users": users,
         }
     )
 
@@ -2366,16 +2467,9 @@ def api_label_record(project, record_id):  # noqa: F401
         return jsonify({"success": True})
     else:
         with project.db as db:
-            record = db.get_results_record(record_id)
-            item = asdict(db.input.get_records(record_id))
-            item["state"] = record.iloc[0].to_dict()
-            item["state"]["lists"] = db.get_lists(record_id)
-            item["tags_form"] = read_tags_data(db) or []
-        item["lists_form"] = read_lists_data(project)
-        item["state"]["user"] = None
-        del item["state"]["user_id"]
-
-        return jsonify({"result": item})
+            state = db.get_results_record(record_id).iloc[0]
+            row = _build_rows(db, project, [state])[0]
+        return jsonify({"result": row})
 
 
 @bp.route("/projects/<project_id>/record/<record_id>/heartbeat",
@@ -2403,7 +2497,11 @@ def api_update_note(project, record_id):  # noqa: F401
     with project.db as db:
         db.update_note(record_id, note)
 
-    return jsonify({"success": True})
+    with project.db as db:
+        state = db.get_results_record(int(record_id)).iloc[0]
+        row = _build_rows(db, project, [state])[0]
+
+    return jsonify({"success": True, "result": row})
 
 
 @bp.route("/projects/<project_id>/record/<record_id>/attachment", methods=["GET"])

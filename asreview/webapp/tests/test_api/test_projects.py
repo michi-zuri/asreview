@@ -435,7 +435,8 @@ def test_label_with_lists(client, project):
     names = [item["name"] for item in record["state"]["lists"]]
     assert names == ["alpha", "beta"]
     # No lists.json configured for this project, so lists_form is None.
-    assert record["lists_form"] is None
+    assert labeled.json["forms"]["lists_form"] is None
+    assert "lists_form" not in record
 
 
 # Test that illegal list item names are rejected

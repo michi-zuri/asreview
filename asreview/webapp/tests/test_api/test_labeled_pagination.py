@@ -449,3 +449,78 @@ def test_cursor_roundtrip():
     assert _decode_cursor(enc, sig) == (1712345678.123456, 42)
     enc_null = _encode_cursor(None, 7, sig)
     assert _decode_cursor(enc_null, sig) == (None, 7)
+
+
+def test_labeled_rows_are_slim(client, project):
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    ids = [r["record_id"] for r in res.json["result"]][:3]
+    for rid in ids:
+        au.label_project_record(client, project, rid, label=1)
+
+    labeled = _labeled(client, project).json
+    assert "forms" in labeled
+    assert "users" in labeled
+    assert set(labeled["forms"].keys()) == {"tags_form", "lists_form"}
+    assert isinstance(labeled["users"], dict)
+
+    for row in labeled["result"]:
+        assert "tags_form" not in row
+        assert "lists_form" not in row
+        assert "user" not in row["state"]
+        assert "user_id" in row["state"]
+
+    if client.application.config["AUTHENTICATION"]:
+        user_keys = set(labeled["users"].keys())
+        for row in labeled["result"]:
+            uid = row["state"]["user_id"]
+            if uid is not None:
+                assert str(uid) in user_keys
+
+
+def test_labeled_unlabeled_rows_are_slim(client, project):
+    r = _labeled(client, project, subset="unlabeled", per_page=5)
+    assert r.status_code == 200
+    labeled = r.get_json()
+    assert "forms" in labeled
+    assert "users" in labeled
+
+    for row in labeled["result"]:
+        assert "tags_form" not in row
+        assert "lists_form" not in row
+        assert "user" not in row["state"]
+        assert "user_id" in row["state"]
+        assert row["state"]["user_id"] is None
+        assert row["state"]["label"] is None
+
+
+def test_put_label_returns_row(client, project):
+    project_id = au.get_project_id(project)
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    rid = res.json["result"][0]["record_id"]
+    au.label_project_record(client, project, rid, label=1)
+
+    r = client.put(
+        f"/api/projects/{project_id}/record/{rid}",
+        data={"record_id": rid, "label": 0},
+    )
+    assert r.status_code == 200
+    result = r.json["result"]
+    assert result["record_id"] == rid
+    assert result["state"]["label"] == 0
+    assert "tags_form" not in result
+    assert "user_id" in result["state"]
+
+
+def test_put_note_returns_row(client, project):
+    project_id = au.get_project_id(project)
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    rid = res.json["result"][0]["record_id"]
+    au.label_project_record(client, project, rid, label=1)
+
+    r = client.put(
+        f"/api/projects/{project_id}/record/{rid}/note",
+        data={"note": "hello"},
+    )
+    assert r.status_code == 200
+    assert r.json["success"] is True
+    assert r.json["result"]["state"]["note"] == "hello"
