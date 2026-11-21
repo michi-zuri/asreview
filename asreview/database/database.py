@@ -3,10 +3,12 @@ import os
 import sqlite3
 import time
 from functools import cached_property
+from pathlib import Path
 
 import pandas as pd
 
 from asreview.data.record import Record
+from asreview.database.fork_migrations import apply_fork_migrations
 from asreview.database.store import DataStore
 from asreview.database.store import _build_conn_uri
 
@@ -433,6 +435,25 @@ class Database:
         self._ensure_tags_table()
         self._ensure_llm_dispatch_table()
         self._ensure_llm_results_table()
+        self._apply_fork_migrations()
+
+    @property
+    def project_id(self):
+        """Project id stored in ``project_state`` (informational).
+
+        The folder name of the database file, or "memory".
+        """
+        if self._in_memory:
+            return "memory"
+        return Path(self.fp).parent.name
+
+    def _apply_fork_migrations(self):
+        """Apply any pending fork-owned schema migrations.
+
+        Idempotent and safe to call on every read-write open; a read-only
+        open never reaches this method.
+        """
+        apply_fork_migrations(self._conn, self.project_id)
 
     def _ensure_lists_table(self):
         """Create the ``lists`` table that stores per-record list items.
@@ -707,6 +728,7 @@ class Database:
             self._ensure_tags_table()
             self._ensure_llm_dispatch_table()
             self._ensure_llm_results_table()
+            self._apply_fork_migrations()
 
     def _fix_record_schema(self, cur):
         """Add columns introduced after the initial schema to the record table."""
