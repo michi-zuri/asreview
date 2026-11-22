@@ -10,11 +10,12 @@ from sqlalchemy import inspect
 from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
-from asreview.project.api import Project
 from asreview.webapp.utils import asreview_path
 from asreview.webapp.utils import get_projects
 from asreview.project.migration import detect_version
+from asreview.project.migration import is_supported_version
 from asreview.project.migration import migrate_project
+from asreview.project.migration import needs_migration
 
 DEFAULT_DATABASE_URI = f"sqlite:///{str(asreview_path())}/asreview.production.sqlite"
 
@@ -182,18 +183,17 @@ class MigrationTool:
 
             for project in get_projects():
                 project_file_version = detect_version(project.config)
-                if project_file_version <= 0 or project_file_version > Project.VERSION:
+                if not is_supported_version(project_file_version):
                     print(
                         f"Project {project.project_path} is in an unknown format or very old version: {project_file_version}"
                     )
-                if project_file_version < Project.VERSION:
+                    continue
+                if needs_migration(project_file_version):
                     print(
                         f"Project {project.project_path} is in the version {project_file_version} format. "
-                        f"Migrating to version {Project.VERSION}..."
+                        "Migrating to the asmr format..."
                     )
-                    migrate_project(
-                        project.project_path, project_file_version, Project.VERSION
-                    )
+                    migrate_project(project.project_path, project_file_version)
 
     def _migrate_new_user_fields(self, engine, user_columns):
         """Migrate user field."""

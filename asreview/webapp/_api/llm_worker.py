@@ -413,12 +413,13 @@ if __name__ == "__main__":
 
 
 def discover_project_paths():
-    """Return sorted v4 project directories under asreview_path().
+    """Return sorted asmr project directories under asreview_path().
 
     A project directory is any subdirectory containing a project.json whose
     ``project_file_version`` (or detected version) equals the current
-    ``Project.VERSION``. Older formats are silently skipped — they need to
-    be upgraded first with ``asreview migrate --projects``.
+    ``Project.VERSION`` (``-1``, the asmr format). Older formats are silently
+    skipped — they need to be upgraded first with ``asreview migrate
+    --projects``.
     """
     base = asreview_path()
     paths = []
@@ -436,9 +437,8 @@ def discover_project_paths():
                 paths.append(p)
             else:
                 logging.debug(
-                    "LLM worker: skipping %s — not a v%s project",
+                    "LLM worker: skipping %s — not an asmr project",
                     p.name,
-                    asr.Project.VERSION,
                 )
     return paths
 

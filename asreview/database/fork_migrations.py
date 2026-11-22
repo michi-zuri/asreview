@@ -3,8 +3,9 @@
 A fork database carries ``PRAGMA application_id = 0x61736D72`` (the bytes
 ``b"asmr"``): that is THE fork mark, checked on every open. Fork schema
 changes are tracked as named revisions in their own ledger table,
-``fork_migrations``. ``PRAGMA user_version`` (4) keeps its current meaning;
-revision names say what each change is, which a single integer cannot. Each
+``fork_migrations``. ``PRAGMA user_version`` holds the fork mark; the
+schema state is the ledger, and revision names say what each change is,
+which a single integer cannot. Each
 revision is applied once, in order, inside BEGIN IMMEDIATE so that
 concurrent processes opening the same database cannot apply it twice.
 Revision ids follow Alembic style ("0000_<slug>") to keep a later move to
@@ -19,9 +20,21 @@ from pathlib import Path
 
 FORK_APPLICATION_ID = 0x61736D72  # b"asmr"
 
+# The fork's project file version and the end of the migration chain.
+# Upstream's migrate_project refuses a source below 1 before copying a
+# project in, so this makes upstream reject a fork project outright.
+ASMR_PROJECT_VERSION = -1
+
+# The fork's database version: the same value as the application_id mark.
+# No upstream release's database version check ever matches it.
+FORK_USER_VERSION = FORK_APPLICATION_ID
+
+# What 10d2 and earlier wrote into user_version before 0002 landed.
+LEGACY_FORK_USER_VERSION = 4
+
 # Revisions whose result create_tables() already builds directly, so a new
 # database is marked as already having applied them.
-BASELINE_REVISIONS = ("0000_tags_tables",)
+BASELINE_REVISIONS = ("0000_tags_tables", "0002_user_version_mark")
 
 
 @dataclass
@@ -93,9 +106,19 @@ def _rev_0001_change_tracking(cur, ctx):
     )
 
 
+def _rev_0002_user_version_mark(cur, ctx):
+    """Rewrite ``user_version`` to the fork mark.
+
+    ``user_version`` lives in the file header and is transactional, so it
+    commits or rolls back with the ledger's ``BEGIN IMMEDIATE``.
+    """
+    cur.execute(f"PRAGMA user_version = {FORK_USER_VERSION}")
+
+
 REVISIONS = [
     ("0000_tags_tables", _rev_0000_tags_tables),
     ("0001_change_tracking", _rev_0001_change_tracking),
+    ("0002_user_version_mark", _rev_0002_user_version_mark),
 ]
 
 

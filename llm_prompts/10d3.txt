@@ -1,0 +1,317 @@
+========================================================================
+TASK 10d3 — fork version fields: project_file_version = -1 ("asmr") as
+           the end of the migration chain; user_version = the asmr mark
+           (revision 0002_user_version_mark)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10d2 (including the project_id fix) committed by the user.
+SPEC: specs/0001-collection-snapshot.md, D8 and the implementation notes
+      "Correction to D8", "The asmr mark (10d2)" and "Fork version fields
+      (10d3)". The spec wins. STOP and report if it disagrees with this
+      prompt.
+
+WHY
+  Two version numbers are visible to upstream ASReview, and both are
+  currently 4. Upstream is at 3, so 4 reads like "upstream version 4",
+  and upstream handles it badly:
+  - project.json "project_file_version": 4. Upstream's Project.load only
+    migrates when the version is < 3 and has no "too new" check, so it
+    copies a fork project into its projects folder and the webapp import
+    reports success.
+  - results.db PRAGMA user_version = 4. Upstream fails its version check
+    when it opens the database, then calls create_tables() on the existing
+    file, which rewrites user_version to 3 before crashing. A future
+    upstream v4 would accept 4.
+
+  The user decided:
+  - project.json "project_file_version" = -1, meaning "asmr project; its
+    schema state is in the ledger". Upstream then calls
+    migrate_project(tmpdir, -1, 3), whose first guard
+    `if src_version < 1: raise ValueError(...)` fires BEFORE the copy:
+    the import is refused and nothing reaches the projects folder.
+  - -1 is also the fork's own target. Project.VERSION becomes -1. The
+    4 was never an upstream version: it labelled the end of the fork's
+    step "upstream v3 → fork". That step stays (it converts upstream
+    projects), but its target is now "asmr", not a number. The chain is
+    1 → 2 → 3 → asmr, walked through a next-version table instead of
+    `+= 1`, and the integer comparisons (`< Project.VERSION` = "needs
+    migration") become two helpers. A fork project never migrates at
+    project level again: every later change, to results.db or to files
+    beside it, is a ledger revision (as 0000 already is).
+  - A plain 4 on disk is a legacy fork project (all 15 local projects,
+    the deployment, old exports). It gets a small step 4 → asmr: refuse
+    unless results.db carries the asmr mark (an unmarked 4 is a future
+    upstream project), then write -1. So `asreview migrate --projects`,
+    the webapp upgrade route and import convert them; no manual script.
+  - results.db user_version = 0x61736D72 (1634954610, the same value as
+    the application_id mark; it fits SQLite's signed 32-bit
+    user_version). No upstream release will ever match it.
+
+  Upstream files keep their own numbers: migration still recognises an
+  upstream v3 project by project_file_version 3 and an upstream v3
+  database by user_version 3. Only the fork's OWN files change.
+
+FACTS (verified — trust these)
+  - asreview/project/api.py
+    * class Project: VERSION = 4 (~110).
+    * is_project (~87): `detect_version(project_config) != Project.VERSION`
+      → False. The LLM worker (webapp/_api/llm_worker.py
+      discover_project_paths ~415) uses it; its docstring says "v4".
+    * Project.create (~193) writes "project_file_version": cls.VERSION.
+    * Project.load (~555): `if current_version < cls.VERSION:
+      migrate_project(tmpdir, current_version, cls.VERSION)`, reload the
+      config; then the 10d2 is_fork_database check (~560), safe_import,
+      copytree. There is no "too new / unknown" check.
+  - asreview/project/migration/migrate.py
+    * detect_version(project_config) (~30): project_file_version if
+      present, else int(version[0]).
+    * migrate_project(folder, src_version, dst_version) (~50): guards
+      src < 1, dst > 4, src >= dst; empty-v1/v2 handling; then
+      `while current_version < dst_version:
+           _migrate_project_one_version(folder, current_version)
+           current_version += 1`.
+    * _migrate_project_one_version (~100): picks v1v2/v2v3/v3v4 by
+      current_version; copies the folder to tmp/tmp_project and to
+      tmp_project/legacy_v{current_version}; logs "from v{n} to
+      v{n + 1}"; migrate, validate, swap with a .backup folder.
+    * is_fork_database(db_fp) (10d2) is in this module. migrate.py
+      imports v1v2/v2v3/v3v4 at module level, so those modules must NOT
+      import from migrate.py (circular).
+  - asreview/webapp/_api/projects.py
+    * api_get_projects (~388): `if detect_version(...) <
+      asr.Project.VERSION: project_upgrade_count += 1; continue`.
+    * api_upgrade_projects (~503): `<= 0 or > VERSION` → "Project version
+      {v} not supported."; `< VERSION` → migrate_project(path, v,
+      VERSION).
+    * api_import_project (~1512): `< VERSION` → warning "created in an
+      older version of ASReview LAB (version {v}). The active learning
+      model has been reset ...".
+  - asreview/webapp/_entry_points/migrate.py (~184): same two checks
+    (the "unknown format" branch prints but does not skip) and
+    "Migrating to version {Project.VERSION}...".
+  - asreview/project/migration/v3v4.py
+    * _migrate (~386) writes project_config["project_file_version"] = 4;
+      checks `user_version != 3 or application_id != 0` (keep).
+    * _validate (~481) checks project_file_version != 4; (~504)
+      `db._is_valid(expected_version=4)`.
+    * migrate_db (~346) `PRAGMA user_version = 4`; docstrings (~37,
+      ~375) say 4.
+    * v3v4.py stays self-contained: no module-level import of
+      database.py (importing from fork_migrations is fine).
+  - asreview/project/schema.py: "project_file_version" {"type":
+    "integer", ...} (~64), example in ~27.
+  - asreview/database/fork_migrations.py: FORK_APPLICATION_ID,
+    BASELINE_REVISIONS = ("0000_tags_tables",), REVISIONS (0000, 0001),
+    mark_fork_database, apply_fork_migrations. Module docstring says
+    "PRAGMA user_version (4) keeps its current meaning".
+  - asreview/database/database.py
+    * CURRENT_DATABASE_VERSION = 4 (~208); create_tables (~407) sets it,
+      then mark_fork_database.
+    * _is_valid(expected_version=None) (~695): mark check and read-write
+      fixup/ledger block gated on `expected_version >=
+      CURRENT_DATABASE_VERSION`; in between `user_version !=
+      expected_version` → ValueError. v2v3._validate calls
+      _is_valid(expected_version=3) on an unmarked upstream v3 database;
+      that path must keep working unchanged.
+  - Tests mentioning the values: tests/test_change_tracking.py:172
+    (user_version == 4), :183/:190 (unmarked user_version 5 refused,
+    unchanged); tests/test_database.py:145 (sets 16843, expects a
+    failure), :165 (== CURRENT_DATABASE_VERSION);
+    tests/test_migrate_project.py:25 (detect_version(...) == 4).
+
+DESIGN (decided — follow it)
+  fork_migrations.py (home of the fork identity constants)
+    - ASMR_PROJECT_VERSION = -1, with a comment: the fork's project file
+      version and the end of the migration chain; upstream's
+      migrate_project raises for it before copying a project in.
+    - FORK_USER_VERSION = FORK_APPLICATION_ID, with a comment: no
+      upstream release's database version check ever matches it.
+    - LEGACY_FORK_USER_VERSION = 4 (what 10d2 and earlier wrote).
+    - New revision, appended to REVISIONS:
+          def _rev_0002_user_version_mark(cur, ctx):
+              cur.execute(f"PRAGMA user_version = {FORK_USER_VERSION}")
+      user_version lives in the file header and is transactional, so it
+      commits or rolls back with the ledger's BEGIN IMMEDIATE.
+    - BASELINE_REVISIONS = ("0000_tags_tables", "0002_user_version_mark").
+    - Module docstring: user_version holds the mark; schema state is the
+      ledger.
+
+  migrate.py
+    - UPSTREAM_VERSIONS = (1, 2, 3).
+    - NEXT_VERSION = {1: 2, 2: 3, 3: ASMR_PROJECT_VERSION,
+      4: ASMR_PROJECT_VERSION}, with a comment that 4 is a legacy fork
+      project.json.
+    - def needs_migration(version): return version in NEXT_VERSION
+    - def is_supported_version(version):
+          return version == ASMR_PROJECT_VERSION or needs_migration(version)
+    - detect_version: unchanged code (returns what is on disk); mention
+      -1 in the docstring.
+    - migrate_project(folder, src_version, dst_version=ASMR_PROJECT_VERSION):
+      guards: not needs_migration(src_version) → ValueError("Project
+      version {src} cannot be migrated."); dst_version !=
+      ASMR_PROJECT_VERSION → ValueError. Loop
+          while current_version != dst_version:
+              _migrate_project_one_version(folder, current_version)
+              current_version = NEXT_VERSION[current_version]
+      Keep the empty-v1/v2 handling and the exception wrapping.
+    - _migrate_project_one_version: add `current_version == 4` →
+      migrate = _migrate_v4_asmr, validate = _validate_v4_asmr. Skip the
+      legacy_v{n} copy for 4 (only one project.json field changes; the
+      .backup swap covers failure). Log "from v{n} to v{NEXT}", printing
+      "asmr" for -1.
+    - _migrate_v4_asmr(project) / _validate_v4_asmr(project), in
+      migrate.py (they need is_fork_database; a separate module would
+      import migrate.py):
+        migrate: if not is_fork_database(results.db) → ValueError("Project
+        version 4 without the asmr mark: not an asmr project."); else set
+        project_file_version = ASMR_PROJECT_VERSION in project.json.
+        validate: project_file_version == ASMR_PROJECT_VERSION.
+      A project without results.db cannot be a fork project → the same
+      ValueError.
+    - Export needs_migration, is_supported_version, UPSTREAM_VERSIONS
+      from asreview/project/migration/__init__.py.
+
+  project/api.py
+    - VERSION = ASMR_PROJECT_VERSION, with a comment: "asmr project; its
+      schema state is in the results.db ledger".
+    - is_project: unchanged (`!= Project.VERSION`).
+    - Project.create: unchanged (writes cls.VERSION, now -1).
+    - Project.load: `if needs_migration(current_version): migrate...`;
+      `elif current_version != cls.VERSION: raise ValueError(f"Project
+      version {current_version} not supported.")` — before any copy.
+      Keep the 10d2 is_fork_database check.
+
+  webapp/_api/projects.py
+    - api_get_projects: needs_migration → count + continue;
+      not is_supported_version → logger.warning and continue (do not
+      count it, do not list it).
+    - api_upgrade_projects: not is_supported_version → "Project version
+      {v} not supported."; needs_migration → migrate_project(path, v)
+      (dst defaults to asmr).
+    - api_import_project: warn only for `v in UPSTREAM_VERSIONS`.
+  webapp/_entry_points/migrate.py
+    - Same two checks; the unsupported branch prints and `continue`s;
+      message "Migrating to the asmr format...".
+  webapp/_api/llm_worker.py
+    - discover_project_paths docstring: "asmr project directories" /
+      `Project.VERSION` (-1); no code change.
+
+  v3v4.py (the step "upstream v3 → asmr"; keep the file name)
+    - _migrate writes project_file_version = ASMR_PROJECT_VERSION (from
+      fork_migrations, not migrate.py); _validate checks it.
+    - migrate_db writes FORK_USER_VERSION instead of 4 (0002 then runs in
+      the same transaction and is a no-op rewrite).
+    - _validate: `db._is_valid()` (default = fork check).
+    - Docstrings: "upstream v3 → asmr", the new values.
+
+  database.py
+    - CURRENT_DATABASE_VERSION = FORK_USER_VERSION (imported), with a
+      one-line comment. Keep the name.
+    - _is_valid: replace the `expected_version >= CURRENT_DATABASE_VERSION`
+      gates with one flag:
+          fork = expected_version == CURRENT_DATABASE_VERSION
+      For a fork database, accept user_version in
+      {CURRENT_DATABASE_VERSION, LEGACY_FORK_USER_VERSION}; any other
+      value → ValueError as now. 4 is accepted so that a marked legacy
+      database reaches the ledger, where 0002 rewrites it. A read-only
+      open accepts 4 and changes nothing. For expected_version=3 keep the
+      exact `!= expected_version` test. Mark check, fixups and ledger
+      stay gated on `fork`.
+
+  schema.py
+    - project_file_version description: "-1 = asmr project; 1–3 =
+      upstream ASReview formats". Update the example in ~27 to -1. No new
+      property.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/project/migration/migrate.py and __init__.py
+  - asreview/project/migration/v3v4.py: migrate_db, _migrate, _validate
+  - asreview/project/api.py: is_project, Project.create, Project.load
+  - asreview/database/fork_migrations.py
+  - asreview/database/database.py: create_tables and _is_valid
+  - the call sites listed in FACTS (webapp projects.py, entry point
+    migrate.py, llm_worker.py)
+  - tests/test_change_tracking.py, tests/test_migrate_project.py
+  Also grep tests/ and asreview/webapp/tests/ for project_file_version,
+  Project.VERSION and migrate_project, and fix any caller that passes
+  dst_version or compares versions as integers.
+
+------------------------------------------------------------------------
+BASELINE FIRST
+------------------------------------------------------------------------
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_change_tracking.py tests/test_database.py tests/test_migrate_project.py tests/test_project.py tests/test_llm_db.py tests/test_data_store.py -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests -q -p no:cacheprovider'
+  Expected: 10 known failures in tests/test_database.py (order
+  assertions); webapp 0 failures. Your change must not add any.
+
+------------------------------------------------------------------------
+TESTS
+------------------------------------------------------------------------
+  tests/test_change_tracking.py — update:
+    - :172 → user_version == FORK_APPLICATION_ID; a new database's ledger
+      is {"0000_tags_tables", "0001_change_tracking",
+      "0002_user_version_mark"}. Update every ledger-set assertion in
+      both test files the same way.
+    - _make_legacy_db: also set user_version back to 4 and delete the
+      0002 ledger row, so it models the real local databases.
+  tests/test_change_tracking.py — add:
+    1. test_legacy_user_version_upgraded: marked, user_version 4, ledger
+       {0000} only. open_db(path) → user_version == FORK_APPLICATION_ID,
+       all three revisions.
+    2. test_read_only_open_keeps_legacy_user_version: same database,
+       read-only open succeeds; user_version still 4, ledger unchanged.
+    3. test_marked_wrong_user_version_refused: marked, user_version 7 →
+       ValueError (not ForeignDatabaseError), file unchanged.
+  tests/test_migrate_project.py:
+    - :25 → detect_version(...) == ASMR_PROJECT_VERSION; also assert the
+      migrated results.db has user_version == FORK_APPLICATION_ID.
+    4. test_version_helpers: needs_migration true for 1, 2, 3, 4 and
+       false for -1, 0, 5; is_supported_version true for -1..4 except 0,
+       false for 0 and 5.
+    5. test_new_project_is_asmr: Project.create(...) writes -1;
+       asr.is_project(path) is True.
+    6. test_legacy_fork_project_migrated: create a project, set
+       project.json to plain 4, migrate_project(path, 4) → -1, no
+       legacy_v4 folder, results.db unchanged.
+    7. test_unmarked_v4_project_refused_by_step: same, but clear the mark
+       (PRAGMA application_id = 0) → migrate_project raises, project.json
+       still 4.
+    8. test_import_unsupported_version_refused: export a project, set its
+       project.json in the zip to 5 → Project.load raises ValueError and
+       the projects folder stays empty.
+    9. test_import_legacy_fork_export: export, set the zip's project.json
+       to plain 4 → Project.load succeeds and the imported project.json
+       has -1.
+
+RUN (from the git root)
+  Both BASELINE commands, plus ruff check + ruff format --check on the
+  changed files. Paste the output and compare it with the baseline.
+
+DONE WHEN
+  - New and migrated projects have project_file_version -1 and
+    results.db user_version 1634954610 with three ledger rows. Marked
+    user_version-4 databases are rewritten on their first read-write
+    open; read-only opens change nothing.
+  - Plain-4 project.json files with a marked database migrate to -1
+    through migrate_project; unmarked ones and unknown versions are
+    refused before anything is copied.
+  - No integer comparison against Project.VERSION is left outside
+    is_project; grep for `Project.VERSION` and `cls.VERSION` to check.
+  - Upstream v3 detection is unchanged.
+  - The tests pass, with no new failures elsewhere.
+  - Only these files changed:
+      asreview/database/fork_migrations.py
+      asreview/database/database.py
+      asreview/project/migration/migrate.py
+      asreview/project/migration/__init__.py
+      asreview/project/migration/v3v4.py
+      asreview/project/api.py
+      asreview/project/schema.py
+      asreview/webapp/_api/projects.py
+      asreview/webapp/_api/llm_worker.py
+      asreview/webapp/_entry_points/migrate.py
+      tests/test_change_tracking.py
+      tests/test_migrate_project.py
+      (plus any test that the grep above shows passes dst_version or
+      compares versions as integers; list them in your report)
+========================================================================

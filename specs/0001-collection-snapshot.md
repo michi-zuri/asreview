@@ -283,6 +283,31 @@ D8's reason is wrong: upstream ASReview is at `CURRENT_DATABASE_VERSION = 3`; th
 
 Decided by the user: a fork database carries `PRAGMA application_id = 0x61736D72` (b"asmr", automated systematic mapping review). Upstream v3 projects upgrade to the fork; the v3→v4 schema rewrite becomes ledger revision `0000_tags_tables` (`0001_change_tracking` keeps its id, since real databases already have it). Every database without the mark is refused, whatever its `user_version`, so a future upstream v4 cannot be mistaken for a fork database. There is no automatic detection of old unmarked fork databases: the user marks existing deployments by hand (set the mark, insert the `0000_tags_tables` ledger row). `open_db` creates tables only in a database that has none (before, any validation error on an existing file triggered `create_tables`).
 
+### Fork version fields (10d3, 2026-11-22)
+
+Both version numbers that upstream reads are moved out of its range:
+
+- `project.json` `project_file_version` is -1, meaning "asmr project;
+  its schema state is in the ledger". Upstream migrates any version
+  below its own, and its `migrate_project` raises for a source below 1
+  before the project is copied in, so upstream refuses the import.
+  `Project.VERSION` is -1 too: the migration chain is 1 → 2 → 3 → asmr,
+  walked through a next-version table. The old 4 was never an upstream
+  version; it labelled the end of the fork's "upstream v3 → fork" step,
+  which stays with "asmr" as its target. A fork project never migrates
+  at project level again: later changes, to `results.db` or to files
+  beside it, are ledger revisions. A plain 4 is a legacy fork
+  `project.json`; the step 4 → asmr accepts it only when `results.db`
+  carries the mark (an unmarked 4 is a future upstream project) and
+  writes -1. Unknown versions are refused before anything is copied.
+- `results.db` `PRAGMA user_version` is the mark value, 0x61736D72
+  (1634954610), so no upstream release's version check matches. Marked
+  databases still at 4 are rewritten by ledger revision
+  `0002_user_version_mark` on their first read-write open.
+
+Upstream files keep their numbers: migration recognises an upstream v3
+project by `project_file_version` 3 and its database by `user_version` 3.
+
 ### Risks and measurements
 
 - `_save_tags` deletes then inserts, so one tag save writes several log rows (one version per row). Harmless; one entry per record reaches the client.

@@ -9,6 +9,8 @@ import pandas as pd
 
 from asreview.data.record import Record
 from asreview.database.fork_migrations import FORK_APPLICATION_ID
+from asreview.database.fork_migrations import FORK_USER_VERSION
+from asreview.database.fork_migrations import LEGACY_FORK_USER_VERSION
 from asreview.database.fork_migrations import apply_fork_migrations
 from asreview.database.fork_migrations import mark_fork_database
 from asreview.database.store import DataStore
@@ -206,7 +208,8 @@ def _ensure_decision_changes(cur):
 
 __all__ = ["Database"]
 
-CURRENT_DATABASE_VERSION = 4
+# The fork's database version: the asmr mark (same value as application_id).
+CURRENT_DATABASE_VERSION = FORK_USER_VERSION
 
 MODEL_COLUMNS = [
     "classifier",
@@ -697,11 +700,14 @@ class Database:
         if expected_version is None:
             expected_version = CURRENT_DATABASE_VERSION
 
+        fork = expected_version == CURRENT_DATABASE_VERSION
         cur = self._conn.cursor()
-        # A fork database (v4 and later) must carry the asmr mark. Upstream
-        # v3 databases are unmarked and are only validated here during the
-        # v2→v3 migration step, before the v3→v4 step marks them.
-        if expected_version >= CURRENT_DATABASE_VERSION:
+        if fork:
+            # A fork database must carry the asmr mark. Its user_version may
+            # still be the legacy value 4 from before 0002_user_version_mark;
+            # the fork migrations below rewrite it to the fork mark. Upstream
+            # v3 databases are unmarked and are only validated here during the
+            # v2→v3 migration step, before the v3→asmr step marks them.
             app_id = int(cur.execute("PRAGMA application_id").fetchone()[0])
             if app_id != FORK_APPLICATION_ID:
                 raise ForeignDatabaseError(
@@ -710,8 +716,15 @@ class Database:
                     "v3 projects are upgraded through project migration; "
                     "other versions are not supported."
                 )
-
-        if self.user_version != expected_version:
+            if self.user_version not in (
+                CURRENT_DATABASE_VERSION,
+                LEGACY_FORK_USER_VERSION,
+            ):
+                raise ValueError(
+                    f"Database version {self.user_version} is not supported. "
+                    "See migration guide."
+                )
+        elif self.user_version != expected_version:
             raise ValueError(
                 f"Database version {self.user_version} is not supported. "
                 "See migration guide."
@@ -747,9 +760,9 @@ class Database:
 
         # Schema fixups and fork migrations apply only to fork-version
         # databases. An upstream v3 database is validated here during the
-        # v2→v3 migration step and must be left untouched for the v3→v4
+        # v2→v3 migration step and must be left untouched for the v3→asmr
         # step that follows (its 0000 revision rewrites the schema).
-        if not self.read_only and expected_version >= CURRENT_DATABASE_VERSION:
+        if not self.read_only and fork:
             self._fix_decision_changes_schema(cur)
             self._fix_record_schema(cur)
             self._fix_results_schema(cur)

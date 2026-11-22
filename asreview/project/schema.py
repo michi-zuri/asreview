@@ -24,7 +24,7 @@ SCHEMA = {
     "examples": [
         {
             "version": "1.0",
-            "project_file_version": 3,
+            "project_file_version": -1,
             "id": "example",
             "mode": "oracle",
             "name": "example",
@@ -65,7 +65,7 @@ SCHEMA = {
             "$id": "#/properties/project_file_version",
             "type": "integer",
             "title": "The project file version schema",
-            "description": "The version number of the ASReview project file format.",
+            "description": "The version number of the ASReview project file format. -1 = asmr project; 1–3 = upstream ASReview formats.",
             "default": 1,
             "examples": [1],
         },

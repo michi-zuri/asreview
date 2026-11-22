@@ -40,6 +40,7 @@ from asreview.data.loader import _get_reader
 from asreview.data.utils import identify_record_groups
 from asreview.database.database import Database
 from asreview.database.database import open_db
+from asreview.database.fork_migrations import ASMR_PROJECT_VERSION
 from asreview.database.fork_migrations import rekey_project_id
 from asreview.datasets import DatasetManager
 from asreview.learner import ActiveLearningCycle
@@ -49,6 +50,7 @@ from asreview.project.exceptions import ProjectError
 from asreview.project.exceptions import ProjectNotFoundError
 from asreview.project.migration import detect_version
 from asreview.project.migration import migrate_project
+from asreview.project.migration import needs_migration
 from asreview.project.migration.migrate import is_fork_database
 from asreview.project.schema import SCHEMA
 from asreview.utils import _get_filename_from_url
@@ -107,7 +109,7 @@ class Project:
     `asreview/state` for information on the model and the labeling decisions.
     """
 
-    VERSION = 4
+    VERSION = ASMR_PROJECT_VERSION
     MODE_SIMULATE = "simulate"
     PATH_CONFIG = "project.json"
     PATH_CONFIG_LOCK = "project.json.lock"
@@ -553,20 +555,22 @@ class Project:
 
             # if migration is needed, do it here
             current_version = detect_version(project_config)
-            if current_version < cls.VERSION:
-                migrate_project(tmpdir, current_version, cls.VERSION)
+            if needs_migration(current_version):
+                migrate_project(tmpdir, current_version)
                 # Migration may have updated project_config, so we reload it.
                 with open(Path(tmpdir, cls.PATH_CONFIG)) as f:
                     project_config = json.load(f)
+            elif current_version != cls.VERSION:
+                raise ValueError(f"Unsupported project file version {current_version}.")
 
-            # Refuse a v4 project that was not made by this fork, before it
-            # is copied into the projects folder where it would later fail
-            # with a bare ForeignDatabaseError.
+            # Refuse a project whose results.db was not made by this fork,
+            # before it is copied into the projects folder where it would
+            # later fail with a bare ForeignDatabaseError.
             results_db = Path(tmpdir, cls.PATH_DB)
             if results_db.exists() and not is_fork_database(results_db):
                 raise ValueError(
-                    "This project was not made by ASReview asmr (project "
-                    "version 4 without the asmr mark) and cannot be imported."
+                    "This project was not made by ASReview asmr (results.db "
+                    "without the asmr mark) and cannot be imported."
                 )
 
             if reset_model_if_not_found:

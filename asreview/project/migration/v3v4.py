@@ -4,6 +4,9 @@ import sqlite3
 import time
 from pathlib import Path
 
+from asreview.database.fork_migrations import ASMR_PROJECT_VERSION
+from asreview.database.fork_migrations import FORK_USER_VERSION
+
 
 def uuid7():
     """Generate a UUID v7 (RFC 9562).
@@ -28,15 +31,15 @@ def uuid7():
 
 
 def migrate_db(cur, project):
-    """Rewrite a v3 database to the v4 tag/list schema on ``cur``.
+    """Rewrite a v3 database to the fork tag/list schema on ``cur``.
 
-    This is the schema half of the v3→v4 migration, tracked as fork ledger
+    This is the schema half of the v3→asmr migration, tracked as fork ledger
     revision ``0000_tags_tables``. It runs on the caller's cursor with no
     commits: SQLite DDL is transactional, so the enclosing ``BEGIN
     IMMEDIATE`` in ``apply_fork_migrations`` makes the whole rewrite atomic.
-    It sets ``PRAGMA user_version = 4`` and returns the list of cleanup
-    callables that delete ``tags.json`` and ``lists.json``; the caller runs
-    them only after the ledger commit.
+    It sets ``PRAGMA user_version`` to the fork mark and returns the list of
+    cleanup callables that delete ``tags.json`` and ``lists.json``; the
+    caller runs them only after the ledger commit.
 
     Parameters
     ----------
@@ -337,7 +340,7 @@ def migrate_db(cur, project):
         cur.execute("ALTER TABLE tags_new RENAME TO tags")
 
     # 10. Update database version
-    cur.execute("PRAGMA user_version = 4")
+    cur.execute(f"PRAGMA user_version = {FORK_USER_VERSION}")
 
     # 11. Re-create decision_changes triggers
     _ensure_triggers(cur)
@@ -352,7 +355,7 @@ def migrate_db(cur, project):
 
 
 def _migrate(project):
-    """Migrate a valid project from version 3 to version 4.
+    """Migrate a valid project from version 3 to the asmr format.
 
     Changes:
     - ``tag_groups`` table is rewritten: ``group_id`` TEXT PK (UUID v7),
@@ -366,11 +369,11 @@ def _migrate(project):
     - New ``list_containers`` table replaces ``lists.json``.
     - ``lists`` table column ``created`` → ``sorted_at``.
     - ``results.tags`` JSON column is dropped.
-    - Database ``PRAGMA user_version`` is set to 4.
+    - Database ``PRAGMA user_version`` is set to the fork mark.
     - Database ``PRAGMA application_id`` is set to the asmr mark.
     - The schema rewrite is applied as fork ledger revision
       ``0000_tags_tables``.
-    - ``project.json`` ``project_file_version`` is set to 4.
+    - ``project.json`` ``project_file_version`` is set to -1 (asmr).
 
     Parameters
     ----------
@@ -383,7 +386,7 @@ def _migrate(project):
     config_fp = Path(project, "project.json")
     with open(config_fp) as f:
         project_config = json.load(f)
-    project_config["project_file_version"] = 4
+    project_config["project_file_version"] = ASMR_PROJECT_VERSION
     with open(config_fp, "w") as f:
         json.dump(project_config, f)
 
@@ -458,7 +461,7 @@ def _ensure_triggers(cur):
 
 
 def _validate(project):
-    """Validate a migrated v4 project.
+    """Validate a migrated asmr project.
 
     Parameters
     ----------
@@ -478,9 +481,9 @@ def _validate(project):
     with open(config_fp) as f:
         config = json.load(f)
 
-    if config.get("project_file_version") != 4:
+    if config.get("project_file_version") != ASMR_PROJECT_VERSION:
         raise ValueError(
-            f"Expected project file version 4, "
+            f"Expected project file version {ASMR_PROJECT_VERSION}, "
             f"got {config.get('project_file_version')}."
         )
 
@@ -491,4 +494,4 @@ def _validate(project):
     from asreview.database.database import Database
 
     with Database(results_db_fp) as db:
-        db._is_valid(expected_version=4)
+        db._is_valid()

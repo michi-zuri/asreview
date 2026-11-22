@@ -73,7 +73,10 @@ from asreview.models.stoppers import NConsecutiveIrrelevant
 from asreview.project.exceptions import ProjectError
 from asreview.project.exceptions import ProjectNotFoundError
 from asreview.project.migration import detect_version
+from asreview.project.migration import is_supported_version
 from asreview.project.migration import migrate_project
+from asreview.project.migration import needs_migration
+from asreview.project.migration import UPSTREAM_VERSIONS
 from asreview.utils import _get_filename_from_url
 from asreview.webapp import DB
 from asreview.webapp._api.llm_mapping import build_prefill_state
@@ -385,8 +388,16 @@ def api_get_projects(projects):  # noqa: F401
     for project, db_project in projects:
         try:
             project_config = project.config
-            if detect_version(project.config) < asr.Project.VERSION:
+            version = detect_version(project_config)
+            if needs_migration(version):
                 project_upgrade_count += 1
+                continue
+            if not is_supported_version(version):
+                logging.warning(
+                    "Skipping project %s: unsupported project file version %s",
+                    project_config.get("id"),
+                    version,
+                )
                 continue
 
             if mode and project_config.get("mode") != mode:
@@ -500,14 +511,12 @@ def api_upgrade_projects(projects):
     for project, _ in projects:
         try:
             project_file_version = detect_version(project.config)
-            if project_file_version <= 0 or project_file_version > asr.Project.VERSION:
+            if not is_supported_version(project_file_version):
                 raise ValueError(
                     f"Project version {project_file_version} not supported."
                 )
-            if project_file_version < asr.Project.VERSION:
-                migrate_project(
-                    project.project_path, project_file_version, asr.Project.VERSION
-                )
+            if needs_migration(project_file_version):
+                migrate_project(project.project_path, project_file_version)
         except Exception as err:
             errors.append(str(err))
             continue
@@ -1510,7 +1519,7 @@ def api_import_project():
             raise ValueError("Invalid ASReview project file") from err
 
     project_file_version = detect_version(project_config)
-    if project_file_version < asr.Project.VERSION:
+    if project_file_version in UPSTREAM_VERSIONS:
         warnings.append(
             "This project was created in an older version of ASReview LAB (version"
             f" {project_file_version}). The active learning model has been reset to the"
