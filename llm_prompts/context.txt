@@ -28,7 +28,9 @@ REPOSITORY LAYOUT (this is the git root)
     asreview/webapp/tests/test_api/<name>.py .
 
 HARD RULES
-  1. READ every file named in the task IN FULL before writing anything.
+  1. READ what the task names before writing anything: small files in
+     full; in large files (database.py ~2700 lines, _api/projects.py
+     ~2900 lines) the named functions/sections, found with grep -n.
      Do not guess at APIs, column names, or function signatures — open the
      file and confirm. If a name in the task does not match the file, STOP
      and report the mismatch instead of inventing code.
@@ -82,7 +84,26 @@ HOW TO RUN TESTS
   (For webapp tests use the same form with
    asreview/webapp/tests/test_api/<file>.py)
   Wherever a task says `devbox run -- python ...`, use this sh -c form.
-  Run only the test you added/changed; do not run the whole suite.
+
+TEST RULES (these OVERRIDE any BASELINE / RUN section in a task prompt)
+  - No baseline runs. The task states the known baseline as a fact
+    (usually: 0 failures). Do not re-measure it.
+  - While working: run only the test file(s) the task touches, with -x,
+    and narrow with -k to the tests you are fixing.
+  - At the end: run the task's own test files once, plus ruff check and
+    ruff format --check on the changed files. Paste that output.
+  - NEVER run the full webapp suite (asreview/webapp/tests, ~9 minutes)
+    or the full tests/ directory. The reviewer runs them. If a task's RUN
+    section lists them, skip them and say so in your report.
+  - Run core test files (tests/*.py) one file per pytest process; some
+    plugins crash when several files share a process.
+  - Wrap every pytest call in timeout:
+      devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest tests/<file>.py -x -q -p no:cacheprovider'
+    Exit code 124 means it hung: stop and report which test, do not
+    retry blindly.
+  - If the same test still fails after 3 fix attempts, STOP and report
+    the test name, the assertion message and what you tried. Do not keep
+    iterating.
 ========================================================================
 
 

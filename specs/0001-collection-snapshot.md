@@ -242,7 +242,7 @@ User checkpoints: after 10a, after 10b+10c (measure on the real project, amend t
 - Backend: `asreview/webapp/_api/projects.py` (helpers + 3 routes), `asreview/database/database.py` (ledger call, triggers, read/prune helpers), `asreview/database/fork_migrations.py` (new).
 - Frontend (`asreview/webapp/src/`): `ProjectComponents/HistoryComponents/{LabeledRecord.js, labeledPaging.js (10a–10h only), collectionModel.js, useCollection.js}`, `ProjectComponents/ReviewComponents/{RecordCard.js, RecordCardLabeler.js}`, `api/ProjectAPI.js`.
 - Tests: `tests/test_change_tracking.py` (new), `asreview/webapp/tests/test_api/{test_labeled_pagination.py, test_collection_sync.py (new), test_projects.py, test_llm_mapping.py}`, Jest files next to the modules.
-- Untouched on purpose: `api_search_data` keeps per-row `tags_form`/`lists_form` (Review page and prior search use it; `RecordCard` falls back to the row fields), `ReviewPage.js`, `PriorSearch.js`, `llm_worker.py`, `PRAGMA user_version`, the `_ensure_*`/`_fix_*` functions.
+- Untouched on purpose: `api_search_data` keeps per-row `tags_form`/`lists_form` (Review page and prior search use it; `RecordCard` falls back to the row fields), `ReviewPage.js`, `PriorSearch.js`, `llm_worker.py`, the `_ensure_*`/`_fix_*` functions.
 
 ### Design summary
 
@@ -277,7 +277,7 @@ Config tables: `UPDATE project_state SET version = version + 1, config_version =
 
 ### Correction to D8 (2026-11-21)
 
-D8's reason is wrong: upstream ASReview is at `CURRENT_DATABASE_VERSION = 3`; the fork set 4 itself in c7b0feb2, and the fork has no upstream-compatibility requirement, so `PRAGMA user_version` is not off limits. The user chose to keep the ledger anyway, for its other reasons: named revisions instead of one integer, a mechanical move to Alembic, and the `BEGIN IMMEDIATE` apply-once that 10d already built and tested. `user_version` stays at 4 with its current meaning; nothing in 10e–10i depends on the wrong claim.
+D8's reason is wrong: upstream ASReview is at `CURRENT_DATABASE_VERSION = 3`; the fork set 4 itself in c7b0feb2, and the fork has no upstream-compatibility requirement, so `PRAGMA user_version` is not off limits. The user chose to keep the ledger anyway, for its other reasons: named revisions instead of one integer, a mechanical move to Alembic, and the `BEGIN IMMEDIATE` apply-once that 10d already built and tested. `user_version` stays at 4 with its current meaning; nothing in 10e–10i depends on the wrong claim. (Superseded by "Fork version fields (10d3)" below: `user_version` is now the mark value.)
 
 ### The asmr mark (10d2, 2026-11-22)
 
@@ -317,4 +317,5 @@ project by `project_file_version` 3 and its database by `user_version` 3.
 - `in_view` cost with post-scan filters: 10g measures one call in the fixture; measure on the largest real project after 10i.
 - Byte measurement for Part 2: DeepSeek measures on the test fixture; the user measures one real 50-row `/labeled` response (devtools) and amends the 10b/10c commit message.
 - Known failures before this work: about 12 in `tests/test_database.py`, about 12 in `asreview/webapp/tests/test_api/test_projects.py`, and `test_list_item_cleaning` (fixed in 10a). Every prompt runs a baseline first; "no new failures" is the bar.
+- Baseline as of 2026-11-22 (after 10d3): `tests/test_database.py` has 10 failures, all from `ORDER BY rowid` on the `INTEGER PRIMARY KEY` results table (fixed in 10d4); the webapp suite has 0 failures (609 passed, 12 skipped). From 10e on, the bar is 0 failures in the files each prompt runs.
 - Flask API tests need the network (Synergy dataset). See the spec's open risk.

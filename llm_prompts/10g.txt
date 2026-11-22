@@ -243,15 +243,17 @@ TESTS
         400.
      9. test_unlabeled_user_filter_checkout: the spec's risk "Unlabeled +
         user filter means assigned to". Check out a record for user X
-        (db.checkout_oldest_dispatched or a direct update_result with
-        user_id; see test_llm_db.py). changes for subset=unlabeled with
+        (db.checkout_oldest_dispatched with llm_dispatch rows set up as
+        in test_llm_db.py, or db.query_top_ranked(user_id=X); NOT
+        update_result, which writes user_id only with a label change). changes for subset=unlabeled with
         filter user_<X> report in_view True.
      10. bad params: since missing → 400; boundary "garbage" → 400; a
          boundary made for another filter → 400.
 
 RUN (from the git root)
   devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_collection_sync.py asreview/webapp/tests/test_api/test_labeled_pagination.py tests/test_change_tracking.py -q'
-  Paste the output.
+  Paste the output. Baseline (after 10f): 0 failures in the existing
+  files; there must be none after.
   Measure the in_view cost (spec risk): in the test fixture, time one
   labeled/changes call with "pdf=false" and boundary "end" on the
   largest subset, and report the time.

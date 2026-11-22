@@ -3,7 +3,8 @@ TASK 10e — Spec 0001 Part 3b: change-tracking triggers + one test per
            write path
 ========================================================================
 (Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
-DEPENDS ON: 10d merged.
+DEPENDS ON: 10d4 committed by the user (query_top_ranked writes
+            assigned_at, which the results UPDATE trigger tracks).
 SPEC: specs/0001-collection-snapshot.md, "Part 3", D6, D9, D10 and the
       implementation notes. The spec wins. STOP and report if it
       disagrees with this prompt.
@@ -32,22 +33,32 @@ FACTS (verified — trust these)
               full text exists, or an ISO timestamp of the last FAILED
               lookup, or NULL (store.py::set_attachment docstring).
       config: tag_groups, tag_options, list_containers.
-  - Existing triggers trg_results_delete and trg_results_label_update
-    (database.py::_set_results_changes_triggers) write to
-    decision_changes. Keep them. The new triggers are separate.
+  - The decision_changes triggers are the four trg_dc_* triggers in
+    database.py::_DECISION_TRIGGERS (insert, label update, user update,
+    delete), created by _ensure_decision_changes (which
+    _set_results_changes_triggers and _fix_decision_changes_schema
+    call). Leave them alone. _ensure_decision_changes drops only its own
+    names (and the legacy trg_results_delete / trg_results_label_update,
+    which must stay gone), so trg_ct_* triggers are unaffected.
   - SQLite trigger facts (verified on 3.53 in a prototype):
     * `INSERT OR REPLACE` / `ON CONFLICT` inside a trigger body, fired by
       an outer UPSERT, raised a UNIQUE error. Use UPDATE, then
       INSERT … WHERE NOT EXISTS (below), which works.
     * A trigger referencing a missing table fails when it FIRES. It does
       not fail when it is created.
-  - Write paths (database.py): label_record (~818), update_result
-    (~1451, group-wide), update_note (~1491), _save_tags (~1736:
-    deletes then inserts tag rows), replace_lists (~1592),
-    delete_result (~1932, group-wide), checkout_oldest_dispatched
-    (~1281), reassign_stale (~1370), touch_last_active (~1432: only
-    last_active), DataStore.set_attachment (store.py ~309, SQLAlchemy
+  - Write paths (database.py; find them by name): label_record,
+    query_top_ranked (inserts pending rows; on conflict sets user_id
+    and, since 10d4, assigned_at), update_result (group-wide),
+    update_note, _save_tags (deletes then inserts tag rows),
+    replace_lists, delete_result (group-wide),
+    checkout_oldest_dispatched, reassign_stale, touch_last_active (only
+    last_active), DataStore.set_attachment (store.py, SQLAlchemy
     session).
+  - fork_migrations.py::rekey_project_id (10d2, called by
+    Project.load(safe_import=True)) rewrites project_state.project_id and
+    the record_versions / change_log rows. The trigger bodies always read
+    project_id from the project_state row, so later writes follow the
+    new id.
 
 DESIGN (decided — follow it)
   database.py, new method placed after _set_results_changes_triggers:
@@ -173,6 +184,8 @@ TESTS — extend tests/test_change_tracking.py
          (needs one list_containers row)
        DataStore.set_attachment(rid, "ABCD1234")  → "attachment"
        delete_result                       → "results" (OLD record id)
+       query_top_ranked (new pending row, then the same row for a
+         user)                             → "results" both times
        checkout_oldest_dispatched          → "results"
        reassign_stale                      → "results"
   3. test_touch_last_active_not_tracked: a labeled or checked-out record,
@@ -198,13 +211,17 @@ TESTS — extend tests/test_change_tracking.py
      the change_log versions are exactly 1..40 with no gaps, each
      record_versions value equals its log version, and project_state
      version == 40.
-  10. test_ledger tests from 10d that simulate a legacy DB by dropping
+  10. test_rekey_then_write_tracked: create a project, rekey_project_id
+      (db path, "new-id"), label a record → the new record_versions and
+      change_log rows have project_id "new-id".
+  11. test_ledger tests from 10d that simulate a legacy DB by dropping
       tables must ALSO drop the trg_ct_* triggers (a trigger on a missing
       project_state fails when it fires). Update them if needed.
 
 RUN (from the git root)
   devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_change_tracking.py tests/test_database.py tests/test_migrate_project.py tests/test_llm_db.py tests/test_data_store.py tests/test_llm_worker.py -q'
-  Compare with the 10d baseline. Paste the output.
+  Baseline (after 10d4): 0 failures in these files (known; do not
+  re-run it). Any failure after your change is yours. Paste the output.
 
   Also measure the bulk-write cost the spec calls a risk: in a scratch
   script (NOT committed), time db._replace_results_from_df on a DB with

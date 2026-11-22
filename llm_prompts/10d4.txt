@@ -1,0 +1,149 @@
+========================================================================
+TASK 10d4 — results order by explicit columns, not rowid
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10d3 committed by the user.
+SPEC: none. This is a bug fix in asreview/database/database.py.
+
+WHY
+  Every read of the labeling history ends in `ORDER BY rowid`, which
+  relies on a SQLite side effect: rowid was the order in which rows were
+  inserted into `results`. Commit 1a1c02c9 (2026-07-11) changed
+  create_tables to `results (record_id INTEGER PRIMARY KEY, ...)`
+  (upstream: `record_id INTEGER UNIQUE`). An INTEGER PRIMARY KEY column
+  IS the rowid, so on databases created since then `ORDER BY rowid`
+  sorts by record_id. Migrated upstream projects kept `UNIQUE` and still
+  have the old order, so the same query gives different results
+  depending on how the database was created.
+
+  What breaks on the new databases: the recall plot and progress data
+  (labels in record-id order instead of screening order), the stopping
+  rule ("irrelevant since the last relevant" reads labels[::-1]), prior
+  order, and export row order. These are also the 10 known failures in
+  tests/test_database.py.
+
+  The user decided:
+  - Never depend on rowid side effects. Order explicitly.
+  - Labeling time (`time`) is the order of the history. A decision
+    change (update_result) does not touch `time`, so a changed record
+    keeps its place.
+  - Ties (a group labeled in one statement has the same `time`) are
+    broken by record_id.
+  - The schema stays as it is: no rebuild, no ledger revision. Once the
+    queries order explicitly, PRIMARY KEY vs UNIQUE no longer matters.
+
+FACTS (verified — trust these)
+  - asreview/database/database.py, `ORDER BY rowid` on results:
+    * get_results_table (~2241): `SELECT {cols} FROM results {where}
+      ORDER BY rowid`. pending=True also returns rows with label NULL.
+    * get_priors (~2564): priors (querier NULL, label NOT NULL),
+      docstring "in the order they were added".
+    * get_pending (~2660): label NULL rows, optionally per user_id.
+  - The paged history query (~2397) already orders explicitly with
+    `(time IS NULL) ASC, time ASC, record_id ASC` (and DESC for
+    latest_first). Use the same form so the two agree.
+  - Pending rows have time NULL. Their order is the hand-out order:
+    * checkout_oldest_dispatched's insert (~1557) and reassign_stale
+      (~1626) set assigned_at = now (also on conflict).
+    * query_top_ranked (~1043) does NOT set assigned_at. Its upsert sets
+      only user_id + MODEL_COLUMNS. The webapp uses it as the fallback
+      (_api/projects.py ~2846) and tests use it heavily.
+    * reassign_stale selects stale rows by last_active only, never by
+      assigned_at, so setting assigned_at in query_top_ranked does not
+      make those rows reassignable. Do NOT set last_active there.
+  - get_last_ranking_table (~980): `SELECT * FROM last_ranking` with no
+    ORDER BY, though its docstring says "ordered by ranking". Its
+    callers only check emptiness and max(training_set); every
+    production query that needs ranking order already says
+    `ORDER BY ranking`.
+  - The 10 failures (tests/test_database.py): test_label_record,
+    test_query_top_ranked, and 8 parametrized test_get_results_table
+    cases. Example: expected [0, 2, 5, 3], got [0, 2, 3, 5].
+    test_query_top_ranked checks the pending order [5, 0, 1, 2, 3, 4],
+    which is hand-out order, not record_id order: it needs assigned_at
+    from query_top_ranked.
+  - Out of scope (do NOT change): `ORDER BY rowid` in the legacy
+    decision_changes fixup (~171), get_decision_changes (~2689),
+    get_decision_log (~2708) and the lists queries (~1746, ~1781). They
+    are on tables without an INTEGER PRIMARY KEY; the user will decide
+    on them separately. legacy_v2/ is also out of scope.
+
+------------------------------------------------------------------------
+CHANGES (asreview/database/database.py only)
+------------------------------------------------------------------------
+  1. A module-level constant next to the other SQL helpers:
+       # Labeling history order: labeled rows by labeling time, then
+       # pending rows by hand-out time; record_id breaks ties (rows of a
+       # group are written in one statement and share their times).
+       _RESULTS_ORDER = "(time IS NULL) ASC, time ASC, assigned_at ASC, record_id ASC"
+     assigned_at only matters among pending rows (time NULL); labeled
+     rows with equal time are rows of one group, which share
+     assigned_at too.
+  2. get_results_table: ORDER BY {_RESULTS_ORDER}.
+  3. get_priors: ORDER BY time, record_id. Update the docstring to "in
+     labeling order".
+  4. get_pending: ORDER BY assigned_at, record_id. (NULL assigned_at,
+     from rows written before the fork, sort first.)
+  5. query_top_ranked: write assigned_at = :now on insert and in the
+     ON CONFLICT update (the same as the checkout insert). Use one
+     time.time() value per call so a group shares it. Nothing else in
+     the query changes.
+  6. get_last_ranking_table: ORDER BY ranking, record_id.
+  7. Docstrings of get_results_table and get_pending: state the order.
+
+  Do not change the schema, create_tables, fork_migrations.py, or any
+  test expectation. The tests already encode the intended order.
+
+------------------------------------------------------------------------
+BASELINE FIRST
+------------------------------------------------------------------------
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_change_tracking.py tests/test_database.py tests/test_migrate_project.py tests/test_project.py tests/test_llm_db.py tests/test_data_store.py -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_state.py tests/test_simulate_cli.py -q -p no:cacheprovider'
+  Expected: 10 known failures in tests/test_database.py; webapp 0
+  failures. Record the test_state.py / test_simulate_cli.py failures
+  (known before this task, partly order-related) for the comparison.
+
+------------------------------------------------------------------------
+TESTS
+------------------------------------------------------------------------
+  tests/test_database.py — add:
+    1. test_results_order_independent_of_schema: build the same history
+       twice, once on a fresh db (record_id INTEGER PRIMARY KEY) and
+       once on a db whose results table was rebuilt with
+       `record_id INTEGER UNIQUE` (CREATE results_new with the same
+       columns, copy, drop, rename). Label 5, then 3, then 0 (prior
+       first); get_results_table()["record_id"] is [0, 5, 3] on both.
+    2. test_decision_change_keeps_history_position: label 1, 2, 3;
+       update_result(1, label=0); get_results_table order is still
+       [1, 2, 3] and label of 1 is 0.
+    3. test_label_time_tie_broken_by_record_id: label a group (base 3,
+       member 4) and record 2 with time.time patched to the same value
+       (monkeypatch asreview.database.database.time.time); the order
+       with groups=True is [2, 3, 4].
+    4. test_query_top_ranked_sets_assigned_at: after query_top_ranked,
+       the pending row (and its group members) have assigned_at set and
+       last_active NULL.
+    5. test_last_ranking_table_ordered: add_last_ranking([5, 0, 2, 1])
+       → get_last_ranking_table()["record_id"] follows ranking.
+
+------------------------------------------------------------------------
+RUN (from the git root)
+------------------------------------------------------------------------
+  All three BASELINE commands, plus ruff check + ruff format --check on
+  the changed files. Paste the output and compare it with the baseline.
+
+DONE WHEN
+  - The 10 known tests/test_database.py failures pass, with no test
+    expectation changed.
+  - No `ORDER BY rowid` is left on results or last_ranking (grep
+    "rowid" in database.py: only the out-of-scope ones listed in FACTS
+    remain).
+  - The new tests pass; webapp still has 0 failures.
+  - test_state.py / test_simulate_cli.py: report which baseline
+    failures now pass and which remain. Do NOT fix the remaining ones;
+    report their assertion messages.
+  - Only these files changed:
+      asreview/database/database.py
+      tests/test_database.py
+========================================================================

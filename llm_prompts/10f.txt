@@ -69,8 +69,8 @@ TESTS (add to test_labeled_pagination.py)
 
 RUN (from the git root)
   devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_labeled_pagination.py asreview/webapp/tests/test_api/test_projects.py tests/test_change_tracking.py -q'
-  Paste the output. There must be no new failures compared with the 10b
-  baseline.
+  Paste the output. Baseline (after 10d4/10e): 0 failures in these
+  files (known; do not re-run it). There must be no failures after.
 
   Manual check for the user (report it, do not claim you did it): with
   the Zotero sync running, a record whose PDF is found gets a higher

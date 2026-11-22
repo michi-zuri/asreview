@@ -74,6 +74,11 @@ _SQL_UUID7 = f"""(
     )
 )"""
 
+# Labeling history order: labeled rows by labeling time, then pending rows by
+# hand-out time; record_id breaks ties (rows of a group are written in one
+# statement and share their times).
+_RESULTS_ORDER = "(time IS NULL) ASC, time ASC, assigned_at ASC, record_id ASC"
+
 DECISION_CHANGES_TABLE_SQL = """CREATE TABLE decision_changes
                             (change_id TEXT PRIMARY KEY NOT NULL,
                             record_id INTEGER,
@@ -990,7 +995,7 @@ class Database:
             dataset, and is ordered by ranking.
         """
         return pd.read_sql_query(
-            "SELECT * FROM last_ranking",
+            "SELECT * FROM last_ranking ORDER BY ranking, record_id",
             self._conn,
             dtype=RANKING_TABLE_COLUMNS_PANDAS_DTYPES,
         )
@@ -1041,9 +1046,10 @@ class Database:
             self._save_tags(record_id, tags)
 
     def query_top_ranked(self, user_id=None):
+        now = time.time()
         model_string = ", ".join(MODEL_COLUMNS)
         top_record_string = ", ".join(f"top_record.{col}" for col in MODEL_COLUMNS)
-        upsert_columns = ["user_id"] + MODEL_COLUMNS
+        upsert_columns = ["user_id", "assigned_at"] + MODEL_COLUMNS
         upsert_string = ", ".join(f"{col} = excluded.{col}" for col in upsert_columns)
 
         con = self._conn
@@ -1065,8 +1071,8 @@ class Database:
                     WHERE record.record_id = (SELECT record_id FROM top_record)
                 )
             )
-            INSERT INTO results (record_id, user_id, {model_string})
-            SELECT group_records.record_id, :user_id, {top_record_string}
+            INSERT INTO results (record_id, user_id, assigned_at, {model_string})
+            SELECT group_records.record_id, :user_id, :now, {top_record_string}
             FROM group_records
             CROSS JOIN top_record ON TRUE
 
@@ -1074,7 +1080,7 @@ class Database:
                 SET {upsert_string}
             RETURNING record_id
             ;""",
-            {"user_id": user_id},
+            {"user_id": user_id, "now": now},
         ).fetchone()
         con.commit()
         # Check if any record was updated, if not, the query did not return a top ranked record
@@ -2203,7 +2209,9 @@ class Database:
         -------
         pd.DataFrame:
             Dataframe containing the data of the specified columns of the
-            results table.
+            results table, in labeling order: labeled rows by labeling time,
+            pending rows (time NULL) after them by hand-out time, with
+            record_id breaking ties.
         """
         if isinstance(columns, str):
             columns = [columns]
@@ -2238,7 +2246,7 @@ class Database:
 
         query_string = "*" if sql_columns is None else ",".join(sql_columns)
         df_results = pd.read_sql_query(
-            f"SELECT {query_string} FROM results {sql_where_str} ORDER BY rowid",
+            f"SELECT {query_string} FROM results {sql_where_str} ORDER BY {_RESULTS_ORDER}",
             self._conn,
             dtype=col_dtype,
         )
@@ -2549,7 +2557,7 @@ class Database:
         Returns
         -------
         pd.DataFrame:
-            The result records of the priors in the order they were added. If multiple
+            The result records of the priors in labeling order. If multiple
             records are in the same group, only the base record of the group is
             returned.
         """
@@ -2561,7 +2569,7 @@ class Database:
             AND record_id IN (
                 SELECT group_id FROM {self.record_table_name}
             )
-            ORDER BY rowid
+            ORDER BY time, record_id
             """,
             self._conn,
             dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES,
@@ -2648,7 +2656,9 @@ class Database:
         Returns
         -------
         pd.DataFrame
-            DataFrame with pending results records.
+            DataFrame with pending results records, in hand-out order
+            (assigned_at, then record_id; rows with NULL assigned_at come
+            first).
         """
         query = f"""SELECT * FROM results WHERE label is null AND record_id IN (
             SELECT group_id FROM {self.record_table_name}
@@ -2657,7 +2667,7 @@ class Database:
         if user_id is not None:
             query += " AND user_id=?"
             params = (user_id,)
-        query += " ORDER BY rowid"
+        query += " ORDER BY assigned_at, record_id"
 
         return pd.read_sql_query(
             query,

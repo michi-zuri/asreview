@@ -357,10 +357,6 @@ def test_label_record(db):
             }
         ]
 
-    state = [
-        [0, None, None, "c0", "q0", "b0", "f0", 40, tags_empty],
-        [5, None, None, "c5", "q5", "b5", "f5", 45, tags_empty],
-    ]
     columns = [
         "record_id",
         "label",
@@ -373,6 +369,10 @@ def test_label_record(db):
         "tags",
     ]
 
+    # The history is ordered by labeling time. Record 5 is still pending (time
+    # NULL) and sorts after every labeled record, so it stays at the end until
+    # it is labeled itself.
+    #
     # record_id 0 is grouped and in the table. The existing record is updated, the new
     # records are added with model information of the existing.
     # Tags are saved only for the base record, not for group members.
@@ -380,21 +380,30 @@ def test_label_record(db):
         {"id": group_id, "values": [{"id": option_id, "checked": True, "text": None}]}
     ]
     db.label_record(0, 1, tags_format, 2)
-    state[0] = [0, 1, 2, "c0", "q0", "b0", "f0", 40, _make_tag_group(True)]
-    state.append([1, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty])
-    state.append([2, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty])
+    state = [
+        [0, 1, 2, "c0", "q0", "b0", "f0", 40, _make_tag_group(True)],
+        [1, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty],
+        [2, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty],
+        [5, None, None, "c5", "q5", "b5", "f5", 45, tags_empty],
+    ]
     assert_state(db, state, columns)
 
     # record_id 3 is grouped but not in the table. The records are added without model
-    # information.
+    # information, before the still-pending record 5.
     db.label_record(3, 0)
-    state.append([3, 0, None, None, None, None, None, None, tags_empty])
-    state.append([4, 0, None, None, None, None, None, None, tags_empty])
+    state = [
+        [0, 1, 2, "c0", "q0", "b0", "f0", 40, _make_tag_group(True)],
+        [1, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty],
+        [2, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty],
+        [3, 0, None, None, None, None, None, None, tags_empty],
+        [4, 0, None, None, None, None, None, None, tags_empty],
+        [5, None, None, "c5", "q5", "b5", "f5", 45, tags_empty],
+    ]
     assert_state(db, state, columns)
 
     # record_id 5 is not in a group, but in the table already, so is updated.
     db.label_record(5, 0)
-    state[1] = [5, 0, None, "c5", "q5", "b5", "f5", 45, tags_empty]
+    state[5] = [5, 0, None, "c5", "q5", "b5", "f5", 45, tags_empty]
     assert_state(db, state, columns)
 
     # record_id 6 is not grouped and not in the table. It's added without model info.
@@ -1139,3 +1148,108 @@ def test_reassign_stale_group(db):
     assert pending["record_id"].tolist() == [0]  # one row per group
     users = db.get_results_table(["user_id"], pending=True, groups=True)["user_id"]
     assert users.tolist() == [2, 2]
+
+
+def _rebuild_results_unique(db):
+    """Rebuild ``results`` with ``record_id INTEGER UNIQUE`` (no rowid alias)."""
+    cur = db._conn.cursor()
+    cur.execute(
+        """CREATE TABLE results_new
+            (record_id INTEGER UNIQUE,
+            label INTEGER,
+            classifier TEXT,
+            querier TEXT,
+            balancer TEXT,
+            feature_extractor TEXT,
+            training_set INTEGER,
+            time FLOAT,
+            note TEXT,
+            user_id INTEGER,
+            assigned_at REAL,
+            last_active REAL)"""
+    )
+    cur.execute("INSERT INTO results_new SELECT * FROM results")
+    cur.execute("DROP TABLE results")
+    cur.execute("ALTER TABLE results_new RENAME TO results")
+    db._conn.commit()
+
+
+def test_results_order_independent_of_schema(tmpdir):
+    """Labeling-history order does not depend on how the results table was built."""
+
+    def build_history(db):
+        db.input.add_records([Record(i, "foo") for i in range(6)])
+        db.label_record(0, 1)  # prior, labeled first
+        db.label_record(5, 0)
+        db.label_record(3, 0)
+
+    # Fresh db: record_id is INTEGER PRIMARY KEY (an alias for rowid).
+    fresh_path = Path(tmpdir, "fresh.db")
+    with asr.Database(fresh_path) as db:
+        db.create_tables()
+        build_history(db)
+        fresh_order = db.get_results_table()["record_id"].to_list()
+
+    # Same history on a db whose results table uses record_id INTEGER UNIQUE.
+    rebuilt_path = Path(tmpdir, "rebuilt.db")
+    with asr.Database(rebuilt_path) as db:
+        db.create_tables()
+        _rebuild_results_unique(db)
+        build_history(db)
+        rebuilt_order = db.get_results_table()["record_id"].to_list()
+
+    assert fresh_order == [0, 5, 3]
+    assert rebuilt_order == [0, 5, 3]
+
+
+def test_decision_change_keeps_history_position(db):
+    """update_result changes the label but not the record's place in history."""
+    db.input.add_records([Record(i, "foo") for i in range(4)])
+    db.label_record(1, 1)
+    db.label_record(2, 1)
+    db.label_record(3, 1)
+
+    db.update_result(1, label=0)
+
+    df = db.get_results_table(["record_id", "label"])
+    assert df["record_id"].to_list() == [1, 2, 3]
+    assert df.set_index("record_id")["label"].loc[1] == 0
+
+
+def test_label_time_tie_broken_by_record_id(db, monkeypatch):
+    """Rows labeled with the same time are ordered by record_id."""
+    db.input.add_records([Record(i, "foo") for i in range(5)])
+    db.input.set_groups([(3, 3), (3, 4)])
+
+    monkeypatch.setattr("asreview.database.database.time.time", lambda: 1234.0)
+    db.label_record(3, 1)  # group (3, 4)
+    db.label_record(2, 1)
+
+    assert db.get_results_table(["record_id"], groups=True)["record_id"].to_list() == [
+        2,
+        3,
+        4,
+    ]
+
+
+def test_query_top_ranked_sets_assigned_at(db):
+    """query_top_ranked records the hand-out time but not last_active."""
+    db.input.add_records([Record(i, "foo") for i in range(4)])
+    db.input.set_groups([(1, 1), (1, 2)])
+    db.add_last_ranking([1, 0, 3], "nb", "max", "balanced", "tfidf", 0)
+
+    db.query_top_ranked()
+
+    df = db.get_results_table(
+        ["record_id", "assigned_at", "last_active"], pending=True, groups=True
+    )
+    assert df["record_id"].to_list() == [1, 2]
+    assert df["assigned_at"].notna().all()
+    assert df["last_active"].isna().all()
+
+
+def test_last_ranking_table_ordered(db):
+    """get_last_ranking_table returns rows in ranking order."""
+    db.add_last_ranking([5, 0, 2, 1], "nb", "max", "balanced", "tfidf", 0)
+
+    assert db.get_last_ranking_table()["record_id"].to_list() == [5, 0, 2, 1]
