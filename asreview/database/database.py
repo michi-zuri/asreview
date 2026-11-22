@@ -211,6 +211,41 @@ def _ensure_decision_changes(cur):
     conn.commit()
 
 
+# An 8-character Zotero attachment key ([A-Z0-9] repeated). Used by the
+# record.attachment trigger's GLOB to tell a full-text key apart from the
+# ISO timestamp a failed lookup stores.
+_ATTACHMENT_KEY_GLOB = "'" + "[A-Z0-9]" * 8 + "'"
+
+
+def _record_change_sql(rid, source):
+    """SQL body recording a change to one record (``rid`` = NEW/OLD.record_id)."""
+    return f"""
+        UPDATE project_state SET version = version + 1;
+        UPDATE record_versions
+           SET version = (SELECT version FROM project_state)
+         WHERE project_id = (SELECT project_id FROM project_state)
+           AND record_id = {rid};
+        INSERT INTO record_versions (project_id, record_id, version)
+        SELECT project_id, {rid}, version FROM project_state
+         WHERE NOT EXISTS (
+             SELECT 1 FROM record_versions
+              WHERE project_id = (SELECT project_id FROM project_state)
+                AND record_id = {rid});
+        INSERT INTO change_log
+            (project_id, version, record_id, source, changed_at)
+        SELECT project_id, version, {rid}, '{source}',
+               (julianday('now') - 2440587.5) * 86400.0
+          FROM project_state;"""
+
+
+# A form-definition change: bump the version and mark the config version at
+# the new version. In an UPDATE every right-hand side sees the OLD row, so
+# ``config_version`` becomes the NEW version.
+_CONFIG_CHANGE_SQL = """
+        UPDATE project_state
+           SET version = version + 1, config_version = version + 1;"""
+
+
 __all__ = ["Database"]
 
 # The fork's database version: the asmr mark (same value as application_id).
@@ -462,6 +497,7 @@ class Database:
         self._ensure_llm_dispatch_table()
         self._ensure_llm_results_table()
         self._apply_fork_migrations()
+        self._ensure_change_tracking_triggers()
 
     @property
     def project_id(self):
@@ -784,6 +820,7 @@ class Database:
             self._ensure_llm_dispatch_table()
             self._ensure_llm_results_table()
             self._apply_fork_migrations()
+            self._ensure_change_tracking_triggers()
 
     def _fix_record_schema(self, cur):
         """Add columns introduced after the initial schema to the record table."""
@@ -890,6 +927,86 @@ class Database:
 
     def _set_results_changes_triggers(self):
         _ensure_decision_changes(self._conn.cursor())
+
+    def _ensure_change_tracking_triggers(self):
+        """(Re)create the Spec 0001 change-tracking triggers.
+
+        Runs on every read-write open: SQLite drops a table's triggers
+        with the table, and some ``_fix_*`` functions rebuild tables.
+        """
+        record = self.record_table_name
+        statements = []
+
+        def _add(name, event, body, when=None):
+            when_clause = f" WHEN {when}" if when else ""
+            statements.append(
+                f"CREATE TRIGGER IF NOT EXISTS {name} {event} FOR EACH ROW"
+                f"{when_clause} BEGIN {body} END"
+            )
+
+        _add(
+            "trg_ct_results_insert",
+            "AFTER INSERT ON results",
+            _record_change_sql("NEW.record_id", "results"),
+        )
+        _add(
+            "trg_ct_results_delete",
+            "AFTER DELETE ON results",
+            _record_change_sql("OLD.record_id", "results"),
+        )
+        _add(
+            "trg_ct_results_update",
+            "AFTER UPDATE OF label, time, note, user_id, assigned_at ON results",
+            _record_change_sql("NEW.record_id", "results"),
+            when="OLD.label IS NOT NEW.label "
+            "OR OLD.time IS NOT NEW.time "
+            "OR OLD.note IS NOT NEW.note "
+            "OR OLD.user_id IS NOT NEW.user_id "
+            "OR OLD.assigned_at IS NOT NEW.assigned_at",
+        )
+
+        for table in ("tags", "lists"):
+            _add(
+                f"trg_ct_{table}_insert",
+                f"AFTER INSERT ON {table}",
+                _record_change_sql("NEW.record_id", table),
+            )
+            _add(
+                f"trg_ct_{table}_update",
+                f"AFTER UPDATE ON {table}",
+                _record_change_sql("NEW.record_id", table),
+            )
+            _add(
+                f"trg_ct_{table}_delete",
+                f"AFTER DELETE ON {table}",
+                _record_change_sql("OLD.record_id", table),
+            )
+
+        _add(
+            "trg_ct_record_attachment",
+            f"AFTER UPDATE OF attachment ON {record}",
+            _record_change_sql("NEW.record_id", "attachment"),
+            when="OLD.attachment IS NOT NEW.attachment "
+            f"AND (COALESCE(OLD.attachment GLOB {_ATTACHMENT_KEY_GLOB}, 0) "
+            f"OR COALESCE(NEW.attachment GLOB {_ATTACHMENT_KEY_GLOB}, 0))",
+        )
+
+        for table in ("tag_groups", "tag_options", "list_containers"):
+            for op, suffix in (
+                ("INSERT", "insert"),
+                ("UPDATE", "update"),
+                ("DELETE", "delete"),
+            ):
+                _add(
+                    f"trg_ct_{table}_{suffix}",
+                    f"AFTER {op} ON {table}",
+                    _CONFIG_CHANGE_SQL,
+                )
+
+        cur = self._conn.cursor()
+        for statement in statements:
+            cur.execute(statement)
+        self._conn.commit()
 
     @property
     def record_table_name(self):
@@ -2155,6 +2272,60 @@ class Database:
             {"record_id": record_id},
         )
         con.commit()
+
+    def get_project_state(self):
+        """Return the change-tracking state, zeros/None before migration.
+
+        Returns
+        -------
+        dict
+            Keys ``version``, ``config_version``, ``pruned_version`` and
+            ``last_pruned_at``. A read-only open of an unmigrated database
+            (no ``project_state`` table) returns the zero/default state.
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT version, config_version, pruned_version, last_pruned_at "
+                "FROM project_state"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row is None:
+            return {
+                "version": 0,
+                "config_version": 0,
+                "pruned_version": 0,
+                "last_pruned_at": None,
+            }
+        return {
+            "version": row[0],
+            "config_version": row[1],
+            "pruned_version": row[2],
+            "last_pruned_at": row[3],
+        }
+
+    def get_record_versions(self, record_ids):
+        """Return ``{record_id: version}`` for the given records.
+
+        Records without a ``record_versions`` row are absent from the
+        result (their version is 0). The ``IN (...)`` list is chunked to
+        stay under SQLite's bound-variable limit.
+        """
+        record_ids = [int(record_id) for record_id in record_ids]
+        result = {}
+        if not record_ids:
+            return result
+        cur = self._conn.cursor()
+        for i in range(0, len(record_ids), 900):
+            chunk = record_ids[i : i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = cur.execute(
+                f"SELECT record_id, version FROM record_versions "
+                f"WHERE record_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            result.update({record_id: version for record_id, version in rows})
+        return result
 
     def get_results_record(self, record_id):
         """Get the data of a specific query from the results table.

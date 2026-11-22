@@ -1,14 +1,17 @@
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import asreview as asr
+from asreview.data.record import Record
 from asreview.database.database import ForeignDatabaseError
 from asreview.database.fork_migrations import FORK_APPLICATION_ID
 from asreview.database.fork_migrations import FORK_USER_VERSION
 from asreview.database.fork_migrations import LEGACY_FORK_USER_VERSION
+from asreview.database.fork_migrations import rekey_project_id
 
 
 @pytest.fixture
@@ -16,6 +19,89 @@ def db(tmpdir):
     with asr.Database(Path(tmpdir, "test.db")) as db:
         db.create_tables()
         yield db
+
+
+# All Spec 0001 change-tracking trigger names, for the "triggers exist"
+# checks and the legacy-DB cleanup.
+CT_TRIGGER_NAMES = [
+    "trg_ct_results_insert",
+    "trg_ct_results_delete",
+    "trg_ct_results_update",
+    "trg_ct_tags_insert",
+    "trg_ct_tags_update",
+    "trg_ct_tags_delete",
+    "trg_ct_lists_insert",
+    "trg_ct_lists_update",
+    "trg_ct_lists_delete",
+    "trg_ct_record_attachment",
+    "trg_ct_tag_groups_insert",
+    "trg_ct_tag_groups_update",
+    "trg_ct_tag_groups_delete",
+    "trg_ct_tag_options_insert",
+    "trg_ct_tag_options_update",
+    "trg_ct_tag_options_delete",
+    "trg_ct_list_containers_insert",
+    "trg_ct_list_containers_update",
+    "trg_ct_list_containers_delete",
+]
+
+
+@pytest.fixture
+def db_with_records(db):
+    db.input.add_records([Record(i, "d") for i in range(10)])
+    return db
+
+
+def state(db):
+    """Return (version, config_version) from project_state."""
+    row = db._conn.execute(
+        "SELECT version, config_version FROM project_state"
+    ).fetchone()
+    return (row[0], row[1]) if row else (0, 0)
+
+
+def rv(db, rid):
+    """Return record_versions.version for ``rid``, or 0 if absent."""
+    row = db._conn.execute(
+        "SELECT version FROM record_versions WHERE record_id = ?", (rid,)
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def log(db):
+    """Return the change_log rows (version, record_id, source) in order."""
+    return [
+        (version, record_id, source)
+        for version, record_id, source in db._conn.execute(
+            "SELECT version, record_id, source FROM change_log ORDER BY version"
+        ).fetchall()
+    ]
+
+
+def _insert_tag_group(db, group_id="g1"):
+    db._conn.execute(
+        "INSERT INTO tag_groups (group_id, export_name, label_name) "
+        "VALUES (?, 'export', 'Label')",
+        (group_id,),
+    )
+    db._conn.commit()
+
+
+def _insert_tag_option(db, option_id="o1", group_id="g1"):
+    db._conn.execute(
+        "INSERT INTO tag_options (option_id, group_id, export_name, label_name) "
+        "VALUES (?, ?, 'export', 'Label')",
+        (option_id, group_id),
+    )
+    db._conn.commit()
+
+
+def _insert_list_container(db, list_id="l1"):
+    db._conn.execute(
+        "INSERT INTO list_containers (list_id, name) VALUES (?, 'My list')",
+        (list_id,),
+    )
+    db._conn.commit()
 
 
 def _make_legacy_db(tmpdir):
@@ -37,6 +123,8 @@ def _make_legacy_db(tmpdir):
             "change_log",
         ]:
             cur.execute(f"DROP TABLE {table}")
+        for name in CT_TRIGGER_NAMES:
+            cur.execute(f"DROP TRIGGER IF EXISTS {name}")
         cur.execute(
             "DELETE FROM fork_migrations WHERE revision = '0001_change_tracking'"
         )
@@ -294,3 +382,274 @@ def test_marked_wrong_user_version_refused(tmpdir):
 
     with pytest.raises(ValueError):
         asr.open_db(path)
+
+
+def test_label_record_tracked(db_with_records):
+    """The spec example: labeling record 7 relevant bumps the version."""
+    db_with_records.label_record(7, 1)
+    assert state(db_with_records) == (1, 0)
+    assert rv(db_with_records, 7) == 1
+    assert log(db_with_records) == [(1, 7, "results")]
+
+
+def test_update_result_tracked(db_with_records):
+    """A label change via update_result is tracked as 'results'."""
+    db_with_records.label_record(7, 0)
+    db_with_records.update_result(7, label=1)
+    assert rv(db_with_records, 7) == 2
+    assert log(db_with_records) == [(1, 7, "results"), (2, 7, "results")]
+
+
+def test_update_note_tracked(db_with_records):
+    """A note change is tracked as 'results'."""
+    db_with_records.label_record(7, 0)
+    db_with_records.update_note(7, "hello")
+    assert rv(db_with_records, 7) == 2
+    assert log(db_with_records) == [(1, 7, "results"), (2, 7, "results")]
+
+
+def test_save_tags_tracked(db_with_records):
+    """Saving tags is tracked as 'tags'."""
+    _insert_tag_group(db_with_records)
+    _insert_tag_option(db_with_records)
+    before = state(db_with_records)[0]
+    db_with_records.update_result(
+        7, tags=[{"id": "g1", "values": [{"id": "o1", "checked": True}]}]
+    )
+    assert state(db_with_records)[0] == before + 1
+    assert rv(db_with_records, 7) == before + 1
+    assert log(db_with_records)[-1] == (before + 1, 7, "tags")
+
+
+def test_replace_lists_tracked(db_with_records):
+    """Replacing list items is tracked as 'lists'."""
+    _insert_list_container(db_with_records)
+    before = state(db_with_records)[0]
+    db_with_records.replace_lists(7, [{"list_id": "l1", "item_id": "i1", "name": "x"}])
+    assert state(db_with_records)[0] == before + 1
+    assert rv(db_with_records, 7) == before + 1
+    assert log(db_with_records)[-1] == (before + 1, 7, "lists")
+
+
+def test_set_attachment_tracked(db_with_records):
+    """Storing a Zotero attachment key via the DataStore is tracked."""
+    db_with_records.input.set_attachment(7, "ABCD1234")
+    assert rv(db_with_records, 7) == 1
+    assert log(db_with_records) == [(1, 7, "attachment")]
+
+
+def test_delete_result_tracked(db_with_records):
+    """Deleting a results row is tracked with the OLD record id."""
+    db_with_records.label_record(7, 0)
+    db_with_records.delete_result(7)
+    assert rv(db_with_records, 7) == 2
+    assert log(db_with_records) == [(1, 7, "results"), (2, 7, "results")]
+
+
+def test_query_top_ranked_tracked(db_with_records):
+    """Inserting a pending row, then reassigning it, both tracked."""
+    db_with_records.add_last_ranking([0, 1, 2], "nb", "max", "balanced", "tfidf", 0)
+    db_with_records.query_top_ranked()
+    assert rv(db_with_records, 0) == 1
+    db_with_records.query_top_ranked(user_id=1)
+    assert rv(db_with_records, 0) == 2
+    assert log(db_with_records) == [(1, 0, "results"), (2, 0, "results")]
+
+
+def test_checkout_oldest_dispatched_tracked(db_with_records):
+    """Checking out a dispatched record inserts a tracked results row."""
+    db_with_records.add_last_ranking(
+        list(range(10)), "nb", "max", "balanced", "tfidf", 0
+    )
+    db_with_records.top_up_dispatch(3, "H")
+    db_with_records.checkout_oldest_dispatched(user_id=1)
+    assert rv(db_with_records, 0) == 1
+    assert log(db_with_records) == [(1, 0, "results")]
+
+
+def test_reassign_stale_tracked(db_with_records):
+    """Reassigning a stale checkout is tracked as 'results'."""
+    db_with_records.add_last_ranking(
+        list(range(10)), "nb", "max", "balanced", "tfidf", 0
+    )
+    db_with_records.top_up_dispatch(1, "H")
+    db_with_records.checkout_oldest_dispatched(user_id=2)
+    # Backdate last_active so the checkout is stale; last_active is not tracked.
+    db_with_records._conn.execute(
+        "UPDATE results SET last_active = ? WHERE record_id = 0",
+        (time.time() - 100000,),
+    )
+    db_with_records._conn.commit()
+    db_with_records.reassign_stale(user_id=1, older_than=3600)
+    assert rv(db_with_records, 0) == 2
+    assert log(db_with_records) == [(1, 0, "results"), (2, 0, "results")]
+
+
+def test_touch_last_active_not_tracked(db_with_records):
+    """Heartbeat writes to last_active never create versions."""
+    db_with_records.add_last_ranking([0, 1, 2], "nb", "max", "balanced", "tfidf", 0)
+    db_with_records.query_top_ranked(user_id=1)
+    assert state(db_with_records) == (1, 0)
+    for _ in range(10):
+        assert db_with_records.touch_last_active(0, user_id=1)
+    assert state(db_with_records) == (1, 0)
+    assert log(db_with_records) == [(1, 0, "results")]
+
+
+def test_noop_update_not_tracked(db_with_records):
+    """A no-op note write does not create a version."""
+    db_with_records.label_record(7, 0)
+    db_with_records.update_note(7, "same")
+    assert state(db_with_records) == (2, 0)
+    db_with_records.update_note(7, "same")
+    assert state(db_with_records) == (2, 0)
+    assert log(db_with_records) == [(1, 7, "results"), (2, 7, "results")]
+
+
+def test_attachment_failed_lookup_not_tracked(db_with_records):
+    """Rewriting the failed-lookup timestamp is not tracked."""
+    db_with_records.input.set_attachment(7, "2026-10-20T10:00:00")
+    assert state(db_with_records) == (0, 0)
+    db_with_records.input.set_attachment(7, "2026-10-20T11:00:00")
+    assert state(db_with_records) == (0, 0)
+    # A real key appearing is tracked...
+    db_with_records.input.set_attachment(7, "ABCD1234")
+    assert state(db_with_records) == (1, 0)
+    # ...and disappearing (back to a timestamp) is too.
+    db_with_records.input.set_attachment(7, "2026-10-20T12:00:00")
+    assert state(db_with_records) == (2, 0)
+    assert log(db_with_records) == [(1, 7, "attachment"), (2, 7, "attachment")]
+
+
+def test_config_changes(db):
+    """Config edits bump version and config_version, no per-record rows."""
+    _insert_tag_group(db)
+    assert state(db) == (1, 1)
+    _insert_tag_option(db)
+    assert state(db) == (2, 2)
+    _insert_list_container(db)
+    assert state(db) == (3, 3)
+    assert log(db) == []
+    assert db._conn.execute("SELECT COUNT(*) FROM record_versions").fetchone()[0] == 0
+
+
+def test_triggers_after_create_tables(db):
+    """create_tables creates every change-tracking trigger."""
+    names = {
+        row[0]
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'"
+        )
+    }
+    for name in CT_TRIGGER_NAMES:
+        assert name in names
+
+
+def test_triggers_after_fix_tags_schema(tmpdir):
+    """A legacy tags table rebuilt on open gets its triggers back."""
+    path = Path(tmpdir, "test.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+
+    with sqlite3.connect(str(path)) as conn:
+        cur = conn.cursor()
+        cur.execute("DROP TABLE tags")
+        cur.execute(
+            "CREATE TABLE tags (tag_id TEXT PRIMARY KEY, "
+            "record_id INTEGER NOT NULL, checked INTEGER)"
+        )
+        conn.commit()
+        names = {
+            row[0]
+            for row in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        assert "trg_ct_tags_insert" not in names
+
+    with asr.open_db(path):
+        pass
+
+    with sqlite3.connect(str(path)) as conn:
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        for name in CT_TRIGGER_NAMES:
+            assert name in names
+
+
+def test_version_order_equals_commit_order(tmpdir):
+    """Two writer threads produce gap-free versions in commit order."""
+    path = Path(tmpdir, "test.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+        db.input.add_records([Record(i, "d") for i in range(40)])
+
+    errors = []
+    barrier = threading.Barrier(2)
+
+    def label_range(start, end):
+        try:
+            barrier.wait()
+            with asr.open_db(path) as db:
+                for rid in range(start, end):
+                    db.label_record(rid, 1)
+        except BaseException as err:  # noqa: BLE001 - re-raised via assert below
+            errors.append(err)
+
+    threads = [
+        threading.Thread(target=label_range, args=(0, 20)),
+        threading.Thread(target=label_range, args=(20, 40)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+
+    with sqlite3.connect(str(path)) as conn:
+        cur = conn.cursor()
+        versions = [
+            row[0]
+            for row in cur.execute("SELECT version FROM change_log ORDER BY version")
+        ]
+        assert versions == list(range(1, 41))
+        assert cur.execute("SELECT version FROM project_state").fetchone()[0] == 40
+        for version, record_id in cur.execute(
+            "SELECT version, record_id FROM change_log ORDER BY version"
+        ):
+            stored = cur.execute(
+                "SELECT version FROM record_versions WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+            assert stored is not None and stored[0] == version
+
+
+def test_rekey_then_write_tracked(tmpdir):
+    """After rekey_project_id, later writes follow the new project id."""
+    path = Path(tmpdir, "test.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+        db.input.add_records([Record(i, "d") for i in range(3)])
+
+    rekey_project_id(path, "new-id")
+
+    with asr.open_db(path) as db:
+        db.label_record(0, 1)
+
+    with sqlite3.connect(str(path)) as conn:
+        cur = conn.cursor()
+        assert (
+            cur.execute("SELECT project_id FROM project_state").fetchone()[0]
+            == "new-id"
+        )
+        assert cur.execute(
+            "SELECT project_id, record_id, version FROM record_versions"
+        ).fetchall() == [("new-id", 0, 1)]
+        assert cur.execute(
+            "SELECT project_id, version, record_id, source FROM change_log"
+        ).fetchall() == [("new-id", 1, 0, "results")]
