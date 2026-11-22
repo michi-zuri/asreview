@@ -1,0 +1,233 @@
+========================================================================
+TASK 10d2 — the "asmr" database mark; v3→v4 becomes ledger revision
+            0000_tags_tables; unmarked databases are refused
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10d (fork_migrations.py ledger), committed by the user.
+SPEC: specs/0001-collection-snapshot.md, D8 and "Correction to D8"
+      below the marker. STOP and report if anything below disagrees
+      with the code you read.
+
+WHY
+  Upstream ASReview is at project/database version 3. This fork ("asmr",
+  automated systematic mapping review) uses 4, and a future upstream v4
+  would carry the same number with a different schema. From now on:
+    - a fork database carries PRAGMA application_id = 0x61736D72
+      (the bytes b"asmr", decimal 1634954610). That is THE fork mark.
+    - an upstream v3 project (project_file_version 3, user_version 3,
+      no mark) is upgraded to the fork. The schema part of today's
+      v3→v4 migration becomes ledger revision "0000_tags_tables".
+    - any other database without the mark is REFUSED (future upstream
+      v4, v5+, anything foreign). There is NO detection of old fork
+      databases without the mark: the user marks their existing
+      deployments by hand before deploying this.
+  Ledger id "0001_change_tracking" must stay as it is: real databases
+  already have that row.
+
+FACTS (verified — trust these)
+  - asreview/database/database.py
+    * CURRENT_DATABASE_VERSION = 4 (~246). It stays 4.
+    * open_db (~287): `db._is_valid()`, and on ANY ValueError, if not
+      read_only, `db.create_tables()`. BUG this task fixes: a refused
+      or wrong-version EXISTING database is treated as new;
+      create_tables first writes `PRAGMA user_version = 4` and then
+      crashes on `CREATE TABLE results` (table exists). Only a database
+      without tables may be created.
+    * create_tables (~431): sets user_version, creates everything at
+      the current (v4) schema, last line self._apply_fork_migrations().
+    * _is_valid (~718): first the user_version check, then
+      REQUIRED_TABLES, then (read-write only) _fix_*/_ensure_* and,
+      last, self._apply_fork_migrations().
+    * project_id property and _apply_fork_migrations() exist (10d).
+  - asreview/database/fork_migrations.py (10d): REVISIONS list,
+    `apply_fork_migrations(conn, project_id)`; revision functions take
+    (cur, project_id). Fast path, then commit + BEGIN IMMEDIATE +
+    re-read + apply + commit, rollback on error.
+  - asreview/project/migration/v3v4.py: self-contained ON PURPOSE (its
+    own uuid7 copy; it must NOT import database.py at module level).
+    `_migrate(project)`: sets project.json project_file_version = 4,
+    opens results.db with sqlite3, rewrites the tag/list schema (reads
+    tags.json and lists.json), commits SEVERAL times along the way
+    (also inside _rebuild_results_without_tags), sets user_version = 4,
+    re-creates old-style decision_changes triggers (_ensure_triggers),
+    deletes tags.json/lists.json. `_validate(project)` checks
+    project_file_version == 4 and `Database(...)._is_valid(4)` (local
+    import).
+  - asreview/project/migration/migrate.py: migrate_project runs each
+    step on a temporary COPY of the project folder, keeps a
+    legacy_v<N>/ copy and a .backup folder for rollback. Keep that
+    wrapper: the v3 upgrade still goes through it.
+  - Project-level version checks read project.json only:
+    asreview/project/api.py (~85 is_project, ~553 Project.load
+    migrates when detect_version < VERSION),
+    asreview/webapp/_api/projects.py (~385 list, ~499 upgrade, ~1511
+    import warning), asreview/webapp/_entry_points/migrate.py (~184).
+  - Test fixtures: tests/asreview_files/*.asreview are v2 or v3
+    (project_file_version 3); the webapp archive holds v0.x/v1.x
+    projects. None is a v4 project, so none needs the mark.
+  - tests/test_database.py builds some old-schema databases by hand
+    (e.g. test_fix_old_v2_decision_changes_schema,
+    test_upgrade_record_id_pk_decision_changes). Those helpers set
+    user_version 4 and must now also set the mark (they model old FORK
+    databases, which the user marks by hand).
+
+DESIGN (decided — follow it)
+  1. fork_migrations.py
+     - `FORK_APPLICATION_ID = 0x61736D72  # b"asmr"`
+     - `BASELINE_REVISIONS = ("0000_tags_tables",)`: revisions whose
+       result create_tables() already builds directly.
+     - New `def mark_fork_database(conn):` sets
+       `PRAGMA application_id = {FORK_APPLICATION_ID}`, creates the
+       ledger table if missing, INSERT OR IGNORE the BASELINE_REVISIONS
+       rows (applied_at = time.time()), commit. Called by create_tables
+       only.
+     - Revision functions take (cur, ctx). `ctx` is a small dataclass
+       `MigrationContext(project_id: str, project_path: Path | None)`;
+       project_path is the folder holding results.db, None in memory.
+       Change `_rev_0001_change_tracking` to read ctx.project_id.
+       `apply_fork_migrations(conn, project_id, project_path=None)`.
+     - REVISIONS = [("0000_tags_tables", _rev_0000_tags_tables),
+                    ("0001_change_tracking", _rev_0001_change_tracking)]
+     - `_rev_0000_tags_tables(cur, ctx)` calls
+       `v3v4.migrate_db(cur, ctx.project_path)` (local import inside
+       the function; see 2). Guard FIRST: if the `tag_options` table
+       already exists, raise RuntimeError("0000_tags_tables on a
+       database that already has the v4 tag schema; is the
+       '0000_tags_tables' ledger row missing?"). That turns a missing
+       ledger row into a rollback instead of a corrupted database.
+     - File cleanup (deleting tags.json/lists.json) must happen only
+       AFTER the ledger commit. Let a revision return a list of
+       callables; apply_fork_migrations calls them after commit().
+
+  2. v3v4.py (stays self-contained)
+     - Split `_migrate` into:
+         `migrate_db(cur, project)`: the schema rewrite, steps 1–11, on
+         the GIVEN cursor, with NO commit anywhere (remove the commits,
+         including in _rebuild_results_without_tags). SQLite DDL is
+         transactional, so the ledger's BEGIN IMMEDIATE covers it. It
+         sets `PRAGMA user_version = 4` and returns the cleanup
+         callables that delete tags.json/lists.json.
+         `_migrate(project)`: project.json project_file_version = 4;
+         open results.db with sqlite3; check user_version == 3 and
+         application_id == 0 (else raise ValueError naming both);
+         `PRAGMA application_id = FORK_APPLICATION_ID`; then
+         `apply_fork_migrations(conn, Path(project).name, project)`
+         (local import from asreview.database.fork_migrations — that
+         module imports only stdlib, so the self-contained rule holds),
+         which applies 0000 and 0001; close.
+     - `_validate` keeps checking project_file_version == 4 and
+       `_is_valid(expected_version=4)`; that now also requires the
+       mark (see 3).
+     - Keep its docstring's change list; add "PRAGMA application_id is
+       set to the asmr mark" and "the schema rewrite is ledger revision
+       0000_tags_tables".
+
+  3. database.py
+     - create_tables(): after setting user_version, call
+       `mark_fork_database(self._conn)` (before creating the tables).
+       The last line stays self._apply_fork_migrations(), which now
+       applies only 0001 on a new database.
+     - _apply_fork_migrations(): pass project_path
+       (`None if self._in_memory else Path(self.fp).parent`).
+     - _is_valid(): FIRST check (before user_version):
+           app_id = PRAGMA application_id
+           if app_id != FORK_APPLICATION_ID: raise ForeignDatabaseError(
+               f"{self.fp} is not an asmr database (application_id "
+               f"{app_id}, user_version {self.user_version}). Upstream "
+               "v3 projects are upgraded through project migration; "
+               "other versions are not supported.")
+       `class ForeignDatabaseError(ValueError)` defined in database.py.
+     - open_db(): call create_tables() only when the database has no
+       tables at all (`SELECT count(*) FROM sqlite_master WHERE
+       type='table'` == 0). Otherwise re-raise the ValueError. Read-only
+       behaviour stays as it is.
+
+  4. Project-level refusal (clear message before anything opens a
+     foreign database):
+     - New helper in asreview/project/migration/migrate.py:
+           def is_fork_database(db_fp): opens with
+           sqlite3.connect(f"file:{db_fp}?mode=ro", uri=True) and
+           returns PRAGMA application_id == FORK_APPLICATION_ID
+           (local import of the constant).
+     - migrate_project: `dst_version > 4` check stays. A project with
+       project_file_version 4 is never migrated (unchanged).
+     - Project.load (asreview/project/api.py ~553): after the migration
+       block, if results.db exists in tmpdir and not
+       is_fork_database(...) → raise ValueError("This project was not
+       made by ASReview asmr (project version 4 without the asmr mark)
+       and cannot be imported."). Do this BEFORE the project is copied
+       to its final folder.
+     - Leave the other project.json checks (list, upgrade, CLI) as they
+       are: opening a foreign database now fails with
+       ForeignDatabaseError, which is enough there.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/database/fork_migrations.py
+  - asreview/database/database.py lines 240–340 and 420–460 and 715–800
+  - asreview/project/migration/v3v4.py and migrate.py
+  - asreview/project/api.py lines 520–620
+  - tests/test_change_tracking.py, tests/test_migrate_project.py
+  - in tests/test_database.py: every place that writes PRAGMA
+    user_version or builds a database without create_tables()
+
+------------------------------------------------------------------------
+BASELINE FIRST
+------------------------------------------------------------------------
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest tests/test_change_tracking.py tests/test_database.py tests/test_migrate_project.py tests/test_project.py tests/test_llm_db.py tests/test_data_store.py -q'
+  Known before this task: 10 failures in tests/test_database.py
+  (test_label_record, test_query_top_ranked, test_get_results_table ×8).
+  Also run the webapp import/upgrade tests:
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && python -m pytest asreview/webapp/tests/test_api/test_projects.py -q -k "import or upgrade or create"'
+  Note the result; your change must not add failures.
+
+------------------------------------------------------------------------
+TESTS — add to tests/test_change_tracking.py (rename nothing)
+------------------------------------------------------------------------
+  Helper `_make_legacy_db` (10d) drops the fork tables; keep it, and
+  keep the mark on it (it models an old FORK database).
+  1. test_new_database_is_marked: create_tables → application_id ==
+     0x61736D72; ledger == {"0000_tags_tables", "0001_change_tracking"}.
+  2. test_unmarked_v4_database_refused: create a db, then
+     `PRAGMA application_id = 0` via plain sqlite3. open_db(path) raises
+     ForeignDatabaseError; afterwards user_version is still 4 and the
+     `results` rows are untouched (open_db must not "create" it).
+  3. test_unmarked_v5_database_refused: as 2 with user_version 5; also
+     check user_version is still 5 afterwards.
+  4. test_read_only_open_refuses_unmarked: read_only=True → ValueError.
+  5. test_empty_file_is_created: a 0-byte results.db → open_db creates
+     tables and marks it.
+  6. test_missing_baseline_row_rolls_back: marked db, DELETE the
+     "0000_tags_tables" ledger row; open_db raises (RuntimeError from
+     the guard); afterwards the ledger row is still missing and the
+     schema unchanged (rollback worked).
+  In tests/test_migrate_project.py:
+  7. The existing v2→v4 and v3→v4 migration tests must still pass; add
+     assertions that the migrated results.db has the mark and both
+     ledger rows, and that tags.json/lists.json are gone.
+  8. test_import_unmarked_v4_project_refused: export a fresh project
+     (asr.Project.create + export, or zip the folder), set
+     application_id = 0 in its results.db inside the zip copy, then
+     asr.Project.load(...) raises ValueError mentioning "asmr"; nothing
+     is left in the projects folder.
+  Update the tests/test_database.py helpers that build databases by
+  hand so they also set the mark (FORK_APPLICATION_ID), and nothing
+  else in them.
+
+RUN (from the git root)
+  The two baseline commands again. Paste the output, compare.
+
+DONE WHEN
+  - New databases are marked; v2/v3 projects migrate to marked v4 with
+    both ledger rows; unmarked databases (any user_version) are refused
+    without being modified; a 0-byte file is still created.
+  - The new tests pass, no new failures elsewhere.
+  - Only these files changed:
+      asreview/database/fork_migrations.py
+      asreview/database/database.py
+      asreview/project/migration/v3v4.py
+      asreview/project/migration/migrate.py
+      asreview/project/api.py
+      tests/test_change_tracking.py
+      tests/test_migrate_project.py
+      tests/test_database.py
+========================================================================

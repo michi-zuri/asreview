@@ -10,8 +10,9 @@ SPEC: specs/0001-collection-snapshot.md, "Part 3", D7, D8, D9 and the
 
 WHY
   Part 4 needs a per-project version counter, a per-record version and a
-  change log. Upstream owns `PRAGMA user_version` (_is_valid requires
-  exactly 4), so the fork gets its own ledger of named revisions. Several
+  change log. The fork tracks schema changes as a ledger of named
+  revisions; `PRAGMA user_version` (4, set by the fork in c7b0feb2) keeps
+  its current meaning. Several
   processes open the same results.db (Flask, the LLM worker, the Zotero
   sync), so each revision must be applied exactly once, under
   BEGIN IMMEDIATE.
@@ -52,9 +53,10 @@ DESIGN (decided — follow it)
 
     """Fork-owned schema migrations (Spec 0001, D8).
 
-    `PRAGMA user_version` belongs to upstream ASReview, so fork schema
-    changes are tracked in their own ledger table, `fork_migrations`.
-    Each revision is applied once, in order, inside BEGIN IMMEDIATE so
+    Fork schema changes are tracked as named revisions in their own ledger
+    table, `fork_migrations`. `PRAGMA user_version` (4) keeps its current
+    meaning; revision names say what each change is, which a single integer
+    cannot. Each revision is applied once, in order, inside BEGIN IMMEDIATE so
     that concurrent processes opening the same database cannot apply it
     twice. Revision ids follow Alembic style ("0001_<slug>") to keep a
     later move to Alembic mechanical.

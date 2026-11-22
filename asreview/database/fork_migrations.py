@@ -1,8 +1,9 @@
 """Fork-owned schema migrations (Spec 0001, D8).
 
-``PRAGMA user_version`` belongs to upstream ASReview, so fork schema
-changes are tracked in their own ledger table, ``fork_migrations``.
-Each revision is applied once, in order, inside BEGIN IMMEDIATE so
+Fork schema changes are tracked as named revisions in their own ledger
+table, ``fork_migrations``. ``PRAGMA user_version`` (4) keeps its current
+meaning; revision names say what each change is, which a single integer
+cannot. Each revision is applied once, in order, inside BEGIN IMMEDIATE so
 that concurrent processes opening the same database cannot apply it
 twice. Revision ids follow Alembic style ("0001_<slug>") to keep a
 later move to Alembic mechanical.

@@ -275,6 +275,14 @@ Config tables: `UPDATE project_state SET version = version + 1, config_version =
 
 **Hook (10i).** One async operation at a time (load more, poll, patch, Refresh); a generation counter drops results from an old snapshot (filter/subset change). Poll every 15 s, skipped while `document.hidden`, immediate on `visibilitychange`. `/records` fetched in chunks of 200.
 
+### Correction to D8 (2026-11-21)
+
+D8's reason is wrong: upstream ASReview is at `CURRENT_DATABASE_VERSION = 3`; the fork set 4 itself in c7b0feb2, and the fork has no upstream-compatibility requirement, so `PRAGMA user_version` is not off limits. The user chose to keep the ledger anyway, for its other reasons: named revisions instead of one integer, a mechanical move to Alembic, and the `BEGIN IMMEDIATE` apply-once that 10d already built and tested. `user_version` stays at 4 with its current meaning; nothing in 10e–10i depends on the wrong claim.
+
+### The asmr mark (10d2, 2026-11-22)
+
+Decided by the user: a fork database carries `PRAGMA application_id = 0x61736D72` (b"asmr", automated systematic mapping review). Upstream v3 projects upgrade to the fork; the v3→v4 schema rewrite becomes ledger revision `0000_tags_tables` (`0001_change_tracking` keeps its id, since real databases already have it). Every database without the mark is refused, whatever its `user_version`, so a future upstream v4 cannot be mistaken for a fork database. There is no automatic detection of old unmarked fork databases: the user marks existing deployments by hand (set the mark, insert the `0000_tags_tables` ledger row). `open_db` creates tables only in a database that has none (before, any validation error on an existing file triggered `create_tables`).
+
 ### Risks and measurements
 
 - `_save_tags` deletes then inserts, so one tag save writes several log rows (one version per row). Harmless; one entry per record reaches the client.
