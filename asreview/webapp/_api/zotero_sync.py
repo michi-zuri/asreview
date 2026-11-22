@@ -88,8 +88,9 @@ def records_due_for_check(rows, max_age, now=None):
     return never_checked + [record_id for _, record_id in checked]
 
 
-def sync_db_attachments(db, config, max_age=BACKGROUND_RECHECK_INTERVAL,
-                        delay=1.0, sleep=time.sleep):
+def sync_db_attachments(
+    db, config, max_age=BACKGROUND_RECHECK_INTERVAL, delay=1.0, sleep=time.sleep
+):
     """Refresh the Zotero attachment cache of every due record in `db`.
 
     Records whose cached lookup changed between the initial scan and their
@@ -118,9 +119,7 @@ def sync_db_attachments(db, config, max_age=BACKGROUND_RECHECK_INTERVAL,
         The number of Zotero lookups performed.
     """
     df = db.input[["record_id", "original_id", "attachment", "duplicate_of"]]
-    ids = records_due_for_check(
-        df.itertuples(index=False, name=None), max_age
-    )
+    ids = records_due_for_check(df.itertuples(index=False, name=None), max_age)
 
     lookups = 0
     keys = 0
@@ -131,9 +130,7 @@ def sync_db_attachments(db, config, max_age=BACKGROUND_RECHECK_INTERVAL,
         try:
             value = refresh_attachment(db, config, record, max_age)
         except ZoteroLookupError as err:
-            logging.warning(
-                "Zotero sync: lookup failed (%s), stopping this pass", err
-            )
+            logging.warning("Zotero sync: lookup failed (%s), stopping this pass", err)
             break
         lookups += 1
         if is_attachment_key(value):
@@ -163,14 +160,16 @@ def sync_db_attachments(db, config, max_age=BACKGROUND_RECHECK_INTERVAL,
     logging.info(
         "Zotero sync: %d lookup(s) performed, %d resolved to keys, "
         "%d cleared from missing_pdf",
-        lookups, keys, cleared,
+        lookups,
+        keys,
+        cleared,
     )
     return lookups
 
 
-def sync_project_attachments(project_path,
-                             max_age=BACKGROUND_RECHECK_INTERVAL,
-                             delay=1.0, sleep=time.sleep):
+def sync_project_attachments(
+    project_path, max_age=BACKGROUND_RECHECK_INTERVAL, delay=1.0, sleep=time.sleep
+):
     """Refresh the Zotero attachment cache of one project directory.
 
     Returns 0 without opening the database when Zotero is not configured.
@@ -202,9 +201,7 @@ def sync_project_attachments(project_path,
     with asr.Project(project_path) as project:
         db = open_db(project.db_path)
         try:
-            return sync_db_attachments(
-                db, config, max_age, delay=delay, sleep=sleep
-            )
+            return sync_db_attachments(db, config, max_age, delay=delay, sleep=sleep)
         finally:
             db.close()
 

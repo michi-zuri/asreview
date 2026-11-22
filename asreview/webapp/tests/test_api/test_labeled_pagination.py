@@ -142,9 +142,7 @@ def test_unlabeled_subset_pagination_and_pdf_filter(client, project):
 
     # filter="pdf=false": giving the first id a PDF removes it from the
     # first page, which stays full. The body must be strict JSON.
-    r = _labeled(
-        client, project, subset="unlabeled", per_page=5, filter="pdf=false"
-    )
+    r = _labeled(client, project, subset="unlabeled", per_page=5, filter="pdf=false")
     assert r.status_code == 200
     assert b"NaN" not in r.data
     result = r.json["result"]
@@ -154,9 +152,7 @@ def test_unlabeled_subset_pagination_and_pdf_filter(client, project):
     with asr.Project(project.project_path) as asr_project:
         asr_project.db.input.set_attachment(target, "ABCD1234")
 
-    r = _labeled(
-        client, project, subset="unlabeled", per_page=5, filter="pdf=false"
-    )
+    r = _labeled(client, project, subset="unlabeled", per_page=5, filter="pdf=false")
     assert r.status_code == 200
     new_ids = {item["record_id"] for item in r.json["result"]}
     assert target not in new_ids

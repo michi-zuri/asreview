@@ -11,8 +11,7 @@ from asreview.webapp._api.projects import FALLBACK_LLM_MODELS
 
 
 def _get_settings(client, project):
-    return client.get(
-        f"/api/projects/{au.get_project_id(project)}/llm_settings")
+    return client.get(f"/api/projects/{au.get_project_id(project)}/llm_settings")
 
 
 def _put_settings(client, project, body):
@@ -71,8 +70,7 @@ class FakeModelsApi:
         page_list = self.pages[kind]
         after_id = kwargs.get("after_id")
         if not page_list:
-            return SimpleNamespace(data=[], has_more=False, first_id=None,
-                                   last_id=None)
+            return SimpleNamespace(data=[], has_more=False, first_id=None, last_id=None)
         if after_id is None:
             page = page_list[0]
         else:
@@ -101,56 +99,78 @@ def test_put_model_persists(client, project):
     r = _put_settings(client, project, {"model": "claude-sonnet-4-6"})
     assert r.status_code == 200
 
-    assert _get_settings(client, project).get_json()["model"] == \
-        "claude-sonnet-4-6"
+    assert _get_settings(client, project).get_json()["model"] == "claude-sonnet-4-6"
     assert _project_config(project)["llm"]["model"] == "claude-sonnet-4-6"
 
 
 def test_catalog_fetched_live_from_models_api(client, project, monkeypatch):
     """With a key, GET serves the live Models API listing (incl. retired)."""
     _set_api_key(client, project)
-    fake = FakeModelsApi(_catalog_pages(
-        default=[{
-            "data": [
-                {"id": "claude-opus-4-6", "display_name": "Claude Opus 4.6",
-                 "lifecycle": "active"},
-                {"id": "claude-sonnet-4-5-20250929",
-                 "display_name": "Claude Sonnet 4.5", "lifecycle": "active"},
-                {"id": "claude-3-7-sonnet-latest",
-                 "display_name": "Claude 3.7 Sonnet",
-                 "lifecycle": "deprecated"},
+    fake = FakeModelsApi(
+        _catalog_pages(
+            default=[
+                {
+                    "data": [
+                        {
+                            "id": "claude-opus-4-6",
+                            "display_name": "Claude Opus 4.6",
+                            "lifecycle": "active",
+                        },
+                        {
+                            "id": "claude-sonnet-4-5-20250929",
+                            "display_name": "Claude Sonnet 4.5",
+                            "lifecycle": "active",
+                        },
+                        {
+                            "id": "claude-3-7-sonnet-latest",
+                            "display_name": "Claude 3.7 Sonnet",
+                            "lifecycle": "deprecated",
+                        },
+                    ],
+                    "has_more": False,
+                }
             ],
-            "has_more": False,
-        }],
-        retired=[{
-            "data": [
-                {"id": "claude-opus-4-1", "display_name": "Claude Opus 4.1",
-                 "lifecycle": "retired"},
+            retired=[
+                {
+                    "data": [
+                        {
+                            "id": "claude-opus-4-1",
+                            "display_name": "Claude Opus 4.1",
+                            "lifecycle": "retired",
+                        },
+                    ],
+                    "has_more": False,
+                }
             ],
-            "has_more": False,
-        }],
-    ))
+        )
+    )
     monkeypatch.setattr(projects_mod.anthropic, "Anthropic", fake)
 
     r = _get_settings(client, project)
     assert r.status_code == 200
     body = r.get_json()
     assert body["models"] == [
-        {"id": "claude-opus-4-6", "label": "Claude Opus 4.6",
-         "lifecycle": "active"},
-        {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5",
-         "lifecycle": "active"},
-        {"id": "claude-3-7-sonnet-latest",
-         "label": "Claude 3.7 Sonnet (deprecated)",
-         "lifecycle": "deprecated"},
-        {"id": "claude-opus-4-1", "label": "Claude Opus 4.1 (retired)",
-         "lifecycle": "retired"},
+        {"id": "claude-opus-4-6", "label": "Claude Opus 4.6", "lifecycle": "active"},
+        {
+            "id": "claude-sonnet-4-5-20250929",
+            "label": "Claude Sonnet 4.5",
+            "lifecycle": "active",
+        },
+        {
+            "id": "claude-3-7-sonnet-latest",
+            "label": "Claude 3.7 Sonnet (deprecated)",
+            "lifecycle": "deprecated",
+        },
+        {
+            "id": "claude-opus-4-1",
+            "label": "Claude Opus 4.1 (retired)",
+            "lifecycle": "retired",
+        },
     ]
     assert body["api_key"] is True  # still masked
     # Both listings requested via the repeated "lifecycle[]" query param
     # (a plain "lifecycle" param is rejected with a 400), full page size.
-    kinds = [(c.get("extra_query") or {}).get("lifecycle[]")
-             for c in fake.calls]
+    kinds = [(c.get("extra_query") or {}).get("lifecycle[]") for c in fake.calls]
     assert kinds == [None, "retired"]
     assert all(c["limit"] == 1000 for c in fake.calls)
 
@@ -158,25 +178,35 @@ def test_catalog_fetched_live_from_models_api(client, project, monkeypatch):
 def test_catalog_paginates_when_has_more(client, project, monkeypatch):
     """The fetch follows after_id cursors until has_more is false."""
     _set_api_key(client, project)
-    fake = FakeModelsApi(_catalog_pages(default=[
-        {"data": [{"id": "m1", "display_name": "M1", "lifecycle": "active"}],
-         "has_more": True, "last_id": "m1"},
-        {"data": [{"id": "m2", "display_name": "M2", "lifecycle": "active"}],
-         "has_more": False, "first_id": "m1"},
-    ]))
+    fake = FakeModelsApi(
+        _catalog_pages(
+            default=[
+                {
+                    "data": [{"id": "m1", "display_name": "M1", "lifecycle": "active"}],
+                    "has_more": True,
+                    "last_id": "m1",
+                },
+                {
+                    "data": [{"id": "m2", "display_name": "M2", "lifecycle": "active"}],
+                    "has_more": False,
+                    "first_id": "m1",
+                },
+            ]
+        )
+    )
     monkeypatch.setattr(projects_mod.anthropic, "Anthropic", fake)
 
     r = _get_settings(client, project)
     assert r.status_code == 200
     assert [m["id"] for m in r.get_json()["models"]] == ["m1", "m2"]
-    default_calls = [c for c in fake.calls
-                     if (c.get("extra_query") or {}).get("lifecycle[]") is None]
+    default_calls = [
+        c for c in fake.calls if (c.get("extra_query") or {}).get("lifecycle[]") is None
+    ]
     assert default_calls[0].get("after_id") is None
     assert default_calls[1].get("after_id") == "m1"
 
 
-def test_catalog_falls_back_when_models_api_unreachable(client, project,
-                                                        monkeypatch):
+def test_catalog_falls_back_when_models_api_unreachable(client, project, monkeypatch):
     """GET serves the fallback catalog when the Models API is down."""
     _set_api_key(client, project)
 
@@ -193,20 +223,34 @@ def test_catalog_falls_back_when_models_api_unreachable(client, project,
 def test_put_validation_uses_live_catalog(client, project, monkeypatch):
     """PUT validates the model id against the live Models API listing."""
     _set_api_key(client, project)
-    fake = FakeModelsApi(_catalog_pages(default=[{
-        "data": [{"id": "claude-sonnet-4-5-20250929",
-                  "display_name": "Claude Sonnet 4.5", "lifecycle": "active"}],
-        "has_more": False,
-    }]))
+    fake = FakeModelsApi(
+        _catalog_pages(
+            default=[
+                {
+                    "data": [
+                        {
+                            "id": "claude-sonnet-4-5-20250929",
+                            "display_name": "Claude Sonnet 4.5",
+                            "lifecycle": "active",
+                        }
+                    ],
+                    "has_more": False,
+                }
+            ]
+        )
+    )
     monkeypatch.setattr(projects_mod.anthropic, "Anthropic", fake)
 
     r = _put_settings(client, project, {"model": "claude-nope"})
     assert r.status_code == 400
     assert _project_config(project)["llm"]["model"] == DEFAULT_LLM_MODEL
 
-    assert _put_settings(
-        client, project, {"model": "claude-sonnet-4-5-20250929"}
-    ).status_code == 200
+    assert (
+        _put_settings(
+            client, project, {"model": "claude-sonnet-4-5-20250929"}
+        ).status_code
+        == 200
+    )
     assert _project_config(project)["llm"]["model"] == "claude-sonnet-4-5-20250929"
 
 
@@ -236,15 +280,18 @@ def test_models_client_pins_anthropic_endpoint(monkeypatch):
     }
 
 
-def test_retired_listing_failure_keeps_main_listing(client, project,
-                                                    monkeypatch):
+def test_retired_listing_failure_keeps_main_listing(client, project, monkeypatch):
     """A failing retired listing must not hide the active+deprecated one."""
     _set_api_key(client, project)
     fake = FakeModelsApi(
-        _catalog_pages(default=[{
-            "data": [{"id": "m1", "display_name": "M1", "lifecycle": "active"}],
-            "has_more": False,
-        }]),
+        _catalog_pages(
+            default=[
+                {
+                    "data": [{"id": "m1", "display_name": "M1", "lifecycle": "active"}],
+                    "has_more": False,
+                }
+            ]
+        ),
         fail_kinds=("retired",),
     )
     monkeypatch.setattr(projects_mod.anthropic, "Anthropic", fake)
@@ -259,10 +306,16 @@ def test_retired_listing_failure_keeps_main_listing(client, project,
 def test_post_llm_models_uses_stored_key(client, project, monkeypatch):
     """POST /llm_models without a body key lists with the stored key."""
     _set_api_key(client, project)
-    fake = FakeModelsApi(_catalog_pages(default=[{
-        "data": [{"id": "m1", "display_name": "M1", "lifecycle": "active"}],
-        "has_more": False,
-    }]))
+    fake = FakeModelsApi(
+        _catalog_pages(
+            default=[
+                {
+                    "data": [{"id": "m1", "display_name": "M1", "lifecycle": "active"}],
+                    "has_more": False,
+                }
+            ]
+        )
+    )
     monkeypatch.setattr(projects_mod.anthropic, "Anthropic", fake)
 
     r = _post_models(client, project, {})
@@ -275,10 +328,16 @@ def test_post_llm_models_uses_stored_key(client, project, monkeypatch):
 
 def test_post_llm_models_uses_typed_key(client, project, monkeypatch):
     """POST /llm_models lists with the body's key, which is not stored."""
-    fake = FakeModelsApi(_catalog_pages(default=[{
-        "data": [{"id": "m1", "display_name": "M1", "lifecycle": "active"}],
-        "has_more": False,
-    }]))
+    fake = FakeModelsApi(
+        _catalog_pages(
+            default=[
+                {
+                    "data": [{"id": "m1", "display_name": "M1", "lifecycle": "active"}],
+                    "has_more": False,
+                }
+            ]
+        )
+    )
     monkeypatch.setattr(projects_mod.anthropic, "Anthropic", fake)
 
     r = _post_models(client, project, {"api_key": "sk-typed"})
@@ -304,23 +363,37 @@ def test_post_llm_models_without_any_key_falls_back(client, project):
 
 def test_put_validates_against_entered_key(client, project, monkeypatch):
     """PUT validates the model against the api_key entered in the same call."""
-    fake = FakeModelsApi(_catalog_pages(default=[{
-        "data": [{"id": "claude-sonnet-4-5-20250929",
-                  "display_name": "Claude Sonnet 4.5", "lifecycle": "active"}],
-        "has_more": False,
-    }]))
+    fake = FakeModelsApi(
+        _catalog_pages(
+            default=[
+                {
+                    "data": [
+                        {
+                            "id": "claude-sonnet-4-5-20250929",
+                            "display_name": "Claude Sonnet 4.5",
+                            "lifecycle": "active",
+                        }
+                    ],
+                    "has_more": False,
+                }
+            ]
+        )
+    )
     monkeypatch.setattr(projects_mod.anthropic, "Anthropic", fake)
 
     # No stored key: model + key arrive in the same PUT.
-    r = _put_settings(client, project,
-                      {"model": "claude-nope", "api_key": "sk-typed"})
+    r = _put_settings(client, project, {"model": "claude-nope", "api_key": "sk-typed"})
     assert r.status_code == 400
     assert not _project_config(project)["llm"].get("api_key")
 
-    assert _put_settings(
-        client, project,
-        {"model": "claude-sonnet-4-5-20250929", "api_key": "sk-typed"},
-    ).status_code == 200
+    assert (
+        _put_settings(
+            client,
+            project,
+            {"model": "claude-sonnet-4-5-20250929", "api_key": "sk-typed"},
+        ).status_code
+        == 200
+    )
     cfg = _project_config(project)["llm"]
     assert cfg["model"] == "claude-sonnet-4-5-20250929"
     assert cfg["api_key"] == "sk-typed"
@@ -348,22 +421,33 @@ def test_model_change_invalidates_unlabeled_only(client, project):
     with asr_project.db as db:
         cur = db._conn.cursor()
         # rid1 (no final decision): results deleted, dispatch re-queued.
-        assert cur.execute(
-            "SELECT COUNT(*) FROM llm_results WHERE record_id = ?",
-            (rid1,),
-        ).fetchone()[0] == 0
+        assert (
+            cur.execute(
+                "SELECT COUNT(*) FROM llm_results WHERE record_id = ?",
+                (rid1,),
+            ).fetchone()[0]
+            == 0
+        )
         assert cur.execute(
             "SELECT status, prompt_hash, attempts, last_error "
-            "FROM llm_dispatch WHERE record_id = ?", (rid1,),
+            "FROM llm_dispatch WHERE record_id = ?",
+            (rid1,),
         ).fetchone() == ("queued", "H", 0, None)
         # rid2 (labeled): result and 'ready' status kept.
-        assert cur.execute(
-            "SELECT COUNT(*) FROM llm_results WHERE record_id = ?",
-            (rid2,),
-        ).fetchone()[0] == 1
-        assert cur.execute(
-            "SELECT status FROM llm_dispatch WHERE record_id = ?", (rid2,),
-        ).fetchone()[0] == "ready"
+        assert (
+            cur.execute(
+                "SELECT COUNT(*) FROM llm_results WHERE record_id = ?",
+                (rid2,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            cur.execute(
+                "SELECT status FROM llm_dispatch WHERE record_id = ?",
+                (rid2,),
+            ).fetchone()[0]
+            == "ready"
+        )
 
 
 def _export_project_file(client, project, tmp_path, name="export.asreview"):
@@ -376,11 +460,12 @@ def _export_project_file(client, project, tmp_path, name="export.asreview"):
 
 def test_import_preserves_model(client, project, tmp_path):
     """Export/import round-trip keeps the configured model."""
-    assert _put_settings(
-        client, project, {"model": "claude-sonnet-4-6"}).status_code == 200
+    assert (
+        _put_settings(client, project, {"model": "claude-sonnet-4-6"}).status_code
+        == 200
+    )
 
-    r = au.import_project(
-        client, _export_project_file(client, project, tmp_path))
+    r = au.import_project(client, _export_project_file(client, project, tmp_path))
     assert r.status_code == 200
     assert r.json["data"]["llm"]["model"] == "claude-sonnet-4-6"
 

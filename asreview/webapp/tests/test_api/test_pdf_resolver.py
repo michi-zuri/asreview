@@ -8,9 +8,7 @@ from asreview.webapp._api.pdf_resolver import PdfResolver
 
 
 def fake_record(attachment):
-    return types.SimpleNamespace(
-        attachment=attachment, original_id="ITEMKEY0"
-    )
+    return types.SimpleNamespace(attachment=attachment, original_id="ITEMKEY0")
 
 
 def make_enabled_config():

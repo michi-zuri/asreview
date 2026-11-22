@@ -8,8 +8,7 @@ import asreview.webapp.tests.utils.api_utils as au
 
 def _dispatch_count(project):
     with asr.Project(project.project_path).db as db:
-        return db._conn.execute(
-            "SELECT COUNT(*) FROM llm_dispatch").fetchone()[0]
+        return db._conn.execute("SELECT COUNT(*) FROM llm_dispatch").fetchone()[0]
 
 
 def _setup_review(client, project):

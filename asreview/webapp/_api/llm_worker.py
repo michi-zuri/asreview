@@ -103,12 +103,12 @@ def _ensure_attachment(db, resolver, record):
     if is_attachment_key(value):
         logging.info("record %s: attachment key resolved via Zotero", record.record_id)
     else:
-        logging.info(
-            "record %s: no PDF attachment found in Zotero", record.record_id)
+        logging.info("record %s: no PDF attachment found in Zotero", record.record_id)
 
 
-def screen_record(db, resolver, client, record, prompt, prompt_hash,
-                  model, max_tokens=2048):
+def screen_record(
+    db, resolver, client, record, prompt, prompt_hash, model, max_tokens=2048
+):
     """Run ONE LLM screening attempt for a record and record the result.
 
     Returns one of the status strings: "ready", "failed", "missing_pdf".
@@ -157,13 +157,14 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
     pdf_bytes = pdf_path.read_bytes()
     user_content = [
         _pdf_document_block(pdf_bytes),
-        {"type": "text",
-         "text": build_user_text(record.title, record.abstract)},
+        {"type": "text", "text": build_user_text(record.title, record.abstract)},
     ]
 
     # 3. First call (transient errors propagate to the caller).
     resp = client.messages.create(
-        model=model, max_tokens=max_tokens, system=prompt,
+        model=model,
+        max_tokens=max_tokens,
+        system=prompt,
         messages=[{"role": "user", "content": user_content}],
     )
     text = _extract_text(resp)
@@ -177,16 +178,24 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
     except ValueError:
         logging.warning("record %s bad JSON; attempting repair.", record_id)
         repair = client.messages.create(
-            model=model, max_tokens=max_tokens,
-            messages=[{"role": "user", "content": [{
-                "type": "text",
-                "text": (
-                    "The following was supposed to be a single JSON "
-                    "object but is malformed. Return ONLY the corrected "
-                    "JSON object, with no prose and no code fences:\n\n"
-                    + text
-                ),
-            }]}],
+            model=model,
+            max_tokens=max_tokens,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "The following was supposed to be a single JSON "
+                                "object but is malformed. Return ONLY the corrected "
+                                "JSON object, with no prose and no code fences:\n\n"
+                                + text
+                            ),
+                        }
+                    ],
+                }
+            ],
         )
         try:
             payload = _parse_json(_extract_text(repair))
@@ -197,8 +206,12 @@ def screen_record(db, resolver, client, record, prompt, prompt_hash,
 
     # 5. Success -> store and mark ready.
     db.store_llm_result(
-        record_id, prompt_hash, model, json.dumps(payload),
-        input_tokens=in_tok, output_tokens=out_tok,
+        record_id,
+        prompt_hash,
+        model,
+        json.dumps(payload),
+        input_tokens=in_tok,
+        output_tokens=out_tok,
     )
     return "ready"
 
@@ -209,19 +222,35 @@ _TRANSIENT_STATUS = {429, 500, 502, 503, 529}
 
 def _default_is_transient(exc):
     """Return True for transient Anthropic API errors."""
-    if isinstance(exc, (anthropic.APIConnectionError,
-                        anthropic.RateLimitError,
-                        anthropic.InternalServerError)):
+    if isinstance(
+        exc,
+        (
+            anthropic.APIConnectionError,
+            anthropic.RateLimitError,
+            anthropic.InternalServerError,
+        ),
+    ):
         return True
     if isinstance(exc, anthropic.APIStatusError):
         return getattr(exc, "status_code", None) in _TRANSIENT_STATUS
     return False
 
 
-def process_with_retry(db, resolver, client, record, prompt, prompt_hash,
-                       model, max_attempts=5, base_delay=1.0,
-                       max_delay=60.0, is_transient=None,
-                       sleep=time.sleep, jitter=random.random):
+def process_with_retry(
+    db,
+    resolver,
+    client,
+    record,
+    prompt,
+    prompt_hash,
+    model,
+    max_attempts=5,
+    base_delay=1.0,
+    max_delay=60.0,
+    is_transient=None,
+    sleep=time.sleep,
+    jitter=random.random,
+):
     """Run screen_record with exponential backoff + jitter on transient errors.
 
     Returns the final status string. On a non-transient error, or after
@@ -234,11 +263,14 @@ def process_with_retry(db, resolver, client, record, prompt, prompt_hash,
     while True:
         try:
             start = time.time()
-            status = screen_record(db, resolver, client, record, prompt,
-                                   prompt_hash, model)
+            status = screen_record(
+                db, resolver, client, record, prompt, prompt_hash, model
+            )
             logging.info(
                 "llm screen record_id=%s status=%s latency=%.2fs",
-                record_id, status, time.time() - start,
+                record_id,
+                status,
+                time.time() - start,
             )
             return status
         except Exception as err:
@@ -247,22 +279,32 @@ def process_with_retry(db, resolver, client, record, prompt, prompt_hash,
             if not is_transient(err) or attempt >= max_attempts:
                 logging.warning(
                     "record %s failed after %d attempt(s): %s",
-                    record_id, attempt, err,
+                    record_id,
+                    attempt,
+                    err,
                 )
                 db.mark_dispatch_failed(record_id, err)
                 return "failed"
-            delay = min(max_delay, base_delay * (2 ** (attempt - 1))) \
-                + jitter()
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1))) + jitter()
             logging.info(
-                "record %s transient error (attempt %d): %s; retrying in "
-                "%.1fs", record_id, attempt, err, delay,
+                "record %s transient error (attempt %d): %s; retrying in %.1fs",
+                record_id,
+                attempt,
+                err,
+                delay,
             )
             sleep(delay)
 
 
-def run_worker_once(project, model=None, max_concurrent=3, max_attempts=5,
-                    db_factory=None, resolver_factory=None,
-                    executor=None):
+def run_worker_once(
+    project,
+    model=None,
+    max_concurrent=3,
+    max_attempts=5,
+    db_factory=None,
+    resolver_factory=None,
+    executor=None,
+):
     """Claim and process all currently-queued dispatch rows once.
 
     Returns the number of records processed.  Builds the current system
@@ -296,9 +338,7 @@ def run_worker_once(project, model=None, max_concurrent=3, max_attempts=5,
     # through a DeepSeek-compatible endpoint; the worker must not inherit
     # that. (Passing api_key explicitly already keeps the SDK from reading
     # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN from the environment.)
-    client = anthropic.Anthropic(
-        api_key=api_key, base_url="https://api.anthropic.com"
-    )
+    client = anthropic.Anthropic(api_key=api_key, base_url="https://api.anthropic.com")
 
     criteria_text = settings.get("criteria_text", "")
     tags = read_tags_data(project.db)
@@ -306,9 +346,7 @@ def run_worker_once(project, model=None, max_concurrent=3, max_attempts=5,
     prompt, prompt_hash = build_system_prompt(tags, lists, criteria_text)
 
     db_factory = db_factory or (lambda: open_db(project.db_path))
-    resolver_factory = resolver_factory or (
-        lambda: PdfResolver(project.project_path)
-    )
+    resolver_factory = resolver_factory or (lambda: PdfResolver(project.project_path))
 
     claimed = []
     while True:
@@ -325,8 +363,14 @@ def run_worker_once(project, model=None, max_concurrent=3, max_attempts=5,
             resolver = resolver_factory()
             record = job_db.input.get_records(record_id)
             return process_with_retry(
-                job_db, resolver, client, record, prompt, prompt_hash,
-                model, max_attempts=max_attempts,
+                job_db,
+                resolver,
+                client,
+                record,
+                prompt,
+                prompt_hash,
+                model,
+                max_attempts=max_attempts,
             )
         finally:
             job_db.close()
@@ -339,13 +383,13 @@ def run_worker_once(project, model=None, max_concurrent=3, max_attempts=5,
     return len(claimed)
 
 
-def run_worker(project_path, model=None, max_concurrent=3,
-               poll_interval=5.0):
+def run_worker(project_path, model=None, max_concurrent=3, poll_interval=5.0):
     """Continuously drain a project's LLM queue (single-project mode)."""
     with asr.Project(project_path) as project:
         while True:
             n = run_worker_once(
-                project, model,
+                project,
+                model,
                 max_concurrent=max_concurrent,
             )
             if n == 0:
@@ -355,6 +399,7 @@ def run_worker(project_path, model=None, max_concurrent=3,
 def main():
     """CLI entrypoint for the LLM screening worker."""
     import argparse
+
     logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser(description="ASReview LLM screening worker")
     ap.add_argument("project_path")
@@ -390,13 +435,15 @@ def discover_project_paths():
             if ok:
                 paths.append(p)
             else:
-                logging.debug("LLM worker: skipping %s — not a v%s project",
-                              p.name, asr.Project.VERSION)
+                logging.debug(
+                    "LLM worker: skipping %s — not a v%s project",
+                    p.name,
+                    asr.Project.VERSION,
+                )
     return paths
 
 
-def run_worker_all(model=None, executor=None, max_concurrent=3,
-                   max_attempts=5):
+def run_worker_all(model=None, executor=None, max_concurrent=3, max_attempts=5):
     """Drain the queued dispatch rows of every project once.
 
     Returns the total number of records processed across all projects. A
@@ -408,7 +455,8 @@ def run_worker_all(model=None, executor=None, max_concurrent=3,
         try:
             with asr.Project(path) as project:
                 total += run_worker_once(
-                    project, model,
+                    project,
+                    model,
                     max_concurrent=max_concurrent,
                     max_attempts=max_attempts,
                     executor=executor,
@@ -460,8 +508,7 @@ def run_worker_service(poll_interval=5.0, port=None, zotero_sync=True):
     if port is not None:
         _start_health_server(port)
     logging.info(
-        "ASReview LLM worker starting (model=per-project setting, "
-        "max_concurrent=%s)",
+        "ASReview LLM worker starting (model=per-project setting, max_concurrent=%s)",
         max_concurrent,
     )
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:

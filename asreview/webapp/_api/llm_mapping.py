@@ -99,9 +99,7 @@ def _map_labels(payload, group_lookup):
 
         group_export = group_entry.get("group")
         if not group_export or group_export not in group_lookup:
-            logging.warning(
-                "Unknown or missing label group export: %r", group_export
-            )
+            logging.warning("Unknown or missing label group export: %r", group_export)
             continue
 
         group_info = group_lookup[group_export]
@@ -158,9 +156,7 @@ def _map_labels(payload, group_lookup):
                 if isinstance(raw_text, str) and raw_text.strip():
                     text = raw_text
 
-            group_values_out.append(
-                {"id": option_id, "checked": True, "text": text}
-            )
+            group_values_out.append({"id": option_id, "checked": True, "text": text})
 
         # single_select enforcement
         if group_info["single_select"] and len(group_values_out) > 1:
@@ -173,9 +169,7 @@ def _map_labels(payload, group_lookup):
             group_values_out = group_values_out[:1]
 
         if group_values_out:
-            tags_out.append(
-                {"id": group_info["id"], "values": group_values_out}
-            )
+            tags_out.append({"id": group_info["id"], "values": group_values_out})
 
     return tags_out
 
@@ -205,9 +199,7 @@ def _map_lists(payload, list_lookup):
         list_id = list_lookup[list_name]
         items = list_entry.get("items")
         if not isinstance(items, list):
-            logging.warning(
-                "List '%s' items is not a list; skipping list.", list_name
-            )
+            logging.warning("List '%s' items is not a list; skipping list.", list_name)
             continue
 
         seen_names = set()
@@ -216,9 +208,7 @@ def _map_lists(payload, list_lookup):
         for item in items:
             name = str(item).strip()
             if not name:
-                logging.warning(
-                    "Empty item in list '%s'; dropping.", list_name
-                )
+                logging.warning("Empty item in list '%s'; dropping.", list_name)
                 continue
 
             if name in seen_names:

@@ -40,6 +40,7 @@ from asreview.data.loader import _get_reader
 from asreview.data.utils import identify_record_groups
 from asreview.database.database import Database
 from asreview.database.database import open_db
+from asreview.database.fork_migrations import rekey_project_id
 from asreview.datasets import DatasetManager
 from asreview.learner import ActiveLearningCycle
 from asreview.learner import ActiveLearningCycleData
@@ -48,6 +49,7 @@ from asreview.project.exceptions import ProjectError
 from asreview.project.exceptions import ProjectNotFoundError
 from asreview.project.migration import detect_version
 from asreview.project.migration import migrate_project
+from asreview.project.migration.migrate import is_fork_database
 from asreview.project.schema import SCHEMA
 from asreview.utils import _get_filename_from_url
 from asreview.utils import _is_url
@@ -557,6 +559,16 @@ class Project:
                 with open(Path(tmpdir, cls.PATH_CONFIG)) as f:
                     project_config = json.load(f)
 
+            # Refuse a v4 project that was not made by this fork, before it
+            # is copied into the projects folder where it would later fail
+            # with a bare ForeignDatabaseError.
+            results_db = Path(tmpdir, cls.PATH_DB)
+            if results_db.exists() and not is_fork_database(results_db):
+                raise ValueError(
+                    "This project was not made by ASReview asmr (project "
+                    "version 4 without the asmr mark) and cannot be imported."
+                )
+
             if reset_model_if_not_found:
                 try:
                     model_config = (
@@ -578,10 +590,14 @@ class Project:
                         json.dump(project_config, f)
 
             if safe_import:
-                # assign a new id to the project.
+                # assign a new id to the project, and re-key the database's
+                # change-tracking tables so their rows follow the new id.
                 project_config["id"] = uuid4().hex
                 with open(Path(tmpdir, cls.PATH_CONFIG), "w") as f:
                     json.dump(project_config, f)
+
+                if results_db.exists():
+                    rekey_project_id(results_db, project_config["id"])
 
             shutil.copytree(tmpdir, Path(project_path, project_config["id"]))
         return cls(Path(project_path, project_config["id"]))

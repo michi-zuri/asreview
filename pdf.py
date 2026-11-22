@@ -13,6 +13,7 @@ Usage:
 Optional:
     python poc_pdf_screen.py paper.pdf --prompt my_screening_prompt.txt
 """
+
 import argparse
 import base64
 import json
@@ -273,13 +274,18 @@ def screen(pdf_path: Path, system_prompt: str, model: str) -> dict:
         model=model,
         max_tokens=1024,
         system=system_prompt,
-        messages=[{
-            "role": "user",
-            "content": [
-                pdf_to_block(pdf_path),
-                {"type": "text", "text": "Screen this article. Respond with JSON only."},
-            ],
-        }],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    pdf_to_block(pdf_path),
+                    {
+                        "type": "text",
+                        "text": "Screen this article. Respond with JSON only.",
+                    },
+                ],
+            }
+        ],
     )
 
     # Claude may return several content blocks; take the text ones.
@@ -288,18 +294,22 @@ def screen(pdf_path: Path, system_prompt: str, model: str) -> dict:
     # Be forgiving about accidental ```json fences, then parse strictly.
     if text.startswith("```"):
         text = text.strip("`")
-        text = text[text.find("{"):]
+        text = text[text.find("{") :]
     try:
         verdict = json.loads(text)
     except json.JSONDecodeError as e:
-        print("!! Claude did not return valid JSON. Raw output:\n", text, file=sys.stderr)
+        print(
+            "!! Claude did not return valid JSON. Raw output:\n", text, file=sys.stderr
+        )
         raise SystemExit(f"JSON parse failed: {e}")
 
     # Report token usage -- tells you the real per-PDF cost before you batch 1000s.
-    print(f"[tokens] input={resp.usage.input_tokens} "
-          f"output={resp.usage.output_tokens} "
-          f"(cache_read={getattr(resp.usage, 'cache_read_input_tokens', 0)})",
-          file=sys.stderr)
+    print(
+        f"[tokens] input={resp.usage.input_tokens} "
+        f"output={resp.usage.output_tokens} "
+        f"(cache_read={getattr(resp.usage, 'cache_read_input_tokens', 0)})",
+        file=sys.stderr,
+    )
     return verdict
 
 
@@ -313,10 +323,10 @@ def main():
     if not args.pdf.exists():
         raise SystemExit(f"No such file: {args.pdf}")
 
-    system_prompt = args.prompt.read_text() if args.prompt else SYSTEM_PROMPT
     print(args.pdf)
-    #verdict = screen(args.pdf, system_prompt, args.model)
-    #print(json.dumps(verdict, indent=2, ensure_ascii=False))
+    # system_prompt = args.prompt.read_text() if args.prompt else SYSTEM_PROMPT
+    # verdict = screen(args.pdf, system_prompt, args.model)
+    # print(json.dumps(verdict, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

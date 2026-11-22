@@ -1,4 +1,3 @@
-import json
 import sqlite3
 import time
 from pathlib import Path
@@ -334,25 +333,29 @@ def test_label_record(db):
     tags_empty = []
 
     def _make_tag_group(checked):
-        return [{
-            "id": group_id,
-            "export": "test_group",
-            "label": "Test Group",
-            "single_select": False,
-            "required_relevant": False,
-            "required_irrelevant": False,
-            "require_all": False,
-            "input_helper_text": "",
-            "values": [{
-                "id": option_id,
-                "export": "tag1",
-                "label": "Tag 1",
-                "free_text": False,
-                "free_text_required": False,
-                "checked": checked,
-                "text": None,
-            }],
-        }]
+        return [
+            {
+                "id": group_id,
+                "export": "test_group",
+                "label": "Test Group",
+                "single_select": False,
+                "required_relevant": False,
+                "required_irrelevant": False,
+                "require_all": False,
+                "input_helper_text": "",
+                "values": [
+                    {
+                        "id": option_id,
+                        "export": "tag1",
+                        "label": "Tag 1",
+                        "free_text": False,
+                        "free_text_required": False,
+                        "checked": checked,
+                        "text": None,
+                    }
+                ],
+            }
+        ]
 
     state = [
         [0, None, None, "c0", "q0", "b0", "f0", 40, tags_empty],
@@ -373,7 +376,9 @@ def test_label_record(db):
     # record_id 0 is grouped and in the table. The existing record is updated, the new
     # records are added with model information of the existing.
     # Tags are saved only for the base record, not for group members.
-    tags_format = [{"id": group_id, "values": [{"id": option_id, "checked": True, "text": None}]}]
+    tags_format = [
+        {"id": group_id, "values": [{"id": option_id, "checked": True, "text": None}]}
+    ]
     db.label_record(0, 1, tags_format, 2)
     state[0] = [0, 1, 2, "c0", "q0", "b0", "f0", 40, _make_tag_group(True)]
     state.append([1, 1, 2, "c0", "q0", "b0", "f0", 40, tags_empty])
@@ -393,7 +398,9 @@ def test_label_record(db):
     assert_state(db, state, columns)
 
     # record_id 6 is not grouped and not in the table. It's added without model info.
-    tags_format2 = [{"id": group_id, "values": [{"id": option_id, "checked": False, "text": None}]}]
+    tags_format2 = [
+        {"id": group_id, "values": [{"id": option_id, "checked": False, "text": None}]}
+    ]
     db.label_record(6, 1, tags_format2, 3)
     state.append([6, 1, 3, None, None, None, None, None, _make_tag_group(False)])
     assert_state(db, state, columns)

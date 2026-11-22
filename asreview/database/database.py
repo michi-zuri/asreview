@@ -8,7 +8,9 @@ from pathlib import Path
 import pandas as pd
 
 from asreview.data.record import Record
+from asreview.database.fork_migrations import FORK_APPLICATION_ID
 from asreview.database.fork_migrations import apply_fork_migrations
+from asreview.database.fork_migrations import mark_fork_database
 from asreview.database.store import DataStore
 from asreview.database.store import _build_conn_uri
 
@@ -201,6 +203,7 @@ def _ensure_decision_changes(cur):
         cur.execute(f"CREATE TRIGGER IF NOT EXISTS {name} {body}")
     conn.commit()
 
+
 __all__ = ["Database"]
 
 CURRENT_DATABASE_VERSION = 4
@@ -244,6 +247,10 @@ RANKING_TABLE_COLUMNS_PANDAS_DTYPES = {
 }
 
 
+class ForeignDatabaseError(ValueError):
+    """Raised when a database does not carry the asmr fork mark."""
+
+
 def open_db(fp, read_only=False):
     """Open a database.
 
@@ -283,7 +290,17 @@ def open_db(fp, read_only=False):
                 f"There is no valid database at {fp} and the database is opened in"
                 " read-only mode"
             ) from e
-        db.create_tables()
+        # Only a database with no tables at all may be created here. A refused
+        # or wrong-version EXISTING database must surface its error instead of
+        # being treated as new.
+        cur = db._conn.cursor()
+        table_count = cur.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table'"
+        ).fetchone()[0]
+        if table_count == 0:
+            db.create_tables()
+        else:
+            raise
     return db
 
 
@@ -390,6 +407,7 @@ class Database:
 
     def create_tables(self):
         self.user_version = CURRENT_DATABASE_VERSION
+        mark_fork_database(self._conn)
         self.input.create_tables()
 
         cur = self._conn.cursor()
@@ -453,7 +471,8 @@ class Database:
         Idempotent and safe to call on every read-write open; a read-only
         open never reaches this method.
         """
-        apply_fork_migrations(self._conn, self.project_id)
+        project_path = None if self._in_memory else Path(self.fp).parent
+        apply_fork_migrations(self._conn, self.project_id, project_path)
 
     def _ensure_lists_table(self):
         """Create the ``lists`` table that stores per-record list items.
@@ -677,12 +696,26 @@ class Database:
     def _is_valid(self, expected_version=None):
         if expected_version is None:
             expected_version = CURRENT_DATABASE_VERSION
+
+        cur = self._conn.cursor()
+        # A fork database (v4 and later) must carry the asmr mark. Upstream
+        # v3 databases are unmarked and are only validated here during the
+        # v2→v3 migration step, before the v3→v4 step marks them.
+        if expected_version >= CURRENT_DATABASE_VERSION:
+            app_id = int(cur.execute("PRAGMA application_id").fetchone()[0])
+            if app_id != FORK_APPLICATION_ID:
+                raise ForeignDatabaseError(
+                    f"{self.fp} is not an asmr database (application_id "
+                    f"{app_id}, user_version {self.user_version}). Upstream "
+                    "v3 projects are upgraded through project migration; "
+                    "other versions are not supported."
+                )
+
         if self.user_version != expected_version:
             raise ValueError(
                 f"Database version {self.user_version} is not supported. "
                 "See migration guide."
             )
-        cur = self._conn.cursor()
         column_names = cur.execute("PRAGMA table_info(results)").fetchall()
         table_names = cur.execute(
             "SELECT name FROM sqlite_master WHERE type='table';"
@@ -712,7 +745,11 @@ class Database:
                 f"{' '.join(missing_columns)}."
             )
 
-        if not self.read_only:
+        # Schema fixups and fork migrations apply only to fork-version
+        # databases. An upstream v3 database is validated here during the
+        # v2→v3 migration step and must be left untouched for the v3→v4
+        # step that follows (its 0000 revision rewrites the schema).
+        if not self.read_only and expected_version >= CURRENT_DATABASE_VERSION:
             self._fix_decision_changes_schema(cur)
             self._fix_record_schema(cur)
             self._fix_results_schema(cur)
@@ -751,9 +788,7 @@ class Database:
 
     def _fix_results_schema(self, cur):
         """Add columns introduced after the initial results schema."""
-        columns = [
-            row[1] for row in cur.execute("PRAGMA table_info(results)")
-        ]
+        columns = [row[1] for row in cur.execute("PRAGMA table_info(results)")]
         if "assigned_at" not in columns:
             cur.execute("ALTER TABLE results ADD COLUMN assigned_at REAL")
             self._conn.commit()
@@ -1210,8 +1245,15 @@ class Database:
         con.commit()
         return row[0] if row else None
 
-    def store_llm_result(self, record_id, prompt_hash, model, payload_json,
-                         input_tokens=None, output_tokens=None):
+    def store_llm_result(
+        self,
+        record_id,
+        prompt_hash,
+        model,
+        payload_json,
+        input_tokens=None,
+        output_tokens=None,
+    ):
         """Upsert an llm_results row and mark its dispatch row 'ready'.
 
         Keyed by (record_id, prompt_hash); re-processing overwrites. Also
@@ -1231,8 +1273,15 @@ class Database:
                    input_tokens = excluded.input_tokens,
                    output_tokens = excluded.output_tokens,
                    created_at = excluded.created_at""",
-            (record_id, prompt_hash, model, payload_json,
-             input_tokens, output_tokens, now),
+            (
+                record_id,
+                prompt_hash,
+                model,
+                payload_json,
+                input_tokens,
+                output_tokens,
+                now,
+            ),
         )
         cur.execute(
             "UPDATE llm_dispatch SET status = 'ready', last_error = NULL "
@@ -1277,8 +1326,7 @@ class Database:
         con = self._conn
         cur = con.cursor()
         cur.execute(
-            "DELETE FROM llm_dispatch "
-            "WHERE record_id = ? AND status = 'missing_pdf'",
+            "DELETE FROM llm_dispatch WHERE record_id = ? AND status = 'missing_pdf'",
             (int(record_id),),
         )
         con.commit()
@@ -1365,12 +1413,19 @@ class Database:
         cur = self._conn.cursor()
         d = cur.execute(
             "SELECT status, dispatched_at, attempts, last_error "
-            "FROM llm_dispatch WHERE record_id = ?", (record_id,)
+            "FROM llm_dispatch WHERE record_id = ?",
+            (record_id,),
         ).fetchone()
         if d is None:
             return None
-        meta = {"status": d[0], "dispatched_at": d[1], "attempts": d[2],
-                "last_error": d[3], "has_result": False, "pdf_match": None}
+        meta = {
+            "status": d[0],
+            "dispatched_at": d[1],
+            "attempts": d[2],
+            "last_error": d[3],
+            "has_result": False,
+            "pdf_match": None,
+        }
         r = cur.execute(
             "SELECT model, input_tokens, output_tokens, created_at, "
             "payload_json "
@@ -1378,12 +1433,18 @@ class Database:
             (record_id, prompt_hash),
         ).fetchone()
         if r is not None:
-            meta.update(has_result=True, model=r[0], input_tokens=r[1],
-                        output_tokens=r[2], created_at=r[3])
+            meta.update(
+                has_result=True,
+                model=r[0],
+                input_tokens=r[1],
+                output_tokens=r[2],
+                created_at=r[3],
+            )
             try:
                 payload = json.loads(r[4])
-                pdf_match = payload.get("pdf_match") \
-                    if isinstance(payload, dict) else None
+                pdf_match = (
+                    payload.get("pdf_match") if isinstance(payload, dict) else None
+                )
                 if not isinstance(pdf_match, dict):
                     pdf_match = None
             except (ValueError, TypeError):
@@ -1789,9 +1850,7 @@ class Database:
                 "This list cannot be deleted because it still has items "
                 "assigned to records. Remove all items from this list first."
             )
-        cur.execute(
-            "DELETE FROM list_containers WHERE list_id = ?", (list_id,)
-        )
+        cur.execute("DELETE FROM list_containers WHERE list_id = ?", (list_id,))
         if cur.rowcount == 0:
             raise ValueError(f"List with id '{list_id}' not found.")
         self._conn.commit()
@@ -1854,9 +1913,7 @@ class Database:
                 "options. Delete all options first."
             )
         try:
-            cur.execute(
-                "DELETE FROM tag_groups WHERE group_id = ?", (group_id,)
-            )
+            cur.execute("DELETE FROM tag_groups WHERE group_id = ?", (group_id,))
         except sqlite3.IntegrityError:
             raise ValueError(
                 "This tag group cannot be deleted because it is still in use."
@@ -2042,9 +2099,7 @@ class Database:
                 if gid not in seen_groups:
                     # Copy the group template
                     template = groups_by_id[gid]
-                    group_copy = {
-                        k: v for k, v in template.items() if k != "values"
-                    }
+                    group_copy = {k: v for k, v in template.items() if k != "values"}
                     group_copy["values"] = [dict(v) for v in template["values"]]
                     result[rid].append(group_copy)
                     seen_groups.add(gid)
@@ -2143,11 +2198,7 @@ class Database:
         # Remove "tags" from SQL columns list since it is no longer a results
         # table column -- it is reconstructed from the ``tags`` table below.
         want_tags = columns is None or "tags" in columns
-        sql_columns = (
-            None
-            if columns is None
-            else [c for c in columns if c != "tags"]
-        )
+        sql_columns = None if columns is None else [c for c in columns if c != "tags"]
 
         if (not priors) or (not pending) or (not groups):
             sql_where = []
@@ -2354,9 +2405,17 @@ class Database:
             df_results["tags"] = pd.Series(dtype="object")
         return df_results
 
-    def get_unlabeled_page(self, *, priors=None, has_note=None,
-                           include_users=None, exclude_users=None,
-                           cursor=None, limit=50, latest_first=True):
+    def get_unlabeled_page(
+        self,
+        *,
+        priors=None,
+        has_note=None,
+        include_users=None,
+        exclude_users=None,
+        cursor=None,
+        limit=50,
+        latest_first=True,
+    ):
         """Get an ordered page of unlabeled base records (keyset pagination).
 
         Returns a DataFrame with the same columns as get_results_page

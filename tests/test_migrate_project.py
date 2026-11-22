@@ -1,4 +1,5 @@
 import shutil
+import sqlite3
 from pathlib import Path
 
 import jsonschema
@@ -6,6 +7,7 @@ import pandas
 import pytest
 
 import asreview as asr
+from asreview.database.fork_migrations import FORK_APPLICATION_ID
 from asreview.project.migration import detect_version
 from asreview.project.schema import SCHEMA
 
@@ -23,6 +25,10 @@ def assert_valid_project(project):
     assert detect_version(project.config) == 4
     jsonschema.validate(instance=project.config, schema=SCHEMA)
 
+    # The migrated database must carry the asmr mark and both ledger rows.
+    assert not Path(project.project_path, "tags.json").exists()
+    assert not Path(project.project_path, "lists.json").exists()
+
     with project.db as db:
         db.get_results_table()
         db.get_last_ranking_table()
@@ -34,13 +40,17 @@ def assert_valid_project(project):
         cur = db._conn.cursor()
         tables = [
             row[0]
-            for row in cur.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
         ]
         assert "tag_groups" in tables
         assert "tag_options" in tables
         assert "list_containers" in tables
+
+        # Verify the fork mark and ledger are in place
+        assert cur.execute("PRAGMA application_id").fetchone()[0] == FORK_APPLICATION_ID
+        assert {
+            row[0] for row in cur.execute("SELECT revision FROM fork_migrations")
+        } == {"0000_tags_tables", "0001_change_tracking"}
 
         # Verify tag_groups uses group_id (UUID v7 TEXT PK)
         cols = {row[1] for row in cur.execute("PRAGMA table_info(tag_groups)")}
@@ -86,3 +96,68 @@ def test_project_migration_2_to_3(tmpdir, asreview_v2_project):
         open(asreview_v2_project, "rb"), tmpdir, safe_import=True
     )
     assert_valid_project(project)
+
+
+def test_import_unmarked_v4_project_refused(tmpdir):
+    """A v4 project without the asmr mark cannot be imported."""
+    project_dir = Path(tmpdir, "src.asreview")
+    project = asr.Project.create(project_dir)
+
+    # Unmark its results.db before exporting.
+    with sqlite3.connect(str(project.db_path)) as conn:
+        conn.execute("PRAGMA application_id = 0")
+        conn.commit()
+
+    export_fp = Path(tmpdir, "src-export.asreview")
+    project.export(export_fp)
+
+    projects_dir = Path(tmpdir, "projects")
+    projects_dir.mkdir()
+
+    with pytest.raises(ValueError, match="asmr"):
+        asr.Project.load(export_fp, projects_dir)
+
+    assert list(projects_dir.iterdir()) == []
+
+
+def test_safe_import_rekeys_change_tracking(tmpdir):
+    """safe_import re-keys project_state, record_versions and change_log."""
+    project_dir = Path(tmpdir, "src.asreview")
+    project = asr.Project.create(project_dir)
+
+    # Seed change-tracking rows under the source project's id.
+    with sqlite3.connect(str(project.db_path)) as conn:
+        old_id = conn.execute("SELECT project_id FROM project_state").fetchone()[0]
+        conn.execute(
+            "INSERT INTO record_versions (project_id, record_id, version) "
+            "VALUES (?, 1, 0)",
+            (old_id,),
+        )
+        conn.execute(
+            "INSERT INTO change_log "
+            "(project_id, version, record_id, source, changed_at) "
+            "VALUES (?, 0, 1, 'test', 0.0)",
+            (old_id,),
+        )
+        conn.commit()
+
+    export_fp = Path(tmpdir, "src-export.asreview")
+    project.export(export_fp)
+
+    projects_dir = Path(tmpdir, "projects")
+    projects_dir.mkdir()
+    imported = asr.Project.load(export_fp, projects_dir, safe_import=True)
+
+    new_id = imported.config["id"]
+    assert new_id != old_id
+
+    with sqlite3.connect(str(imported.db_path)) as conn:
+        assert (
+            conn.execute("SELECT project_id FROM project_state").fetchone()[0] == new_id
+        )
+        assert conn.execute("SELECT project_id FROM record_versions").fetchall() == [
+            (new_id,)
+        ]
+        assert conn.execute("SELECT project_id FROM change_log").fetchall() == [
+            (new_id,)
+        ]

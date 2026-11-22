@@ -122,8 +122,11 @@ DEFAULT_LLM_MODEL = "claude-opus-4-6"
 FALLBACK_LLM_MODELS = [
     {"id": "claude-opus-4-6", "label": "Claude Opus 4.6", "lifecycle": "active"},
     {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "lifecycle": "active"},
-    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5",
-     "lifecycle": "active"},
+    {
+        "id": "claude-haiku-4-5-20251001",
+        "label": "Claude Haiku 4.5",
+        "lifecycle": "active",
+    },
 ]
 
 # Bounds for the Models API catalog fetch.
@@ -561,7 +564,9 @@ def api_update_project_info(project):  # noqa: F401
         update_dict["reassign_stale"] = update_dict["reassign_stale"] == "true"
 
     if "allow_member_replace" in update_dict:
-        update_dict["allow_member_replace"] = update_dict["allow_member_replace"] == "true"
+        update_dict["allow_member_replace"] = (
+            update_dict["allow_member_replace"] == "true"
+        )
 
     project.update_config(**update_dict)
 
@@ -889,9 +894,7 @@ def _parse_labeled_query(project):
     has_note = parsed_filters.get("has_note")
 
     user_filters = {
-        k[len("user_") :]: v
-        for k, v in parsed_filters.items()
-        if k.startswith("user_")
+        k[len("user_") :]: v for k, v in parsed_filters.items() if k.startswith("user_")
     }
     include_users = {int(uid) for uid, want in user_filters.items() if want}
     exclude_users = {int(uid) for uid, want in user_filters.items() if not want}
@@ -1170,9 +1173,7 @@ def api_get_labeled(project):  # noqa: F401
     users = _users_map(project)
 
     with project.db as db:
-        batch_size = (
-            (per_page + 1) if not q["post_scan"] else max(per_page + 1, 500)
-        )
+        batch_size = (per_page + 1) if not q["post_scan"] else max(per_page + 1, 500)
         matched = []
         has_next = False
         for state, key in _iter_labeled_matches(db, q, cursor, batch_size):
@@ -2430,17 +2431,27 @@ def api_label_record(project, record_id):  # noqa: F401
     with project.db as db:
         if request.method == "POST":
             status = db.get_result_status(record_id)
-            if (status is not None and status["label"] is not None
-                    and status["user_id"] != user_id):
+            if (
+                status is not None
+                and status["label"] is not None
+                and status["user_id"] != user_id
+            ):
                 logging.warning(
                     "Discarding late label for record %s from user %s "
                     "(already decided by user %s)",
-                    record_id, user_id, status["user_id"])
-                return jsonify({
-                    "discarded": True,
-                    "message": ("This article was reassigned and has already been "
-                                "decided; your input was not saved."),
-                }), 200
+                    record_id,
+                    user_id,
+                    status["user_id"],
+                )
+                return jsonify(
+                    {
+                        "discarded": True,
+                        "message": (
+                            "This article was reassigned and has already been "
+                            "decided; your input was not saved."
+                        ),
+                    }
+                ), 200
 
         if request.method == "PUT":
             db.update_result(record_id, label=label, tags=tags, user_id=user_id)
@@ -2472,15 +2483,13 @@ def api_label_record(project, record_id):  # noqa: F401
         return jsonify({"result": row})
 
 
-@bp.route("/projects/<project_id>/record/<record_id>/heartbeat",
-          methods=["POST"])
+@bp.route("/projects/<project_id>/record/<record_id>/heartbeat", methods=["POST"])
 @login_required
 @project_authorization
 def api_record_heartbeat(project, record_id):  # noqa: F401
     """Liveness ping for an open record. Returns {"active": bool}."""
     user_id = (
-        current_user.id
-        if current_app.config.get("AUTHENTICATION", True) else None
+        current_user.id if current_app.config.get("AUTHENTICATION", True) else None
     )
     with project.db as db:
         active = db.touch_last_active(int(record_id), user_id)
@@ -2536,9 +2545,7 @@ def api_get_record_attachment(project, record_id):  # noqa: F401
             return abort(404)
 
         try:
-            value = refresh_attachment(
-                db, config, record, DEFAULT_RECHECK_INTERVAL
-            )
+            value = refresh_attachment(db, config, record, DEFAULT_RECHECK_INTERVAL)
         except ZoteroLookupError:
             # Transient failure: nothing cached, retried on the next request.
             value = record.attachment
@@ -2612,10 +2619,12 @@ def api_upload_pdf(project, record_id):  # noqa: F401
         if llm_on:
             db.force_requeue(record_id, prompt_hash)
 
-    return jsonify({
-        "attachment_key": attachment_key,
-        "url": build_reader_url(config, original_id, attachment_key),
-    })
+    return jsonify(
+        {
+            "attachment_key": attachment_key,
+            "url": build_reader_url(config, original_id, attachment_key),
+        }
+    )
 
 
 @bp.route("/projects/<project_id>/record/<record_id>/pdf", methods=["DELETE"])
@@ -2638,7 +2647,9 @@ def api_delete_record_pdf(project, record_id):  # noqa: F401
         if project_db is None:
             return jsonify({"message": "Project not found"}), 404
         if not current_user.is_admin and project_db.owner_id != current_user.id:
-            return jsonify({"message": "Only the project owner can delete PDF attachments"}), 403
+            return jsonify(
+                {"message": "Only the project owner can delete PDF attachments"}
+            ), 403
 
     config = get_zotero_config(project.project_path)
     if not config.enabled:
@@ -2657,9 +2668,9 @@ def api_delete_record_pdf(project, record_id):  # noqa: F401
         # deleting the file out from under an active call would waste it.
         meta = db.get_llm_meta(record_id, _current_prompt_hash(project))
         if meta and meta.get("status") == "in_flight":
-            return jsonify({
-                "message": "Cannot delete PDF while LLM screening is in progress"
-            }), 409
+            return jsonify(
+                {"message": "Cannot delete PDF while LLM screening is in progress"}
+            ), 409
 
     # Zotero I/O outside the SQLite transaction
     try:
@@ -2732,9 +2743,9 @@ def api_replace_record_pdf(project, record_id):  # noqa: F401
 
         meta = db.get_llm_meta(record_id, _current_prompt_hash(project))
         if meta and meta.get("status") == "in_flight":
-            return jsonify({
-                "message": "Cannot replace PDF while LLM screening is in progress"
-            }), 409
+            return jsonify(
+                {"message": "Cannot replace PDF while LLM screening is in progress"}
+            ), 409
 
     # Upload the new PDF first so we never lose the record's PDF reference.
     tmp_path = None
@@ -2763,7 +2774,8 @@ def api_replace_record_pdf(project, record_id):  # noqa: F401
         except ZoteroDeleteError as err:
             logging.warning(
                 "Failed to delete old attachment %s during replace: %s",
-                old_attachment_key, err,
+                old_attachment_key,
+                err,
             )
 
     # Local cleanup — store new key, clear stale results, re-queue.
@@ -2784,10 +2796,12 @@ def api_replace_record_pdf(project, record_id):  # noqa: F401
         project.project_id,
     )
 
-    return jsonify({
-        "attachment_key": new_attachment_key,
-        "url": build_reader_url(config, original_id, new_attachment_key),
-    })
+    return jsonify(
+        {
+            "attachment_key": new_attachment_key,
+            "url": build_reader_url(config, original_id, new_attachment_key),
+        }
+    )
 
 
 @bp.route("/projects/<project_id>/get_record", methods=["GET"])
@@ -2813,11 +2827,11 @@ def api_get_record(project):  # noqa: F401
             db.top_up_dispatch(settings["buffer_size"], prompt_hash)
         pending = db.get_pending(user_id=user_id)
         if pending.empty and stale_timeout:
-            pending = db.reassign_stale(
-                user_id=user_id, older_than=stale_timeout)
+            pending = db.reassign_stale(user_id=user_id, older_than=stale_timeout)
         if pending.empty and llm_on:
             pending = db.checkout_oldest_dispatched(
-                user_id=user_id, stale_timeout=stale_timeout or None)
+                user_id=user_id, stale_timeout=stale_timeout or None
+            )
         if pending.empty:
             try:
                 pending = db.query_top_ranked(user_id=user_id)
@@ -2849,8 +2863,7 @@ def api_get_record(project):  # noqa: F401
                 and payload_json is None
             ):
                 count = db.requeue_for_prompt_change(prompt_hash)
-                logging.info(
-                    "Prompt change detected — re-queued %d records.", count)
+                logging.info("Prompt change detected — re-queued %d records.", count)
                 llm_meta["status"] = "queued"
 
     item["state"] = pending.iloc[0].to_dict()
@@ -2872,16 +2885,22 @@ def api_get_record(project):  # noqa: F401
     if payload_json and not has_tags and not record_lists:
         try:
             prefill = build_prefill_state(
-                json.loads(payload_json), tags_form, item["lists_form"],
-                uuid_fn=lambda: uuid7())
+                json.loads(payload_json),
+                tags_form,
+                item["lists_form"],
+                uuid_fn=lambda: uuid7(),
+            )
             item["state"]["tags"] = prefill["tags"]
             item["state"]["lists"] = prefill["lists"]
         except Exception:
             logging.exception("LLM pre-fill failed for record %s", record_id)
 
     if llm_on and (llm_meta is None or llm_meta.get("status") != "ready"):
-        logging.info("llm buffer-miss: served record %s with status=%s",
-                     record_id, (llm_meta or {}).get("status"))
+        logging.info(
+            "llm buffer-miss: served record %s with status=%s",
+            record_id,
+            (llm_meta or {}).get("status"),
+        )
 
     try:
         item["error"] = project.get_review_error()
@@ -2903,8 +2922,7 @@ def api_get_record_llm(project, record_id):  # noqa: F401
     return jsonify(meta)
 
 
-@bp.route("/projects/<project_id>/record/<record_id>/reprocess",
-          methods=["POST"])
+@bp.route("/projects/<project_id>/record/<record_id>/reprocess", methods=["POST"])
 @login_required
 @project_authorization
 def api_reprocess_record(project, record_id):  # noqa: F401
@@ -2916,8 +2934,7 @@ def api_reprocess_record(project, record_id):  # noqa: F401
     return jsonify({"success": True})
 
 
-@bp.route("/projects/<project_id>/record/<record_id>/apply_llm",
-          methods=["POST"])
+@bp.route("/projects/<project_id>/record/<record_id>/apply_llm", methods=["POST"])
 @login_required
 @project_authorization
 def api_apply_llm(project, record_id):  # noqa: F401
@@ -2933,8 +2950,8 @@ def api_apply_llm(project, record_id):  # noqa: F401
     tags_form = read_tags_data(project.db) or []
     lists_form = read_lists_data(project)
     prefill = build_prefill_state(
-        json.loads(payload_json), tags_form, lists_form,
-        uuid_fn=lambda: uuid7())
+        json.loads(payload_json), tags_form, lists_form, uuid_fn=lambda: uuid7()
+    )
     return jsonify({"tags": prefill["tags"], "lists": prefill["lists"]})
 
 
@@ -2969,8 +2986,7 @@ def api_list_llm_models(project):  # noqa: F401
     else:
         api_key = _llm_settings(project).get("api_key")
     catalog = _fetch_llm_models(api_key)
-    return jsonify({"models": catalog if catalog is not None
-                    else FALLBACK_LLM_MODELS})
+    return jsonify({"models": catalog if catalog is not None else FALLBACK_LLM_MODELS})
 
 
 @bp.route("/projects/<project_id>/llm_settings", methods=["PUT"])
@@ -2979,8 +2995,7 @@ def api_list_llm_models(project):  # noqa: F401
 def api_update_llm_settings(project):  # noqa: F401
     body = request.get_json(silent=True) or {}
     current = _llm_settings(project)
-    merged = {**current, **{k: body[k] for k in DEFAULT_LLM_SETTINGS
-                            if k in body}}
+    merged = {**current, **{k: body[k] for k in DEFAULT_LLM_SETTINGS if k in body}}
     merged["buffer_size"] = max(1, int(merged["buffer_size"]))
     merged["max_concurrent_llm"] = max(1, int(merged["max_concurrent_llm"]))
     merged["criteria_text"] = str(merged["criteria_text"])
@@ -2992,8 +3007,7 @@ def api_update_llm_settings(project):  # noqa: F401
     merged["model"] = str(merged.get("model") or "").strip()
     if "model" in body:
         catalog = _fetch_llm_models(merged.get("api_key"))
-        if catalog is not None and \
-                merged["model"] not in {m["id"] for m in catalog}:
+        if catalog is not None and merged["model"] not in {m["id"] for m in catalog}:
             return jsonify({"message": f"Unknown LLM model: {merged['model']}"}), 400
     model_changed = merged["model"] != current["model"]
     old_hash = _current_prompt_hash(project) if _llm_enabled(project) else None

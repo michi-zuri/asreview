@@ -68,12 +68,15 @@ def test_happy_path(db, tmp_path):
     pdf.write_bytes(b"%PDF-1.7")
     resolver = FakeResolver(pdf)
     client = mock.MagicMock()
-    client.messages.create.return_value = make_response(
-        '{"labels":[],"lists":[]}'
-    )
+    client.messages.create.return_value = make_response('{"labels":[],"lists":[]}')
 
     result = llm_worker.screen_record(
-        db, resolver, client, fake_record(), "prompt text", "H",
+        db,
+        resolver,
+        client,
+        fake_record(),
+        "prompt text",
+        "H",
         "claude-opus-4-8",
     )
 
@@ -96,22 +99,24 @@ def test_user_message_sends_title_and_abstract(tmp_path):
     the system prompt stays record-independent."""
     with asr.Database(Path(tmp_path, "t2.db")) as db:
         db.create_tables()
-        db.input.add_records([
-            Record(0, "d", title="Effects of X on Y",
-                   abstract="We studied X.")
-        ])
+        db.input.add_records(
+            [Record(0, "d", title="Effects of X on Y", abstract="We studied X.")]
+        )
         db.add_last_ranking([0], "nb", "max", "balanced", "tfidf", 0)
         db.top_up_dispatch(1, "H")
         pdf = tmp_path / "x.pdf"
         pdf.write_bytes(b"%PDF-1.7")
         resolver = FakeResolver(pdf)
         client = mock.MagicMock()
-        client.messages.create.return_value = make_response(
-            '{"labels":[],"lists":[]}'
-        )
+        client.messages.create.return_value = make_response('{"labels":[],"lists":[]}')
 
         result = llm_worker.screen_record(
-            db, resolver, client, fake_record(), "prompt text", "H",
+            db,
+            resolver,
+            client,
+            fake_record(),
+            "prompt text",
+            "H",
             "claude-opus-4-8",
         )
 
@@ -137,15 +142,20 @@ def test_pdf_mismatch_payload_stored(db, tmp_path):
     )
 
     result = llm_worker.screen_record(
-        db, resolver, client, fake_record(), "prompt", "H", "claude-opus-4-8",
+        db,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
+        "claude-opus-4-8",
     )
 
     assert result == "ready"
     row = _llm_result(db, 0, "H")
     assert row is not None
     stored = json.loads(row[0])
-    assert stored["pdf_match"] == {
-        "plausible": False, "issue": "PDF is about Z"}
+    assert stored["pdf_match"] == {"plausible": False, "issue": "PDF is about Z"}
     assert stored["labels"] == []
     assert stored["lists"] == []
 
@@ -156,12 +166,16 @@ def test_fenced_json_tolerated(db, tmp_path):
     pdf.write_bytes(b"%PDF-1.7")
     resolver = FakeResolver(pdf)
     client = mock.MagicMock()
-    client.messages.create.return_value = make_response(
-        '```json\n{"labels":[]}\n```'
-    )
+    client.messages.create.return_value = make_response('```json\n{"labels":[]}\n```')
 
     result = llm_worker.screen_record(
-        db, resolver, client, fake_record(), "prompt", "H", "claude-opus-4-8",
+        db,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
+        "claude-opus-4-8",
     )
 
     assert result == "ready"
@@ -183,7 +197,13 @@ def test_repair_path(db, tmp_path):
     ]
 
     result = llm_worker.screen_record(
-        db, resolver, client, fake_record(), "prompt", "H", "claude-opus-4-8",
+        db,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
+        "claude-opus-4-8",
     )
 
     assert result == "ready"
@@ -206,7 +226,13 @@ def test_unrepairable(db, tmp_path):
     ]
 
     result = llm_worker.screen_record(
-        db, resolver, client, fake_record(), "prompt", "H", "claude-opus-4-8",
+        db,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
+        "claude-opus-4-8",
     )
 
     assert result == "failed"
@@ -227,7 +253,13 @@ def test_missing_pdf_no_key(db, tmp_path):
     client = mock.MagicMock()
 
     result = llm_worker.screen_record(
-        db, resolver, client, fake_record(), "prompt", "H", "claude-opus-4-8",
+        db,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
+        "claude-opus-4-8",
     )
 
     assert result == "missing_pdf"
@@ -249,7 +281,13 @@ def test_download_failure(db, tmp_path):
     client = mock.MagicMock()
 
     result = llm_worker.screen_record(
-        db, resolver, client, fake_record(), "prompt", "H", "claude-opus-4-8",
+        db,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
+        "claude-opus-4-8",
     )
 
     assert result == "missing_pdf"
@@ -268,7 +306,12 @@ def test_transient_propagates(db, tmp_path):
 
     with pytest.raises(RuntimeError, match="429"):
         llm_worker.screen_record(
-            db, resolver, client, fake_record(), "prompt", "H",
+            db,
+            resolver,
+            client,
+            fake_record(),
+            "prompt",
+            "H",
             "claude-opus-4-8",
         )
 
@@ -308,7 +351,12 @@ def test_retry_transient_then_success(tmp_path):
     ]
 
     status = llm_worker.process_with_retry(
-        db, resolver, client, fake_record(), "prompt", "H",
+        db,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
         "claude-opus-4-8",
         is_transient=lambda e: isinstance(e, Transient),
         sleep=lambda s: None,
@@ -330,8 +378,14 @@ def test_retry_give_up_after_max(db, tmp_path):
     client.messages.create.side_effect = Transient()
 
     status = llm_worker.process_with_retry(
-        db2, resolver, client, fake_record(), "prompt", "H",
-        "claude-opus-4-8", max_attempts=3,
+        db2,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
+        "claude-opus-4-8",
+        max_attempts=3,
         is_transient=lambda e: isinstance(e, Transient),
         sleep=lambda s: None,
         jitter=lambda: 0.0,
@@ -349,7 +403,12 @@ def test_retry_non_transient(db, tmp_path):
     client.messages.create.side_effect = ValueError("boom")
 
     status = llm_worker.process_with_retry(
-        db2, resolver, client, fake_record(), "prompt", "H",
+        db2,
+        resolver,
+        client,
+        fake_record(),
+        "prompt",
+        "H",
         "claude-opus-4-8",
         sleep=lambda s: None,
         jitter=lambda: 0.0,
@@ -364,8 +423,8 @@ def _dispatch_status_full(db, record_id):
     """Return (status, last_error, attempts) from llm_dispatch."""
     cur = db._conn.cursor()
     return cur.execute(
-        "SELECT status, last_error, attempts FROM llm_dispatch "
-        "WHERE record_id = ?", (record_id,),
+        "SELECT status, last_error, attempts FROM llm_dispatch WHERE record_id = ?",
+        (record_id,),
     ).fetchone()
 
 
@@ -381,13 +440,18 @@ def test_run_worker_once(tmp_path, monkeypatch):
     proj.update_config(llm={"api_key": "sk-ant-test"})
     pdf = tmp_path / "x.pdf"
     pdf.write_bytes(b"%PDF-1.7")
-    client = types.SimpleNamespace(messages=types.SimpleNamespace(
-        create=mock.Mock(return_value=make_response('{"labels":[],"lists":[]}'))))
-    monkeypatch.setattr(llm_worker.anthropic, "Anthropic",
-                        mock.Mock(return_value=client))
+    client = types.SimpleNamespace(
+        messages=types.SimpleNamespace(
+            create=mock.Mock(return_value=make_response('{"labels":[],"lists":[]}'))
+        )
+    )
+    monkeypatch.setattr(
+        llm_worker.anthropic, "Anthropic", mock.Mock(return_value=client)
+    )
 
     n = llm_worker.run_worker_once(
-        proj, max_concurrent=1, resolver_factory=lambda: FakeResolver(pdf))
+        proj, max_concurrent=1, resolver_factory=lambda: FakeResolver(pdf)
+    )
 
     assert n == 3
     cur = proj.db._conn.cursor()
@@ -397,18 +461,14 @@ def test_run_worker_once(tmp_path, monkeypatch):
     for rid, status in rows:
         assert status == "ready", f"record {rid} status is {status}"
 
-    result_count = cur.execute(
-        "SELECT COUNT(*) FROM llm_results"
-    ).fetchone()[0]
+    result_count = cur.execute("SELECT COUNT(*) FROM llm_results").fetchone()[0]
     assert result_count == 3
 
 
 def test_worker_client_pins_anthropic_endpoint(tmp_path, monkeypatch):
     """The worker client passes an explicit base_url, so ANTHROPIC_BASE_URL /
     ANTHROPIC_AUTH_TOKEN from the environment cannot reroute it."""
-    monkeypatch.setenv(
-        "ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"
-    )
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "deepseek-token")
     proj = asr.Project.create(Path(tmp_path, "proj"))
     proj.update_config(llm={"api_key": "sk-ant-test"})
@@ -471,7 +531,9 @@ def test_run_worker_all_drains_all(tmp_path, monkeypatch):
     )
 
     total = llm_worker.run_worker_all(
-        model="claude-opus-4-6", executor=None, max_concurrent=1,
+        model="claude-opus-4-6",
+        executor=None,
+        max_concurrent=1,
     )
 
     assert total == 4
@@ -499,7 +561,9 @@ def test_run_worker_all_bad_project_skipped(tmp_path, monkeypatch):
     )
 
     total = llm_worker.run_worker_all(
-        model="claude-opus-4-6", executor=None, max_concurrent=1,
+        model="claude-opus-4-6",
+        executor=None,
+        max_concurrent=1,
     )
 
     assert total == 4
@@ -513,27 +577,29 @@ def test_run_worker_all_bad_project_skipped(tmp_path, monkeypatch):
 def test_worker_uses_project_model(tmp_path, monkeypatch):
     """The worker screens with the project's configured model."""
     proj = asr.Project.create(Path(tmp_path, "proj"))
-    proj.update_config(llm={
-        "api_key": "sk-ant-test", "model": "claude-sonnet-4-6"})
+    proj.update_config(llm={"api_key": "sk-ant-test", "model": "claude-sonnet-4-6"})
     proj.db.input.add_records([Record(0, "d")])
     proj.db.add_last_ranking([0], "nb", "max", "balanced", "tfidf", 0)
     proj.db.top_up_dispatch(1, "H")
     pdf = tmp_path / "x.pdf"
     pdf.write_bytes(b"%PDF-1.7")
-    client = types.SimpleNamespace(messages=types.SimpleNamespace(
-        create=mock.Mock(return_value=make_response('{"labels":[],"lists":[]}'))))
-    monkeypatch.setattr(llm_worker.anthropic, "Anthropic",
-                        mock.Mock(return_value=client))
+    client = types.SimpleNamespace(
+        messages=types.SimpleNamespace(
+            create=mock.Mock(return_value=make_response('{"labels":[],"lists":[]}'))
+        )
+    )
+    monkeypatch.setattr(
+        llm_worker.anthropic, "Anthropic", mock.Mock(return_value=client)
+    )
 
     n = llm_worker.run_worker_once(
-        proj, max_concurrent=1, resolver_factory=lambda: FakeResolver(pdf))
+        proj, max_concurrent=1, resolver_factory=lambda: FakeResolver(pdf)
+    )
 
     assert n == 1
     kwargs = client.messages.create.call_args.kwargs
     assert kwargs["model"] == "claude-sonnet-4-6"
     # The stored result row records the same model.
     cur = proj.db._conn.cursor()
-    row = cur.execute(
-        "SELECT model FROM llm_results WHERE record_id = 0"
-    ).fetchone()
+    row = cur.execute("SELECT model FROM llm_results WHERE record_id = 0").fetchone()
     assert row[0] == "claude-sonnet-4-6"

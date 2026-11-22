@@ -1,6 +1,7 @@
 import json
 import logging
 import shutil
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -12,6 +13,18 @@ from asreview.project.migration.v3v4 import _validate as _validate_v3v4
 
 
 __all__ = ["detect_version", "migrate_project"]
+
+
+def is_fork_database(db_fp):
+    """Return True if the database at ``db_fp`` carries the asmr mark."""
+    from asreview.database.fork_migrations import FORK_APPLICATION_ID
+
+    conn = sqlite3.connect(f"file:{db_fp}?mode=ro", uri=True)
+    try:
+        app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+    finally:
+        conn.close()
+    return app_id == FORK_APPLICATION_ID
 
 
 def detect_version(project_config):

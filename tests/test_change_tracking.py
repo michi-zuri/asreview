@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 import asreview as asr
+from asreview.database.database import ForeignDatabaseError
+from asreview.database.fork_migrations import FORK_APPLICATION_ID
 
 
 @pytest.fixture
@@ -15,19 +17,26 @@ def db(tmpdir):
 
 
 def _make_legacy_db(tmpdir):
-    """Build a valid database and drop the fork tables, simulating pre-fork."""
+    """Build a marked database missing the 0001 change-tracking revision.
+
+    The mark, the 0000 baseline ledger row and the v4 schema are kept; only
+    the 0001 tables and ledger row are stripped, modelling a fork database
+    from before 0001_change_tracking was introduced.
+    """
     path = Path(tmpdir, "test.db")
     with asr.Database(path) as db:
         db.create_tables()
     with sqlite3.connect(str(path)) as conn:
         cur = conn.cursor()
         for table in [
-            "fork_migrations",
             "project_state",
             "record_versions",
             "change_log",
         ]:
             cur.execute(f"DROP TABLE {table}")
+        cur.execute(
+            "DELETE FROM fork_migrations WHERE revision = '0001_change_tracking'"
+        )
         conn.commit()
     return path
 
@@ -39,11 +48,18 @@ def _table_names(conn):
     }
 
 
+def _ledger(conn):
+    return {row[0] for row in conn.execute("SELECT revision FROM fork_migrations")}
+
+
+def _application_id(path):
+    with sqlite3.connect(str(path)) as conn:
+        return conn.execute("PRAGMA application_id").fetchone()[0]
+
+
 def test_ledger_applied_on_create(db, tmpdir):
     cur = db._conn.cursor()
-    assert cur.execute("SELECT revision FROM fork_migrations").fetchall() == [
-        ("0001_change_tracking",)
-    ]
+    assert _ledger(db._conn) == {"0000_tags_tables", "0001_change_tracking"}
     assert cur.execute(
         "SELECT project_id, version, config_version FROM project_state"
     ).fetchall() == [(Path(tmpdir).name, 0, 0)]
@@ -60,9 +76,7 @@ def test_ledger_idempotent_on_reopen(tmpdir):
 
     with sqlite3.connect(str(path)) as conn:
         cur = conn.cursor()
-        assert cur.execute("SELECT revision FROM fork_migrations").fetchall() == [
-            ("0001_change_tracking",)
-        ]
+        assert _ledger(conn) == {"0000_tags_tables", "0001_change_tracking"}
         assert cur.execute("SELECT COUNT(*) FROM project_state").fetchone()[0] == 1
 
 
@@ -73,10 +87,7 @@ def test_ledger_applied_on_legacy_open(tmpdir):
         pass
 
     with sqlite3.connect(str(path)) as conn:
-        cur = conn.cursor()
-        assert cur.execute("SELECT revision FROM fork_migrations").fetchall() == [
-            ("0001_change_tracking",)
-        ]
+        assert _ledger(conn) == {"0000_tags_tables", "0001_change_tracking"}
         assert {
             "project_state",
             "record_versions",
@@ -107,7 +118,7 @@ def test_ledger_concurrent_openers(tmpdir):
 
     with sqlite3.connect(str(path)) as conn:
         cur = conn.cursor()
-        assert cur.execute("SELECT COUNT(*) FROM fork_migrations").fetchone()[0] == 1
+        assert cur.execute("SELECT COUNT(*) FROM fork_migrations").fetchone()[0] == 2
         assert cur.execute("SELECT COUNT(*) FROM project_state").fetchone()[0] == 1
 
 
@@ -118,13 +129,105 @@ def test_read_only_open_does_not_migrate(tmpdir):
         pass
 
     with sqlite3.connect(str(path)) as conn:
-        assert "fork_migrations" not in _table_names(conn)
+        assert "project_state" not in _table_names(conn)
+        assert _ledger(conn) == {"0000_tags_tables"}
 
 
 def test_in_memory_project_id():
     with asr.Database() as db:
         db.create_tables()
         cur = db._conn.cursor()
-        assert cur.execute(
-            "SELECT project_id FROM project_state"
-        ).fetchone()[0] == "memory"
+        assert (
+            cur.execute("SELECT project_id FROM project_state").fetchone()[0]
+            == "memory"
+        )
+
+
+def test_new_database_is_marked(tmpdir):
+    path = Path(tmpdir, "test.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+
+    assert _application_id(path) == FORK_APPLICATION_ID
+    with sqlite3.connect(str(path)) as conn:
+        assert _ledger(conn) == {"0000_tags_tables", "0001_change_tracking"}
+
+
+def test_unmarked_v4_database_refused(tmpdir):
+    path = Path(tmpdir, "test.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+        db._conn.execute("INSERT INTO results (record_id) VALUES (1)")
+        db._conn.commit()
+
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute("PRAGMA application_id = 0")
+        conn.commit()
+
+    with pytest.raises(ForeignDatabaseError):
+        asr.open_db(path)
+
+    with sqlite3.connect(str(path)) as conn:
+        cur = conn.cursor()
+        assert cur.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert cur.execute("SELECT record_id FROM results").fetchall() == [(1,)]
+
+
+def test_unmarked_v5_database_refused(tmpdir):
+    path = Path(tmpdir, "test.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute("PRAGMA application_id = 0")
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
+
+    with pytest.raises(ForeignDatabaseError):
+        asr.open_db(path)
+
+    with sqlite3.connect(str(path)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+
+
+def test_read_only_open_refuses_unmarked(tmpdir):
+    path = Path(tmpdir, "test.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute("PRAGMA application_id = 0")
+        conn.commit()
+
+    with pytest.raises(ValueError):
+        asr.open_db(path, read_only=True)
+
+
+def test_empty_file_is_created(tmpdir):
+    path = Path(tmpdir, "test.db")
+    path.write_bytes(b"")
+
+    with asr.open_db(path):
+        pass
+
+    assert _application_id(path) == FORK_APPLICATION_ID
+    with sqlite3.connect(str(path)) as conn:
+        assert "results" in _table_names(conn)
+        assert _ledger(conn) == {"0000_tags_tables", "0001_change_tracking"}
+
+
+def test_missing_baseline_row_rolls_back(tmpdir):
+    path = Path(tmpdir, "test.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute("DELETE FROM fork_migrations WHERE revision = '0000_tags_tables'")
+        conn.commit()
+
+    with pytest.raises(RuntimeError):
+        asr.open_db(path)
+
+    with sqlite3.connect(str(path)) as conn:
+        assert _ledger(conn) == {"0001_change_tracking"}
+        assert "tag_options" in _table_names(conn)

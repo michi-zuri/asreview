@@ -41,9 +41,7 @@ def test_download_attachment_file_success():
         assert result == fake_bytes
         mock_get.assert_called_once()
         call_args, call_kwargs = mock_get.call_args
-        assert call_args[0] == (
-            "https://api.zotero.org/groups/123/items/ABCD1234/file"
-        )
+        assert call_args[0] == ("https://api.zotero.org/groups/123/items/ABCD1234/file")
         assert call_kwargs["headers"]["Zotero-API-Key"] == "KEY"
         assert call_kwargs["headers"]["Zotero-API-Version"] == "3"
         assert call_kwargs["timeout"] == 30
@@ -109,9 +107,7 @@ def _fake_fetch(monkeypatch, result):
         calls.append(item_key)
         return result
 
-    monkeypatch.setattr(
-        "asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub
-    )
+    monkeypatch.setattr("asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub)
     return calls
 
 
@@ -208,9 +204,7 @@ def test_refresh_attachment_lookup_error_propagates(monkeypatch):
     def stub(config, item_key):
         raise ZoteroLookupError("boom")
 
-    monkeypatch.setattr(
-        "asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub
-    )
+    monkeypatch.setattr("asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub)
 
     with pytest.raises(ZoteroLookupError):
         refresh_attachment(db, make_config(), record, 300)
@@ -227,9 +221,7 @@ def test_refresh_attachment_race_with_concurrent_upload(monkeypatch):
         record.attachment = "WXYZ9876"
         return None
 
-    monkeypatch.setattr(
-        "asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub
-    )
+    monkeypatch.setattr("asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub)
 
     result = refresh_attachment(db, make_config(), record, 300)
 

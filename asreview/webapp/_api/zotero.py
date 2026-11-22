@@ -86,6 +86,7 @@ class ZoteroDeleteError(Exception):
         super().__init__(message)
         self.status_code = status_code
 
+
 # A Zotero object key is exactly 8 characters from the set [A-Z0-9].
 # See https://www.zotero.org/support/dev/web_api/v3/basics#zotero_web_api_item_typefield_requests
 ZOTERO_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
@@ -270,10 +271,7 @@ def fetch_pdf_attachment_key(config, item_key, timeout=10):
         If the request to Zotero fails (network error, rate limit, invalid response).
         This is distinct from `None`, which means the lookup succeeded but found no PDF.
     """
-    url = (
-        f"{ZOTERO_API_BASE}/groups/{config.group_id}"
-        f"/items/{item_key}/children"
-    )
+    url = f"{ZOTERO_API_BASE}/groups/{config.group_id}/items/{item_key}/children"
     headers = {
         "Zotero-API-Version": ZOTERO_API_VERSION,
         "Zotero-API-Key": config.api_key,
@@ -329,10 +327,7 @@ def download_attachment_file(config, attachment_key, timeout=30):
     ZoteroLookupError
         If the request to Zotero fails (network error, HTTP error, etc.).
     """
-    url = (
-        f"{ZOTERO_API_BASE}/groups/{config.group_id}"
-        f"/items/{attachment_key}/file"
-    )
+    url = f"{ZOTERO_API_BASE}/groups/{config.group_id}/items/{attachment_key}/file"
     headers = {
         "Zotero-API-Version": ZOTERO_API_VERSION,
         "Zotero-API-Key": config.api_key,
@@ -343,9 +338,7 @@ def download_attachment_file(config, attachment_key, timeout=30):
         response.raise_for_status()
         return response.content
     except requests.RequestException as err:
-        logging.warning(
-            f"Failed to download attachment {attachment_key}: {err}"
-        )
+        logging.warning(f"Failed to download attachment {attachment_key}: {err}")
         raise ZoteroLookupError(str(err)) from err
 
 
@@ -372,10 +365,12 @@ def _zotero_upload_handshake(config, attachment_key, name, blob, md5_hex, mtime_
     deduplicates via ``exists``). Raises ``ZoteroUploadError`` on any failure.
     """
     s = requests.Session()
-    s.headers.update({
-        "Zotero-API-Version": ZOTERO_API_VERSION,
-        "Authorization": f"Bearer {config.api_key}",
-    })
+    s.headers.update(
+        {
+            "Zotero-API-Version": ZOTERO_API_VERSION,
+            "Authorization": f"Bearer {config.api_key}",
+        }
+    )
     prefix = f"{ZOTERO_API_BASE}/groups/{config.group_id}"
 
     # Step 2a — request upload authorization
@@ -453,7 +448,9 @@ def _zotero_upload_handshake(config, attachment_key, name, blob, md5_hex, mtime_
     except (requests.RequestException, ValueError, KeyError) as err:
         raise ZoteroUploadError(
             f"Upload verification failed: {err}",
-            status_code=getattr(err.response, "status_code", None) if hasattr(err, "response") else None,
+            status_code=getattr(err.response, "status_code", None)
+            if hasattr(err, "response")
+            else None,
         ) from err
 
     return attachment_key
@@ -496,28 +493,32 @@ def upload_pdf_to_zotero(config, parent_item_key, pdf_path):
     name = pdf_path.name
 
     s = requests.Session()
-    s.headers.update({
-        "Zotero-API-Version": ZOTERO_API_VERSION,
-        "Authorization": f"Bearer {config.api_key}",
-    })
+    s.headers.update(
+        {
+            "Zotero-API-Version": ZOTERO_API_VERSION,
+            "Authorization": f"Bearer {config.api_key}",
+        }
+    )
     api_prefix = f"{ZOTERO_API_BASE}/groups/{config.group_id}"
 
     # Phase 1 — create child attachment item
     try:
         r = s.post(
             f"{api_prefix}/items",
-            json=[{
-                "itemType": "attachment",
-                "linkMode": "imported_file",
-                "parentItem": parent_item_key,
-                "title": "Full Text PDF",
-                "contentType": "application/pdf",
-                "filename": name,
-                "tags": [],
-                "relations": {},
-                "md5": None,
-                "mtime": None,
-            }],
+            json=[
+                {
+                    "itemType": "attachment",
+                    "linkMode": "imported_file",
+                    "parentItem": parent_item_key,
+                    "title": "Full Text PDF",
+                    "contentType": "application/pdf",
+                    "filename": name,
+                    "tags": [],
+                    "relations": {},
+                    "md5": None,
+                    "mtime": None,
+                }
+            ],
             headers={"Zotero-Write-Token": uuid.uuid4().hex},
             timeout=30,
         )
@@ -549,7 +550,9 @@ def upload_pdf_to_zotero(config, parent_item_key, pdf_path):
 
     logging.info(
         "Uploaded PDF '%s' to Zotero parent %s → attachment %s",
-        name, parent_item_key, att_key,
+        name,
+        parent_item_key,
+        att_key,
     )
     return att_key
 
@@ -574,10 +577,12 @@ def delete_pdf(config, attachment_key):
         ``status_code`` attribute for programmatic handling (403, 409, 412).
     """
     s = requests.Session()
-    s.headers.update({
-        "Zotero-API-Version": ZOTERO_API_VERSION,
-        "Authorization": f"Bearer {config.api_key}",
-    })
+    s.headers.update(
+        {
+            "Zotero-API-Version": ZOTERO_API_VERSION,
+            "Authorization": f"Bearer {config.api_key}",
+        }
+    )
     base = f"{ZOTERO_API_BASE}/groups/{config.group_id}/items/{attachment_key}"
 
     for attempt in range(2):
@@ -618,7 +623,9 @@ def delete_pdf(config, attachment_key):
 
         if resp.status_code in (204, 404):
             logging.info(
-                "Deleted Zotero attachment %s (group %s)", attachment_key, config.group_id,
+                "Deleted Zotero attachment %s (group %s)",
+                attachment_key,
+                config.group_id,
             )
             return
 
@@ -631,7 +638,8 @@ def delete_pdf(config, attachment_key):
         )
 
     raise ZoteroDeleteError(
-        "Version conflict persisted after retry", status_code=412,
+        "Version conflict persisted after retry",
+        status_code=412,
     )
 
 
@@ -671,13 +679,9 @@ def validate_zotero_credentials(group_id, api_key, timeout=10):
         response.raise_for_status()
         data = response.json()
     except requests.RequestException as err:
-        raise ZoteroLookupError(
-            f"Could not reach Zotero: {err}"
-        ) from err
+        raise ZoteroLookupError(f"Could not reach Zotero: {err}") from err
     except ValueError as err:
-        raise ZoteroLookupError(
-            f"Invalid Zotero response: {err}"
-        ) from err
+        raise ZoteroLookupError(f"Invalid Zotero response: {err}") from err
 
     name = data.get("data", {}).get("name", "")
     if not name:

@@ -18,17 +18,13 @@ def db(tmp_path):
 def db_pool(db):
     # 6 standalone records (record_id == group_id); rank all of them.
     db.input.add_records([Record(i, "d") for i in range(6)])
-    db.add_last_ranking(
-        [0, 1, 2, 3, 4, 5], "nb", "max", "balanced", "tfidf", 0
-    )
+    db.add_last_ranking([0, 1, 2, 3, 4, 5], "nb", "max", "balanced", "tfidf", 0)
     return db
 
 
 def _tables(db):
     cur = db._conn.cursor()
-    rows = cur.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()
+    rows = cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     return {r[0] for r in rows}
 
 
@@ -40,8 +36,7 @@ def _columns(db, table):
 def _dispatch_rows(db):
     cur = db._conn.cursor()
     return cur.execute(
-        "SELECT record_id, status, prompt_hash FROM llm_dispatch "
-        "ORDER BY dispatched_at"
+        "SELECT record_id, status, prompt_hash FROM llm_dispatch ORDER BY dispatched_at"
     ).fetchall()
 
 
@@ -56,8 +51,12 @@ def test_llm_dispatch_columns(db):
     """llm_dispatch has exactly the expected columns."""
     cols = _columns(db, "llm_dispatch")
     assert cols == [
-        "record_id", "dispatched_at", "status", "prompt_hash",
-        "attempts", "last_error",
+        "record_id",
+        "dispatched_at",
+        "status",
+        "prompt_hash",
+        "attempts",
+        "last_error",
     ]
 
 
@@ -65,8 +64,13 @@ def test_llm_results_columns(db):
     """llm_results has exactly the expected columns."""
     cols = _columns(db, "llm_results")
     assert cols == [
-        "record_id", "prompt_hash", "model", "payload_json",
-        "input_tokens", "output_tokens", "created_at",
+        "record_id",
+        "prompt_hash",
+        "model",
+        "payload_json",
+        "input_tokens",
+        "output_tokens",
+        "created_at",
     ]
 
 
@@ -153,15 +157,15 @@ def test_top_up_grow_buffer(db_pool):
 
 def test_top_up_skips_prior_irrelevant(db):
     """Records with included==0 are skipped."""
-    db.input.add_records([
-        Record(0, "d", included=None),
-        Record(1, "d", included=0),
-        Record(2, "d", included=None),
-        Record(3, "d", included=None),
-    ])
-    db.add_last_ranking(
-        [0, 1, 2, 3], "nb", "max", "balanced", "tfidf", 0
+    db.input.add_records(
+        [
+            Record(0, "d", included=None),
+            Record(1, "d", included=0),
+            Record(2, "d", included=None),
+            Record(3, "d", included=None),
+        ]
     )
+    db.add_last_ranking([0, 1, 2, 3], "nb", "max", "balanced", "tfidf", 0)
     n = db.top_up_dispatch(10, "H")
     assert n == 3
     dispatched = [r[0] for r in _dispatch_rows(db)]
@@ -193,9 +197,7 @@ def test_top_up_checked_out_not_re_dispatched(db_pool):
     """Checked-out but unlabeled records stay in the buffer; no top-up needed."""
     db_pool.top_up_dispatch(3, "H")
     cur = db_pool._conn.cursor()
-    cur.execute(
-        "INSERT INTO results(record_id, user_id) VALUES (0, 1)"
-    )
+    cur.execute("INSERT INTO results(record_id, user_id) VALUES (0, 1)")
     db_pool._conn.commit()
 
     # Record 0 is checked out but still unlabeled, so it counts as active.
@@ -261,8 +263,8 @@ def test_checkout_nothing_available(db_pool):
 def _dispatch_status(db, record_id):
     cur = db._conn.cursor()
     r = cur.execute(
-        "SELECT status, last_error, attempts FROM llm_dispatch "
-        "WHERE record_id = ?", (record_id,)
+        "SELECT status, last_error, attempts FROM llm_dispatch WHERE record_id = ?",
+        (record_id,),
     ).fetchone()
     return r  # (status, last_error, attempts)
 
@@ -500,14 +502,16 @@ def test_get_llm_meta_pdf_match(db_pool):
     db_pool.top_up_dispatch(3, "H")
     db_pool.claim_next_queued_dispatch()
     db_pool.store_llm_result(
-        0, "H", "claude-opus-4-8",
+        0,
+        "H",
+        "claude-opus-4-8",
         '{"pdf_match": {"plausible": false, "issue": "PDF is about Z"},'
         ' "labels": [], "lists": []}',
-        10, 20,
+        10,
+        20,
     )
     meta = db_pool.get_llm_meta(0, "H")
-    assert meta["pdf_match"] == {
-        "plausible": False, "issue": "PDF is about Z"}
+    assert meta["pdf_match"] == {"plausible": False, "issue": "PDF is about Z"}
 
 
 def test_get_llm_meta_pdf_match_missing(db_pool):
@@ -663,7 +667,8 @@ def test_requeue_for_prompt_change_preserves_order(db_pool):
     db_pool.requeue_for_prompt_change("B")
     cur = db_pool._conn.cursor()
     times = [
-        r[0] for r in cur.execute(
+        r[0]
+        for r in cur.execute(
             "SELECT dispatched_at FROM llm_dispatch ORDER BY dispatched_at"
         ).fetchall()
     ]

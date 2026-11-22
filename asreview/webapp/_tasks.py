@@ -99,8 +99,11 @@ def run_model(project):
     n_labeled = len(labeled)
 
     _write_progress(
-        project, "loading", "Loading model configuration...",
-        n_records=n_records, n_labeled=n_labeled,
+        project,
+        "loading",
+        "Loading model configuration...",
+        n_records=n_records,
+        n_labeled=n_labeled,
     )
 
     try:
@@ -113,23 +116,29 @@ def run_model(project):
                     cycle_data, skip_feature_extraction=True
                 )
                 _write_progress(
-                    project, "feature_extraction",
+                    project,
+                    "feature_extraction",
                     "Feature matrix loaded from cache",
-                    n_records=n_records, n_labeled=n_labeled,
+                    n_records=n_records,
+                    n_labeled=n_labeled,
                 )
             except ValueError:
                 _write_progress(
-                    project, "feature_extraction",
+                    project,
+                    "feature_extraction",
                     "Extracting features...",
-                    n_records=n_records, n_labeled=n_labeled,
+                    n_records=n_records,
+                    n_labeled=n_labeled,
                 )
                 cycle = asr.ActiveLearningCycle.from_meta(cycle_data)
                 fm = cycle.transform(project.db.input.get_df())
                 project.add_feature_matrix(fm, cycle.feature_extractor.name)
                 _write_progress(
-                    project, "feature_extraction",
+                    project,
+                    "feature_extraction",
                     "Feature extraction complete",
-                    n_records=n_records, n_labeled=n_labeled,
+                    n_records=n_records,
+                    n_labeled=n_labeled,
                 )
         else:
             cycle = asr.ActiveLearningCycle.from_meta(cycle_data)
@@ -137,31 +146,39 @@ def run_model(project):
 
         if cycle.classifier is not None:
             _write_progress(
-                project, "fitting",
+                project,
+                "fitting",
                 "Training classifier...",
-                n_records=n_records, n_labeled=n_labeled,
+                n_records=n_records,
+                n_labeled=n_labeled,
             )
             cycle.fit(
                 fm[labeled["record_id"].values],
                 labeled["label"].values,
             )
             _write_progress(
-                project, "fitting",
+                project,
+                "fitting",
                 "Classifier training complete",
-                n_records=n_records, n_labeled=n_labeled,
+                n_records=n_records,
+                n_labeled=n_labeled,
             )
 
         _write_progress(
-            project, "ranking",
+            project,
+            "ranking",
             "Ranking records...",
-            n_records=n_records, n_labeled=n_labeled,
+            n_records=n_records,
+            n_labeled=n_labeled,
         )
         ranked_record_ids = cycle.rank(fm)
 
         _write_progress(
-            project, "saving",
+            project,
+            "saving",
             "Saving results...",
-            n_records=n_records, n_labeled=n_labeled,
+            n_records=n_records,
+            n_labeled=n_labeled,
         )
         with project.db as db:
             db.add_last_ranking(
@@ -180,8 +197,11 @@ def run_model(project):
 
     except Exception as err:
         _write_progress(
-            project, "error", str(err),
-            n_records=n_records, n_labeled=n_labeled,
+            project,
+            "error",
+            str(err),
+            n_records=n_records,
+            n_labeled=n_labeled,
         )
         project.set_review_error(err)
         raise err

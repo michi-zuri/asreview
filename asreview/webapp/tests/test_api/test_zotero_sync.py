@@ -20,9 +20,7 @@ def _fake_fetch(monkeypatch, results):
         fetched.append(item_key)
         return results.get(item_key)
 
-    monkeypatch.setattr(
-        "asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub
-    )
+    monkeypatch.setattr("asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub)
     return fetched
 
 
@@ -51,25 +49,29 @@ def test_sync_db_attachments_24h_window(tmp_path, monkeypatch):
     now = datetime.now(timezone.utc)
     with asr.Database(Path(tmp_path, "t.db")) as db:
         db.create_tables()
-        db.input.add_records([
-            Record(0, "d", original_id="ITEMA001"),
-            Record(
-                1, "d", original_id="ITEMB002",
-                attachment=(now - timedelta(hours=25)).isoformat(),
-            ),
-            Record(
-                2, "d", original_id="ITEMC003",
-                attachment=(now - timedelta(hours=1)).isoformat(),
-            ),
-        ])
+        db.input.add_records(
+            [
+                Record(0, "d", original_id="ITEMA001"),
+                Record(
+                    1,
+                    "d",
+                    original_id="ITEMB002",
+                    attachment=(now - timedelta(hours=25)).isoformat(),
+                ),
+                Record(
+                    2,
+                    "d",
+                    original_id="ITEMC003",
+                    attachment=(now - timedelta(hours=1)).isoformat(),
+                ),
+            ]
+        )
 
         fetched = _fake_fetch(monkeypatch, {"ITEMA001": "ABCD1234"})
         sleeps = []
 
         config = ZoteroConfig("1", None, "K", 300)
-        n = zotero_sync.sync_db_attachments(
-            db, config, delay=1.0, sleep=sleeps.append
-        )
+        n = zotero_sync.sync_db_attachments(db, config, delay=1.0, sleep=sleeps.append)
 
         assert n == 2
         assert fetched == ["ITEMA001", "ITEMB002"]
@@ -78,18 +80,14 @@ def test_sync_db_attachments_24h_window(tmp_path, monkeypatch):
         assert db.input.get_records(0).attachment == "ABCD1234"
 
         rec1 = db.input.get_records(1)
-        assert datetime.fromisoformat(rec1.attachment) > (
-            now - timedelta(minutes=1)
-        )
+        assert datetime.fromisoformat(rec1.attachment) > (now - timedelta(minutes=1))
 
-        assert db.input.get_records(2).attachment == (
-            now - timedelta(hours=1)
-        ).isoformat()
+        assert (
+            db.input.get_records(2).attachment == (now - timedelta(hours=1)).isoformat()
+        )
 
         # Nothing is due any more: the second pass performs no lookups.
-        n = zotero_sync.sync_db_attachments(
-            db, config, delay=1.0, sleep=sleeps.append
-        )
+        n = zotero_sync.sync_db_attachments(db, config, delay=1.0, sleep=sleeps.append)
         assert n == 0
         assert fetched == ["ITEMA001", "ITEMB002"]
 
@@ -108,10 +106,12 @@ def test_sync_db_attachments_stops_on_lookup_error(tmp_path, monkeypatch):
     """A ZoteroLookupError stops the pass after one fetch; nothing written."""
     with asr.Database(Path(tmp_path, "t.db")) as db:
         db.create_tables()
-        db.input.add_records([
-            Record(0, "d", original_id="ITEMA001"),
-            Record(1, "d", original_id="ITEMB002"),
-        ])
+        db.input.add_records(
+            [
+                Record(0, "d", original_id="ITEMA001"),
+                Record(1, "d", original_id="ITEMB002"),
+            ]
+        )
 
         fetched = []
 
@@ -124,8 +124,10 @@ def test_sync_db_attachments_stops_on_lookup_error(tmp_path, monkeypatch):
         )
 
         n = zotero_sync.sync_db_attachments(
-            db, ZoteroConfig("1", None, "K", 300),
-            delay=1.0, sleep=lambda s: None,
+            db,
+            ZoteroConfig("1", None, "K", 300),
+            delay=1.0,
+            sleep=lambda s: None,
         )
 
         assert n == 0
@@ -145,11 +147,13 @@ def test_sync_clears_missing_pdf_rows(tmp_path, monkeypatch):
     """A found PDF key clears the record's 'missing_pdf' dispatch row."""
     with asr.Database(Path(tmp_path, "t.db")) as db:
         db.create_tables()
-        db.input.add_records([
-            Record(0, "d", original_id="ITEMA001", attachment="ABCD1234"),
-            Record(1, "d", original_id="ITEMB002"),
-            Record(2, "d", original_id="ITEMC003"),
-        ])
+        db.input.add_records(
+            [
+                Record(0, "d", original_id="ITEMA001", attachment="ABCD1234"),
+                Record(1, "d", original_id="ITEMB002"),
+                Record(2, "d", original_id="ITEMC003"),
+            ]
+        )
         for rid in (0, 1, 2):
             db.force_requeue(rid, "H")
             db.mark_dispatch_missing_pdf(rid)
@@ -157,8 +161,10 @@ def test_sync_clears_missing_pdf_rows(tmp_path, monkeypatch):
         _fake_fetch(monkeypatch, {"ITEMB002": "WXYZ9876", "ITEMC003": None})
 
         n = zotero_sync.sync_db_attachments(
-            db, ZoteroConfig("1", None, "K", 300),
-            delay=1.0, sleep=lambda s: None,
+            db,
+            ZoteroConfig("1", None, "K", 300),
+            delay=1.0,
+            sleep=lambda s: None,
         )
 
         assert n == 2
@@ -172,10 +178,12 @@ def test_sync_sweep_runs_after_lookup_error(tmp_path, monkeypatch):
     """The missing_pdf sweep runs even when the pass breaks on a lookup error."""
     with asr.Database(Path(tmp_path, "t.db")) as db:
         db.create_tables()
-        db.input.add_records([
-            Record(0, "d", original_id="ITEMA001", attachment="ABCD1234"),
-            Record(1, "d", original_id="ITEMB002"),
-        ])
+        db.input.add_records(
+            [
+                Record(0, "d", original_id="ITEMA001", attachment="ABCD1234"),
+                Record(1, "d", original_id="ITEMB002"),
+            ]
+        )
         for rid in (0, 1):
             db.force_requeue(rid, "H")
             db.mark_dispatch_missing_pdf(rid)
@@ -191,8 +199,10 @@ def test_sync_sweep_runs_after_lookup_error(tmp_path, monkeypatch):
         )
 
         n = zotero_sync.sync_db_attachments(
-            db, ZoteroConfig("1", None, "K", 300),
-            delay=1.0, sleep=lambda s: None,
+            db,
+            ZoteroConfig("1", None, "K", 300),
+            delay=1.0,
+            sleep=lambda s: None,
         )
 
         assert n == 0

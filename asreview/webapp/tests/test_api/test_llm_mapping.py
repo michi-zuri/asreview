@@ -1,5 +1,3 @@
-import pytest
-
 from asreview.webapp._api.llm_mapping import map_llm_payload_to_asreview
 
 TAGS = [
@@ -168,7 +166,10 @@ def test_single_select_too_many(caplog):
     values = result["tags"][0]["values"]
     assert len(values) == 1
     assert values[0]["id"] == 100  # first one kept
-    assert "single_select" in caplog.text.lower() or "keeping only the first" in caplog.text.lower()
+    assert (
+        "single_select" in caplog.text.lower()
+        or "keeping only the first" in caplog.text.lower()
+    )
 
 
 def test_duplicate_option_deduped(caplog):
@@ -383,10 +384,12 @@ def test_build_prefill_state_tags_pass_through():
     payload = {"labels": [], "lists": []}
     tags_form = [
         {
-            "id": "g1", "export": "quality", "label": "Quality",
-            "single_select": True, "values": [
-                {"id": "o1", "export": "high", "label": "High",
-                 "free_text": False},
+            "id": "g1",
+            "export": "quality",
+            "label": "Quality",
+            "single_select": True,
+            "values": [
+                {"id": "o1", "export": "high", "label": "High", "free_text": False},
             ],
         },
     ]
@@ -397,8 +400,7 @@ def test_build_prefill_state_tags_pass_through():
         counter[0] += 1
         return f"item-{counter[0]}"
 
-    result = build_prefill_state(payload, tags_form, lists_form,
-                                 uuid_fn=fake_uuid)
+    result = build_prefill_state(payload, tags_form, lists_form, uuid_fn=fake_uuid)
     assert result == {"tags": [], "lists": []}
 
 
@@ -422,14 +424,11 @@ def test_build_prefill_state_lists_gain_item_id():
         counter[0] += 1
         return f"item-{counter[0]}"
 
-    result = build_prefill_state(payload, tags_form, lists_form,
-                                 uuid_fn=fake_uuid)
+    result = build_prefill_state(payload, tags_form, lists_form, uuid_fn=fake_uuid)
     assert result["tags"] == []
     assert result["lists"] == [
-        {"list_id": "l1", "name": "bug", "sorted_at": 0.0,
-         "item_id": "item-1"},
-        {"list_id": "l1", "name": "feature", "sorted_at": 1.0,
-         "item_id": "item-2"},
+        {"list_id": "l1", "name": "bug", "sorted_at": 0.0, "item_id": "item-1"},
+        {"list_id": "l1", "name": "feature", "sorted_at": 1.0, "item_id": "item-2"},
     ]
 
 
@@ -445,10 +444,12 @@ def test_build_prefill_state_tags_passthrough_with_lists():
     }
     tags_form = [
         {
-            "id": "g1", "export": "quality", "label": "Quality",
-            "single_select": False, "values": [
-                {"id": "o1", "export": "high", "label": "High",
-                 "free_text": False},
+            "id": "g1",
+            "export": "quality",
+            "label": "Quality",
+            "single_select": False,
+            "values": [
+                {"id": "o1", "export": "high", "label": "High", "free_text": False},
             ],
         },
     ]
@@ -456,8 +457,11 @@ def test_build_prefill_state_tags_passthrough_with_lists():
 
     result = build_prefill_state(payload, tags_form, lists_form)
     assert result["tags"] == [
-        {"id": "g1", "values": [
-            {"id": "o1", "checked": True, "text": None},
-        ]},
+        {
+            "id": "g1",
+            "values": [
+                {"id": "o1", "checked": True, "text": None},
+            ],
+        },
     ]
     assert result["lists"] == []

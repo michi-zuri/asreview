@@ -58,18 +58,23 @@ def main(argv=None):
         description=textwrap.dedent(description).strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-v", "--verbose", action="count", default=0,
-                        help="-v for DEBUG logging.")
-    parser.add_argument("--poll-interval", type=float, default=5.0)
-    parser.add_argument("--port", type=int, default=None,
-                        help="Port for the health check HTTP server. "
-                             "No server is started if omitted.")
-    parser.add_argument("--no-zotero-sync", action="store_true",
-                        help="Disable the background Zotero full-text sync.")
-    args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0, help="-v for DEBUG logging."
     )
+    parser.add_argument("--poll-interval", type=float, default=5.0)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port for the health check HTTP server. No server is started if omitted.",
+    )
+    parser.add_argument(
+        "--no-zotero-sync",
+        action="store_true",
+        help="Disable the background Zotero full-text sync.",
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     run_worker_service(
         poll_interval=args.poll_interval,
         port=args.port,
