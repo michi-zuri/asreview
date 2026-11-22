@@ -232,7 +232,9 @@ def test_grouped_records(tmp_path, demo_data, tmp_project, tmpdir):
     _cli_simulate(argv)
 
     with asr.Project.load(tmp_project, tmpdir).db as db:
-        results = pd.read_sql_query("SELECT * FROM results", db._conn)
+        results = pd.read_sql_query(
+            "SELECT * FROM results ORDER BY time, record_id", db._conn
+        )
 
     # Every record is duplicated exactly once. So after every labeling action, the data
     # of a single duplicate record is added to the state file as well. The duplicate

@@ -192,8 +192,10 @@ def test_move_ranking_data_to_results(project_with_records):
         db.add_last_ranking(
             range(1, len(TEST_RECORD_TABLE) + 1), "nb", "max", "balanced", "tfidf", 4
         )
+        # A pending row without a user stays open to everyone, so each call
+        # needs its own user to get the next record.
         for i in range(4):
-            db.query_top_ranked()
+            db.query_top_ranked(user_id=i + 1)
         data = db.get_results_table(pending=True)
 
     assert data["record_id"].to_list() == [1, 2, 3, 4]
@@ -206,7 +208,7 @@ def test_query_top_ranked(project_with_records):
     with project_with_records.db as db:
         db.add_last_ranking(test_ranking, "nb", "max", "balanced", "tfidf", 4)
         for i in range(5):
-            db.query_top_ranked()
+            db.query_top_ranked(user_id=i + 1)
 
         data = db.get_results_table(pending=True)
         assert data["record_id"].to_list() == [2, 1, 0, 3, 4]
@@ -235,21 +237,23 @@ def test_label_record(project_with_records):
         assert data["training_set"].isna().all()
 
         for i in range(3):
-            db.query_top_ranked()
+            db.query_top_ranked(user_id=i + 1)
         data = db.get_results_table(pending=True)
         assert data["label"].to_list()[:6] == TEST_LABELS[:6]
         assert data["label"][6:].isna().all()
         assert data["record_id"].to_list() == TEST_RECORD_IDS[:6] + [0, 1, 2]
 
+        # The history is in labeling order, so a labeled record moves from the
+        # pending rows to its labeling time.
         db.label_record(1, 1)
         labels = db.get_results_table("label", pending=True)["label"]
         assert labels.to_list()[:6] == TEST_LABELS[:6]
-        assert labels[7] == 1
+        assert labels[6] == 1
 
         db.label_record(0, 0)
         db.label_record(2, 1)
         data = db.get_results_table(pending=True)
-        assert data["label"].to_list() == TEST_LABELS[:6] + [0, 1, 1]
+        assert data["label"].to_list() == TEST_LABELS[:6] + [1, 0, 1]
 
 
 def test_exist_new_labeled_records(project):
