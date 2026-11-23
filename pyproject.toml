@@ -199,3 +199,5 @@ addopts = "--ignore=asreview/webapp/tests/integration_tests"
 markers = [
     "internet_required: requires internet connection to run",
 ]
+tmp_path_retention_policy = "failed"   # delete temp dirs of passing tests at the end of the run
+tmp_path_retention_count = 1           # keep only the most recent run's leftovers

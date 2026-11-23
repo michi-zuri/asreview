@@ -90,8 +90,8 @@ def _insert_tag_group(db, group_id="g1"):
 def _insert_tag_option(db, option_id="o1", group_id="g1"):
     db._conn.execute(
         "INSERT INTO tag_options (option_id, group_id, export_name, label_name) "
-        "VALUES (?, ?, 'export', 'Label')",
-        (option_id, group_id),
+        "VALUES (?, ?, ?, 'Label')",
+        (option_id, group_id, option_id),
     )
     db._conn.commit()
 
@@ -653,3 +653,231 @@ def test_rekey_then_write_tracked(tmpdir):
         assert cur.execute(
             "SELECT project_id, version, record_id, source FROM change_log"
         ).fetchall() == [("new-id", 1, 0, "results")]
+
+
+def test_save_tags_unchanged_no_bump(db_with_records):
+    """Saving identical tags twice bumps only once."""
+    _insert_tag_group(db_with_records)
+    _insert_tag_option(db_with_records)
+    payload = [{"id": "g1", "values": [{"id": "o1", "checked": True}]}]
+    db_with_records.update_result(7, tags=payload)
+    before = state(db_with_records)[0]
+    n_log = len(log(db_with_records))
+    db_with_records.update_result(7, tags=payload)
+    assert state(db_with_records)[0] == before
+    assert len(log(db_with_records)) == n_log
+
+
+def test_save_tags_unchecked_no_bump(db_with_records):
+    """Saving an unchecked option twice bumps only once; row has checked=0."""
+    _insert_tag_group(db_with_records)
+    _insert_tag_option(db_with_records)
+    payload = [{"id": "g1", "values": [{"id": "o1", "checked": False}]}]
+    db_with_records.update_result(7, tags=payload)
+    before = state(db_with_records)[0]
+    db_with_records.update_result(7, tags=payload)
+    assert state(db_with_records)[0] == before
+    row = db_with_records._conn.execute(
+        "SELECT checked, additional_text FROM tags "
+        "WHERE record_id = 7 AND option_id = 'o1'"
+    ).fetchone()
+    assert row == (0, None)
+
+
+def test_save_tags_change_one_bump(db_with_records):
+    """Checking then unchecking is one bump; the row keeps its tag_id."""
+    _insert_tag_group(db_with_records)
+    _insert_tag_option(db_with_records)
+    db_with_records.update_result(
+        7,
+        tags=[{"id": "g1", "values": [{"id": "o1", "checked": True, "text": "a"}]}],
+    )
+    tag_id_before = db_with_records._conn.execute(
+        "SELECT tag_id FROM tags WHERE record_id = 7 AND option_id = 'o1'"
+    ).fetchone()[0]
+    n_log = len(log(db_with_records))
+    db_with_records.update_result(
+        7, tags=[{"id": "g1", "values": [{"id": "o1", "checked": False}]}]
+    )
+    assert len(log(db_with_records)) == n_log + 1
+    assert log(db_with_records)[-1][2] == "tags"
+    row = db_with_records._conn.execute(
+        "SELECT tag_id, checked, additional_text FROM tags "
+        "WHERE record_id = 7 AND option_id = 'o1'"
+    ).fetchone()
+    assert row[0] == tag_id_before
+    assert row[1] == 0
+    assert row[2] is None
+
+
+def test_save_tags_text_change_one_bump(db_with_records):
+    """Changing only the additional_text is one bump."""
+    _insert_tag_group(db_with_records)
+    _insert_tag_option(db_with_records)
+    db_with_records.update_result(
+        7,
+        tags=[{"id": "g1", "values": [{"id": "o1", "checked": True, "text": "a"}]}],
+    )
+    n_log = len(log(db_with_records))
+    db_with_records.update_result(
+        7,
+        tags=[{"id": "g1", "values": [{"id": "o1", "checked": True, "text": "b"}]}],
+    )
+    assert len(log(db_with_records)) == n_log + 1
+    row = db_with_records._conn.execute(
+        "SELECT checked, additional_text FROM tags "
+        "WHERE record_id = 7 AND option_id = 'o1'"
+    ).fetchone()
+    assert row == (1, "b")
+
+
+def test_save_tags_keeps_unsubmitted(db_with_records):
+    """Options not in the payload are left untouched."""
+    _insert_tag_group(db_with_records)
+    _insert_tag_option(db_with_records, "o1", "g1")
+    _insert_tag_option(db_with_records, "o2", "g1")
+    db_with_records.update_result(
+        7,
+        tags=[
+            {
+                "id": "g1",
+                "values": [
+                    {"id": "o1", "checked": True},
+                    {"id": "o2", "checked": True},
+                ],
+            }
+        ],
+    )
+    tag_id_o2 = db_with_records._conn.execute(
+        "SELECT tag_id FROM tags WHERE record_id = 7 AND option_id = 'o2'"
+    ).fetchone()[0]
+    # Save only o1 (changed); o2 is not in the payload.
+    db_with_records.update_result(
+        7, tags=[{"id": "g1", "values": [{"id": "o1", "checked": False}]}]
+    )
+    row_o2 = db_with_records._conn.execute(
+        "SELECT tag_id, checked FROM tags WHERE record_id = 7 AND option_id = 'o2'"
+    ).fetchone()
+    assert row_o2[0] == tag_id_o2
+    assert row_o2[1] == 1
+
+
+def test_note_edit_with_same_tags_no_tag_bump(db_with_records):
+    """label_record with tags, then update_result with the same tags → no tags bump."""
+    _insert_tag_group(db_with_records)
+    _insert_tag_option(db_with_records)
+    payload = [{"id": "g1", "values": [{"id": "o1", "checked": True}]}]
+    db_with_records.label_record(7, 1, tags=payload)
+    n_tags_log = len([row for row in log(db_with_records) if row[2] == "tags"])
+    db_with_records.update_result(7, tags=payload)
+    assert len([row for row in log(db_with_records) if row[2] == "tags"]) == n_tags_log
+
+
+def test_replace_lists_unchanged_no_bump(db_with_records):
+    """Saving identical list items twice bumps only once."""
+    _insert_list_container(db_with_records)
+    items = [
+        {"list_id": "l1", "item_id": "a", "name": "x", "sorted_at": 1.0},
+        {"list_id": "l1", "item_id": "b", "name": "y", "sorted_at": 2.0},
+    ]
+    db_with_records.replace_lists(7, items)
+    before = state(db_with_records)[0]
+    n_log = len(log(db_with_records))
+    db_with_records.replace_lists(7, items)
+    assert state(db_with_records)[0] == before
+    assert len(log(db_with_records)) == n_log
+
+
+def test_replace_lists_missing_sorted_at_keeps_stored(db_with_records):
+    """An item without sorted_at keeps its stored value; no bump."""
+    _insert_list_container(db_with_records)
+    db_with_records.replace_lists(
+        7, [{"list_id": "l1", "item_id": "a", "name": "x", "sorted_at": 5.0}]
+    )
+    n_log = len(log(db_with_records))
+    db_with_records.replace_lists(7, [{"list_id": "l1", "item_id": "a", "name": "x"}])
+    assert len(log(db_with_records)) == n_log
+    assert db_with_records.get_lists(7)[0]["sorted_at"] == 5.0
+
+
+def test_replace_lists_rename_one_bump(db_with_records):
+    """Renaming one of two items is exactly one bump; same item_id, new name."""
+    _insert_list_container(db_with_records)
+    db_with_records.replace_lists(
+        7,
+        [
+            {"list_id": "l1", "item_id": "a", "name": "x", "sorted_at": 1.0},
+            {"list_id": "l1", "item_id": "b", "name": "y", "sorted_at": 2.0},
+        ],
+    )
+    n_log = len(log(db_with_records))
+    db_with_records.replace_lists(
+        7,
+        [
+            {"list_id": "l1", "item_id": "a", "name": "z", "sorted_at": 1.0},
+            {"list_id": "l1", "item_id": "b", "name": "y", "sorted_at": 2.0},
+        ],
+    )
+    assert len(log(db_with_records)) == n_log + 1
+    assert log(db_with_records)[-1][2] == "lists"
+    names = {i["item_id"]: i["name"] for i in db_with_records.get_lists(7)}
+    assert names == {"a": "z", "b": "y"}
+
+
+def test_replace_lists_remove_one_bump(db_with_records):
+    """Dropping one of two items is exactly one bump; the other is untouched."""
+    _insert_list_container(db_with_records)
+    db_with_records.replace_lists(
+        7,
+        [
+            {"list_id": "l1", "item_id": "a", "name": "x", "sorted_at": 1.0},
+            {"list_id": "l1", "item_id": "b", "name": "y", "sorted_at": 2.0},
+        ],
+    )
+    n_log = len(log(db_with_records))
+    db_with_records.replace_lists(
+        7, [{"list_id": "l1", "item_id": "a", "name": "x", "sorted_at": 1.0}]
+    )
+    assert len(log(db_with_records)) == n_log + 1
+    assert log(db_with_records)[-1][2] == "lists"
+    assert [i["item_id"] for i in db_with_records.get_lists(7)] == ["a"]
+
+
+def test_replace_lists_swap_names(db_with_records):
+    """Two items swapping names in one save succeeds."""
+    _insert_list_container(db_with_records)
+    db_with_records.replace_lists(
+        7,
+        [
+            {"list_id": "l1", "item_id": "a", "name": "x", "sorted_at": 1.0},
+            {"list_id": "l1", "item_id": "b", "name": "y", "sorted_at": 2.0},
+        ],
+    )
+    db_with_records.replace_lists(
+        7,
+        [
+            {"list_id": "l1", "item_id": "a", "name": "y", "sorted_at": 1.0},
+            {"list_id": "l1", "item_id": "b", "name": "x", "sorted_at": 2.0},
+        ],
+    )
+    names = {i["item_id"]: i["name"] for i in db_with_records.get_lists(7)}
+    assert names == {"a": "y", "b": "x"}
+
+
+def test_replace_lists_duplicate_rolls_back(db_with_records):
+    """A duplicate name in one save raises and writes nothing."""
+    _insert_list_container(db_with_records)
+    db_with_records.replace_lists(
+        7, [{"list_id": "l1", "item_id": "a", "name": "x", "sorted_at": 1.0}]
+    )
+    n_log = len(log(db_with_records))
+    with pytest.raises(sqlite3.IntegrityError):
+        db_with_records.replace_lists(
+            7,
+            [
+                {"list_id": "l1", "item_id": "a", "name": "x", "sorted_at": 1.0},
+                {"list_id": "l1", "item_id": "b", "name": "x", "sorted_at": 2.0},
+            ],
+        )
+    assert len(log(db_with_records)) == n_log
+    assert [i["item_id"] for i in db_with_records.get_lists(7)] == ["a"]

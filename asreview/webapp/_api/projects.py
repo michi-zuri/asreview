@@ -1687,39 +1687,89 @@ def update_tag_group(project, group_id):
         db._ensure_tag_options_table()
         cur = db._conn.cursor()
 
-        group_sorted_at = updated_tag_group.get("sorted_at", time.time())
+        # Existence check (separate from the write, since an unchanged save
+        # now updates zero rows) + stored sorted_at for the fallback.
+        stored_group = cur.execute(
+            "SELECT sorted_at FROM tag_groups WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+        if stored_group is None:
+            return jsonify(message=f"Tag group '{group_id}' not found."), 404
 
-        # Update the group itself
-        result = cur.execute(
+        group_sorted_at = updated_tag_group.get("sorted_at")
+        if group_sorted_at is None:
+            group_sorted_at = stored_group[0]
+
+        export = updated_tag_group.get("export", "")
+        label = updated_tag_group.get("label", "")
+        required_relevant = 1 if updated_tag_group.get("required_relevant") else 0
+        required_irrelevant = 1 if updated_tag_group.get("required_irrelevant") else 0
+        all_required = 1 if updated_tag_group.get("require_all") else 0
+        single = 1 if updated_tag_group.get("single_select") else 0
+        input_helper_text = updated_tag_group.get("input_helper_text") or ""
+        group_sorted_at = float(group_sorted_at)
+
+        # Unchanged columns are not written, so the config triggers do not
+        # bump config_version (Spec 0001).
+        cur.execute(
             """UPDATE tag_groups SET
                export_name=?, label_name=?, required_for_relevant=?,
                required_for_irrelevant=?, all_required=?, single=?,
                input_helper_text=?, sorted_at=?
-               WHERE group_id=?""",
+               WHERE group_id=?
+                 AND (export_name IS NOT ?
+                   OR label_name IS NOT ?
+                   OR required_for_relevant IS NOT ?
+                   OR required_for_irrelevant IS NOT ?
+                   OR all_required IS NOT ?
+                   OR single IS NOT ?
+                   OR COALESCE(input_helper_text, '') IS NOT ?
+                   OR sorted_at IS NOT ?)""",
             (
-                updated_tag_group.get("export", ""),
-                updated_tag_group.get("label", ""),
-                1 if updated_tag_group.get("required_relevant") else 0,
-                1 if updated_tag_group.get("required_irrelevant") else 0,
-                1 if updated_tag_group.get("require_all") else 0,
-                1 if updated_tag_group.get("single_select") else 0,
-                updated_tag_group.get("input_helper_text", ""),
-                float(group_sorted_at),
+                export,
+                label,
+                required_relevant,
+                required_irrelevant,
+                all_required,
+                single,
+                input_helper_text,
+                group_sorted_at,
                 group_id,
+                export,
+                label,
+                required_relevant,
+                required_irrelevant,
+                all_required,
+                single,
+                input_helper_text,
+                group_sorted_at,
             ),
         )
 
-        if result.rowcount == 0:
-            return jsonify(message=f"Tag group '{group_id}' not found."), 404
+        # Stored option sorted_at values for the fallback.
+        stored_options = {
+            option_id: sorted_at
+            for option_id, sorted_at in cur.execute(
+                "SELECT option_id, sorted_at FROM tag_options WHERE group_id = ?",
+                (group_id,),
+            )
+        }
 
         # Sync tag_options: collect incoming option_ids
         incoming_ids = set()
         for val in updated_tag_group.get("values", []):
             option_id = val.get("id")
-            sorted_at = val.get("sorted_at", time.time())
+            sorted_at = val.get("sorted_at")
+            if sorted_at is None:
+                sorted_at = (
+                    stored_options.get(option_id)
+                    if option_id in stored_options
+                    else time.time()
+                )
             if option_id is not None:
                 incoming_ids.add(option_id)
-                # Upsert: UPDATE if exists, INSERT if new
+                # Unchanged options are not written, so the config triggers
+                # do not bump config_version (Spec 0001).
                 cur.execute(
                     """INSERT INTO tag_options
                        (option_id, group_id, export_name, label_name,
@@ -1730,7 +1780,14 @@ def update_tag_group(project, group_id):
                        label_name=excluded.label_name,
                        free_text_enabled=excluded.free_text_enabled,
                        free_text_required=excluded.free_text_required,
-                       sorted_at=excluded.sorted_at""",
+                       sorted_at=excluded.sorted_at
+                       WHERE tag_options.export_name IS NOT excluded.export_name
+                          OR tag_options.label_name IS NOT excluded.label_name
+                          OR tag_options.free_text_enabled
+                             IS NOT excluded.free_text_enabled
+                          OR tag_options.free_text_required
+                             IS NOT excluded.free_text_required
+                          OR tag_options.sorted_at IS NOT excluded.sorted_at""",
                     (
                         option_id,
                         group_id,
@@ -1856,27 +1913,54 @@ def update_list(project, list_id):
     if not updated_list or not updated_list.get("name"):
         return jsonify(message="No list name found."), 400
 
-    list_sorted_at = updated_list.get("sorted_at", time.time())
+    list_sorted_at = updated_list.get("sorted_at")
 
     with project.db as db:
         db._ensure_list_containers_table()
         cur = db._conn.cursor()
-        result = cur.execute(
+
+        # Existence check (separate from the write, since an unchanged save
+        # now updates zero rows) + stored sorted_at for the fallback.
+        stored_list = cur.execute(
+            "SELECT sorted_at FROM list_containers WHERE list_id = ?",
+            (list_id,),
+        ).fetchone()
+        if stored_list is None:
+            return jsonify(message=f"List '{list_id}' not found."), 404
+
+        if list_sorted_at is None:
+            list_sorted_at = stored_list[0]
+
+        name = updated_list["name"]
+        required_for_relevant = (
+            1 if updated_list.get("required_for_relevant", False) else 0
+        )
+        description = updated_list.get("input_helper_text") or None
+        list_sorted_at = float(list_sorted_at)
+
+        # Unchanged columns are not written, so the config triggers do not
+        # bump config_version (Spec 0001).
+        cur.execute(
             """UPDATE list_containers SET
                name=?, required_for_relevant=?, description=?, sorted_at=?
-               WHERE list_id=?""",
+               WHERE list_id=?
+                 AND (name IS NOT ?
+                   OR required_for_relevant IS NOT ?
+                   OR description IS NOT ?
+                   OR sorted_at IS NOT ?)""",
             (
-                updated_list["name"],
-                1 if updated_list.get("required_for_relevant", False) else 0,
-                updated_list.get("input_helper_text") or None,
-                float(list_sorted_at),
+                name,
+                required_for_relevant,
+                description,
+                list_sorted_at,
                 list_id,
+                name,
+                required_for_relevant,
+                description,
+                list_sorted_at,
             ),
         )
         db._conn.commit()
-
-        if result.rowcount == 0:
-            return jsonify(message=f"List '{list_id}' not found."), 404
 
         return jsonify(read_lists_data(project) or [])
 

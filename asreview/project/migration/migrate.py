@@ -160,12 +160,14 @@ def _migrate_project_one_version(folder, current_version):
         )
 
         # Only project.json changes in the 4 → asmr step, so no legacy copy
-        # is needed; the .backup swap below covers failure.
+        # is needed; the .backup swap below covers failure. Earlier legacy_v*
+        # backups stay at the top level of the project; copying them into the
+        # new backup as well would nest every older backup again.
         if current_version != 4:
             shutil.copytree(
                 folder,
                 Path(tmpdir) / "tmp_project" / f"legacy_v{current_version}",
-                ignore=shutil.ignore_patterns("*.lock"),
+                ignore=shutil.ignore_patterns("*.lock", "legacy_v*"),
             )
 
         next_version = NEXT_VERSION[current_version]

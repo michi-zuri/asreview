@@ -103,6 +103,24 @@ def test_project_migration_1_to_3(tmpdir):
     assert_valid_project(project)
 
 
+def test_legacy_backups_not_nested(tmpdir):
+    """Each step keeps one backup at the top level, without older backups."""
+    asreview_v1_file = Path(
+        "asreview",
+        "webapp",
+        "tests",
+        "asreview-project-file-archive",
+        "v1.5",
+        "asreview-project-v1-5-startreview.asreview",
+    )
+    project = asr.Project.load(open(asreview_v1_file, "rb"), tmpdir, safe_import=True)
+    root = Path(project.project_path)
+    backups = sorted(p.name for p in root.glob("legacy_v*"))
+    assert backups == ["legacy_v1", "legacy_v2", "legacy_v3"]
+    for name in backups:
+        assert not list(Path(root, name).glob("legacy_v*"))
+
+
 def test_project_migration_2_to_3(tmpdir, asreview_v2_project):
     project = asr.Project.load(
         open(asreview_v2_project, "rb"), tmpdir, safe_import=True

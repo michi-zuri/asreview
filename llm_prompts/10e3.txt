@@ -1,0 +1,131 @@
+========================================================================
+TASK 10e3 — form editors: no config bump for an unchanged save
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10e2 committed by the user.
+SPEC: specs/0001-collection-snapshot.md, Part 3 (config_version bumps
+      when the forms change). No spec text changes.
+
+WHY
+  Since 10e, every INSERT / UPDATE / DELETE on tag_groups, tag_options
+  and list_containers fires trg_ct_<table>_* (_CONFIG_CHANGE_SQL: bumps
+  project_state.version and sets config_version). The form-editor routes
+  in projects.py write every row on every save, changed or not:
+  - update_tag_group: one UPDATE of the group + one upsert per option
+    (ON CONFLICT DO UPDATE without a WHERE, so it always writes);
+  - update_list: one UPDATE of the container.
+  So saving a tag group without changes bumps config_version 1 + (number
+  of options) times, and the clients of 10h/10i reload the forms for
+  nothing. Same principle as 10e2: write a row only when it changes.
+  Rare admin traffic, so this is about correctness of config_version,
+  not speed.
+
+FACTS (verified — trust these)
+  - asreview/webapp/_api/projects.py:
+    - update_tag_group (PUT /projects/<id>/tags/<group_id>):
+      1. UPDATE tag_groups SET export_name, label_name,
+         required_for_relevant, required_for_irrelevant, all_required,
+         single, input_helper_text, sorted_at WHERE group_id=?
+         and `if result.rowcount == 0: return 404`.
+      2. For each value with an "id": INSERT INTO tag_options … ON
+         CONFLICT(option_id) DO UPDATE SET export_name, label_name,
+         free_text_enabled, free_text_required, sorted_at (no WHERE).
+         For a value without an id: plain INSERT with uuid7().
+      3. Deletes options not in the payload (IntegrityError ignored:
+         the FK from tags protects options in use). Keep this.
+      4. db._conn.commit().
+      group_sorted_at / option sorted_at fall back to time.time() when
+      the payload has none.
+    - update_list (PUT /projects/<id>/lists/<list_id>): UPDATE
+      list_containers SET name, required_for_relevant, description,
+      sorted_at WHERE list_id=?, commit, `if result.rowcount == 0: 404`.
+      sorted_at falls back to time.time().
+    - create_tag_group / create_list insert new rows: a real change,
+      leave them alone. delete_* routes: leave them alone.
+  - IMPORTANT: once the UPDATE has a "changed" WHERE, rowcount is 0 for
+    an unchanged save too, so rowcount can no longer mean "not found".
+    The existence check must become a separate
+    SELECT 1 FROM <table> WHERE <id> = ? before the write.
+  - Client (SetupComponents/TagCard.js, ListCard.js) sends sorted_at for
+    the group, the options and the list, keeping the stored value unless
+    the user edits. The time.time() fallback only hits payloads without
+    sorted_at (API callers, tests).
+  - asreview/webapp/tests/test_api/test_projects.py::test_lists_crud
+    covers create / read / update of lists. No existing test PUTs a tag
+    group. Tests open the project db with
+      with asr.Project(project.project_path) as asr_project:
+          db = asr_project.db
+    (see test_labeled_pagination.py). db.get_project_state() returns
+    {"version", "config_version", ...}.
+
+------------------------------------------------------------------------
+CHANGE (asreview/webapp/_api/projects.py: update_tag_group, update_list)
+------------------------------------------------------------------------
+  1. Existence: SELECT 1 … WHERE group_id = ? / list_id = ? first; 404
+     when missing (same message as now). Then drop the rowcount check.
+  2. sorted_at fallback: when the payload has no sorted_at, use the
+     STORED value for an existing group / option / list (read it in the
+     same SELECT); time.time() only for a new option.
+  3. UPDATE tag_groups … WHERE group_id = ? AND (<col> IS NOT ? OR …)
+     over all eight SET columns. Same for list_containers (four columns).
+     Use IS NOT so NULLs compare correctly (description can be NULL).
+     input_helper_text: read_tags_data returns NULL as "", so write
+     `updated_tag_group.get("input_helper_text") or ""` and compare with
+     COALESCE(input_helper_text, '') IS NOT ? — otherwise a group stored
+     with NULL (older projects) bumps once on an unchanged save.
+     list description is already written as `... or None`; GET returns
+     NULL as "" and the PUT turns "" back into None, so plain IS NOT works.
+  4. tag_options upsert: add
+       WHERE tag_options.export_name IS NOT excluded.export_name
+          OR tag_options.label_name IS NOT excluded.label_name
+          OR tag_options.free_text_enabled IS NOT excluded.free_text_enabled
+          OR tag_options.free_text_required IS NOT excluded.free_text_required
+          OR tag_options.sorted_at IS NOT excluded.sorted_at
+     to the DO UPDATE.
+  5. Keep the option-removal loop and the responses as they are.
+  6. Short comment at each WHERE: unchanged rows are not written, so the
+     config triggers do not bump config_version (Spec 0001).
+
+  Do not change database.py, the triggers, the create / delete routes,
+  read_tags_data, or the client.
+
+------------------------------------------------------------------------
+TESTS (new file asreview/webapp/tests/test_api/test_form_edits.py; use
+       the client / project fixtures like test_projects.py)
+------------------------------------------------------------------------
+  Helper: cfg(project) → db.get_project_state()["config_version"] and
+  ["version"], opened as in FACTS.
+  1. test_tag_group_unchanged_save_no_bump: POST a tag group with two
+     options, GET it back, PUT exactly what GET returned → version and
+     config_version unchanged.
+  2. test_tag_group_label_change_bumps: PUT with a new group label →
+     config_version increases; GET shows the new label.
+  3. test_tag_option_change_bumps: PUT with one option's label changed →
+     config_version increases; the other option is unchanged.
+  4. test_tag_group_missing_sorted_at_keeps_stored: PUT the GET payload
+     with sorted_at removed from group and options → no bump; the stored
+     sorted_at values are unchanged.
+  5. test_tag_group_unknown_404: PUT to a random group_id → 404.
+  6. test_list_unchanged_save_no_bump: create a list, PUT the same name /
+     required_for_relevant / sorted_at → no bump.
+  7. test_list_rename_bumps: PUT a new name → config_version increases.
+  8. test_list_unknown_404: PUT to a random list_id → 404.
+  test_projects.py::test_lists_crud must pass unchanged.
+
+------------------------------------------------------------------------
+RUN (from the git root; see TEST RULES in context.txt)
+------------------------------------------------------------------------
+  Baseline: 0 failures in these files (known; do not re-run).
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest asreview/webapp/tests/test_api/test_form_edits.py -x -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest asreview/webapp/tests/test_api/test_projects.py -q -p no:cacheprovider -k "lists or tags"'
+  ruff check + ruff format --check on the two changed files.
+  Paste the output.
+
+DONE WHEN
+  - An unchanged tag-group or list save writes no row (tests 1, 4, 6).
+  - A real change bumps config_version (tests 2, 3, 7).
+  - Unknown ids still return 404 (tests 5, 8).
+  - Only these files changed:
+      asreview/webapp/_api/projects.py
+      asreview/webapp/tests/test_api/test_form_edits.py
+========================================================================

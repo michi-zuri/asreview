@@ -1919,11 +1919,14 @@ class Database:
         return result
 
     def replace_lists(self, record_id, items):
-        """Replace all list items for a record.
+        """Replace the list items for a record, writing only what changed.
 
-        Each item belongs to exactly one record. Items are keyed by
-        ``item_id`` (the table's primary key) so they can later be referenced by
-        foreign keys.
+        Items are matched by ``item_id``. Unchanged items are not written
+        (no version bump, Spec 0001); changed items are updated in place;
+        items missing from the payload are deleted. An item without
+        ``sorted_at`` keeps its stored value (a new item gets the current
+        time). Renames that collide inside one save are applied by deleting
+        and re-inserting those rows. On error nothing is written.
 
         Parameters
         ----------
@@ -1937,31 +1940,88 @@ class Database:
         con = self._conn
         cur = con.cursor()
 
-        cur.execute("DELETE FROM lists WHERE record_id = ?", (int(record_id),))
+        record_id = int(record_id)
+        items = list(items or [])
 
-        rows = []
-        for item in items or []:
+        # The same item_id twice in one payload is a client error.
+        seen = set()
+        for item in items:
+            item_id = str(item["item_id"])
+            if item_id in seen:
+                raise sqlite3.IntegrityError(f"duplicate item_id {item_id}")
+            seen.add(item_id)
+
+        stored = {
+            item_id: (list_id, name, sorted_at)
+            for item_id, list_id, name, sorted_at in cur.execute(
+                "SELECT item_id, list_id, name, sorted_at FROM lists "
+                "WHERE record_id = ?",
+                (record_id,),
+            )
+        }
+
+        wanted = {}
+        for item in items:
+            item_id = str(item["item_id"])
+            list_id = str(item["list_id"])
             name = item["name"]
             sorted_at = item.get("sorted_at")
             if sorted_at is None:
-                sorted_at = time.time()
-            rows.append(
-                (
-                    int(record_id),
-                    str(item["list_id"]),
-                    str(item["item_id"]),
-                    name,
-                    float(sorted_at),
+                sorted_at = stored[item_id][2] if item_id in stored else time.time()
+            wanted[item_id] = (list_id, name, float(sorted_at))
+
+        removed = [item_id for item_id in stored if item_id not in wanted]
+        new = [item_id for item_id in wanted if item_id not in stored]
+        changed = [
+            item_id
+            for item_id in wanted
+            if item_id in stored and wanted[item_id] != stored[item_id]
+        ]
+
+        # Among the changed rows, those whose new (list_id, name) is held by
+        # another stored row that is not removed must be deleted and
+        # re-inserted (a swap), or the per-row UNIQUE constraint would trip
+        # halfway through.
+        swap = []
+        for item_id in changed:
+            new_list, new_name, _ = wanted[item_id]
+            for other_id, (other_list, other_name, _) in stored.items():
+                if other_id == item_id or other_id in removed:
+                    continue
+                if (new_list, new_name) == (other_list, other_name):
+                    swap.append(item_id)
+                    break
+        swap_set = set(swap)
+
+        try:
+            for item_id in removed:
+                cur.execute("DELETE FROM lists WHERE item_id = ?", (item_id,))
+            for item_id in swap:
+                cur.execute("DELETE FROM lists WHERE item_id = ?", (item_id,))
+
+            for item_id in changed:
+                if item_id in swap_set:
+                    continue
+                list_id, name, sorted_at = wanted[item_id]
+                cur.execute(
+                    "UPDATE lists SET list_id = ?, name = ?, sorted_at = ? "
+                    "WHERE item_id = ?",
+                    (list_id, name, sorted_at, item_id),
                 )
-            )
-        if rows:
-            cur.executemany(
-                """INSERT INTO lists
-                (record_id, list_id, item_id, name, sorted_at)
-                VALUES (?, ?, ?, ?, ?)""",
-                rows,
-            )
-        con.commit()
+
+            for item_id in new + swap:
+                list_id, name, sorted_at = wanted[item_id]
+                cur.execute(
+                    "INSERT INTO lists "
+                    "(record_id, list_id, item_id, name, sorted_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (record_id, list_id, item_id, name, sorted_at),
+                )
+
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
 
     def delete_list_container(self, list_id):
         """Delete a list container definition.
@@ -2061,10 +2121,16 @@ class Database:
     def _save_tags(self, record_id, tags, cur=None):
         """Store tag selections for a record in the ``tags`` table.
 
-        Deletes existing tag rows for the given record within the affected
-        groups, then inserts one row per checked tag value. Only checked tags
-        are persisted; unchecked tags are omitted (their absence means
-        unchecked).
+        Writes one row per submitted option, checked or not; unchecked
+        options are stored with ``checked = 0`` and ``additional_text``
+        NULL. ``additional_text`` is kept only for checked options.
+
+        Existing rows are updated in place and keep their ``tag_id``. A row
+        is written only when ``checked`` or ``additional_text`` changes, so
+        an unchanged save does not bump the record's version (Spec 0001).
+        Options not in the payload are left as they are.
+
+        Commits only when no cursor was passed in (``cur`` is None).
 
         The ``tags`` parameter uses the same nested format as the API:
 
@@ -2080,8 +2146,6 @@ class Database:
         if own_cur:
             cur = self._conn.cursor()
 
-        # Collect all option_ids to delete existing rows in one pass
-        option_ids = []
         rows = []
         for group in tags:
             if not isinstance(group, dict):
@@ -2092,7 +2156,6 @@ class Database:
                 option_id = tag_val.get("id")
                 if option_id is None:
                     continue
-                option_ids.append(str(option_id))
                 checked = bool(tag_val.get("checked", False))
                 text = tag_val.get("text")
                 rows.append(
@@ -2105,18 +2168,16 @@ class Database:
                     )
                 )
 
-        if option_ids:
-            placeholders = ",".join("?" * len(option_ids))
-            cur.execute(
-                f"DELETE FROM tags WHERE record_id = ? AND option_id IN ({placeholders})",
-                [int(record_id)] + option_ids,
-            )
-
         if rows:
             cur.executemany(
-                """INSERT OR REPLACE INTO tags
-                   (tag_id, record_id, option_id, checked, additional_text)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO tags
+                       (tag_id, record_id, option_id, checked, additional_text)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(record_id, option_id) DO UPDATE
+                      SET checked = excluded.checked,
+                          additional_text = excluded.additional_text
+                    WHERE tags.checked IS NOT excluded.checked
+                       OR tags.additional_text IS NOT excluded.additional_text""",
                 rows,
             )
 

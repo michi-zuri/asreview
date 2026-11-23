@@ -1,0 +1,208 @@
+========================================================================
+TASK 10e2 — _save_tags and replace_lists: write changed rows only,
+           no delete + re-insert
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10e committed by the user (trg_ct_tags_* triggers exist).
+SPEC: specs/0001-collection-snapshot.md, Part 3 (a record's version bumps
+      when the record changes). No spec text changes.
+
+WHY
+  database.py::_save_tags deletes every submitted option row of the record
+  (checked or not) and inserts them all again with a fresh tag_id. This is
+  left over from when tags were one JSON value per record. Since 10e every
+  deleted and every inserted tags row fires a trg_ct_tags_* trigger: one
+  version bump plus one change_log row per row. So a save that changes
+  nothing (e.g. a note-only edit that resends the tag form) still marks
+  the record as changed. The clients of 10h/10i then re-fetch rows that
+  did not change, and change_log grows for nothing.
+
+  The user decided:
+  - Upsert. An unchanged row is not written at all; a changed row is one
+    UPDATE (one bump). A new option is one INSERT.
+  - Keep storing unchecked options as rows with checked = 0 (current
+    behaviour). Do NOT delete rows on uncheck.
+  - Keep each row's tag_id (it is set only on the first insert).
+  - Rewrite the docstring to describe this behaviour. (The current one
+    says "only checked tags are persisted", which is wrong.)
+  - Do the same for replace_lists, which runs in the same label request
+    and deletes + re-inserts every list item of the record (two bumps per
+    item, even when nothing changed).
+
+FACTS (verified — trust these)
+  - tags table (database.py, _ensure_tags_table):
+      tag_id TEXT PRIMARY KEY, record_id INTEGER NOT NULL,
+      option_id TEXT NOT NULL, checked INTEGER NOT NULL DEFAULT 0,
+      additional_text TEXT, UNIQUE(record_id, option_id), plus FKs.
+    The UNIQUE(record_id, option_id) is the conflict target.
+  - _save_tags(record_id, tags, cur=None): today it
+      1. collects one row per value dict with an "id":
+         (uuid7(), record_id, option_id, 1/0, text if checked and text
+         else None);
+      2. DELETE FROM tags WHERE record_id = ? AND option_id IN (…);
+      3. INSERT OR REPLACE INTO tags … (executemany);
+      4. commits only when it opened its own cursor (cur is None).
+    Callers: label_record and update_result (both `if tags is not None:
+    self._save_tags(record_id, tags)`).
+  - Options that are NOT in the submitted payload are left untouched
+    today (the DELETE only covers submitted option_ids). Keep that.
+  - _load_tags reads every tags row (checked 0 and 1) and returns
+    "checked": bool(checked). It needs no change.
+  - trg_ct_tags_update is AFTER UPDATE ON tags with no WHEN clause. An
+    ON CONFLICT DO UPDATE whose WHERE is false writes nothing, so the
+    trigger does not fire. That is the mechanism this task relies on.
+  - tests/test_change_tracking.py::test_save_tags_tracked (first save of
+    a checked option → exactly one bump, source "tags") must keep passing
+    unchanged.
+  - lists table (_ensure_lists_table):
+      record_id INTEGER NOT NULL, list_id TEXT NOT NULL,
+      item_id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL,
+      sorted_at FLOAT NOT NULL, UNIQUE(record_id, list_id, name), FKs.
+  - replace_lists(record_id, items): today DELETE FROM lists WHERE
+    record_id = ?, then INSERT of every item (sorted_at = time.time()
+    when the item has none), then commit. Only caller:
+    projects.py::api_label_record, on POST and PUT when the form has
+    "lists"; it maps ValueError → 400 and sqlite3.IntegrityError → 400
+    "List entries must be unique.".
+  - The client (RecordCardLabeler.js) sends every item with its item_id
+    and a sorted_at, so an unchanged save resends identical items.
+  - SQLite checks UNIQUE per row, not per statement. So when two items
+    of the same list swap names in one save, updating them one by one
+    hits UNIQUE(record_id, list_id, name) halfway, although the end state
+    is valid.
+  - trg_ct_lists_insert / _update / _delete fire per row with no WHEN.
+  - tests/test_database.py has replace_lists tests that must keep passing
+    unchanged, among them:
+      test_replace_lists_rejects_duplicate_item_id (same item_id twice in
+        one payload → sqlite3.IntegrityError),
+      test_replace_lists_rejects_duplicate_name (two items, same list,
+        same name → sqlite3.IntegrityError),
+      test_replace_lists_clears_previous (items=[] removes all).
+    tests/test_change_tracking.py::test_replace_lists_tracked as well.
+
+------------------------------------------------------------------------
+CHANGE (asreview/database/database.py, _save_tags only)
+------------------------------------------------------------------------
+  1. Keep the row collection as it is (same tuple, uuid7() for tag_id,
+     same checked / text normalisation).
+  2. Remove the DELETE.
+  3. Replace INSERT OR REPLACE with:
+       INSERT INTO tags
+           (tag_id, record_id, option_id, checked, additional_text)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(record_id, option_id) DO UPDATE
+          SET checked = excluded.checked,
+              additional_text = excluded.additional_text
+        WHERE tags.checked IS NOT excluded.checked
+           OR tags.additional_text IS NOT excluded.additional_text
+     (qualify the old row with the table name `tags.`; excluded.tag_id is
+     NOT used, so an existing row keeps its tag_id.)
+  4. option_ids is then only needed for the old DELETE: remove it if it
+     becomes unused.
+  5. Docstring (numpy style, like the rest of the file). It must say:
+     - one row per submitted option, checked or not; unchecked options
+       are stored with checked = 0 and additional_text NULL;
+     - additional_text is kept only for checked options;
+     - existing rows are updated in place and keep their tag_id; a row
+       is written only when checked or additional_text changes, so an
+       unchanged save does not bump the record's version (Spec 0001);
+     - options not in the payload are left as they are;
+     - commits only when no cursor is passed in.
+     Keep the description of the nested `tags` format.
+
+------------------------------------------------------------------------
+CHANGE (asreview/database/database.py, replace_lists only)
+------------------------------------------------------------------------
+  Compute the difference with the stored rows in Python, then write only
+  that. All in one transaction:
+  1. If the payload has the same item_id twice, raise
+     sqlite3.IntegrityError("duplicate item_id ...") before writing.
+  2. Read the record's stored rows: {item_id: (list_id, name, sorted_at)}.
+  3. Build the wanted rows. sorted_at: the payload's value; if missing,
+     the STORED value for an existing item_id, else time.time() (a new
+     item). Compare sorted_at as float.
+  4. Classify each item_id:
+       removed   = stored, not in the payload
+       new       = in the payload, not stored
+       changed   = in both, and list_id, name or sorted_at differ
+       unchanged = in both, all equal → no statement at all
+  5. Swap handling: among the changed rows, those whose new
+     (list_id, name) is currently held by ANOTHER stored row that is not
+     removed form the set C. Rows in C are deleted before the updates and
+     inserted again (same item_id) after them. Everything else in
+     "changed" is a single UPDATE … WHERE item_id = ?.
+     Order: DELETE removed; DELETE C; UPDATE changed − C; INSERT new + C.
+     (A swap therefore costs a delete + insert for those rows only. A
+     real duplicate still fails on the INSERT with IntegrityError.)
+  6. On any exception: con.rollback() and re-raise, so a failed save
+     leaves the stored items as they were. Commit once at the end.
+  7. Docstring: keep the parameter description. Say that items are
+     matched by item_id; unchanged items are not written (no version
+     bump, Spec 0001); changed items are updated in place; items missing
+     from the payload are deleted; an item without sorted_at keeps its
+     stored value; renames that collide inside one save are applied by
+     delete + re-insert of those rows; on error nothing is written.
+
+  Do not change _load_tags, get_lists, the schema, the triggers,
+  v3v4.py, projects.py, or any other function.
+
+------------------------------------------------------------------------
+TESTS (tests/test_change_tracking.py; reuse _insert_tag_group /
+       _insert_tag_option, db_with_records, and the log(db) /
+       rv(db, rid) / state(db) helpers already there)
+------------------------------------------------------------------------
+  1. test_save_tags_unchanged_no_bump: save option o1 checked; read the
+     record's version and the change_log length. Save the same payload
+     again → version and change_log length unchanged.
+  2. test_save_tags_unchecked_no_bump: same as 1, with o1 unchecked both
+     times; the row exists with checked = 0.
+  3. test_save_tags_change_one_bump: save o1 checked, then o1 unchecked →
+     exactly one new change_log row (source "tags"); the row now has
+     checked = 0, additional_text NULL, and the SAME tag_id as before.
+  4. test_save_tags_text_change_one_bump: o1 checked with text "a", then
+     checked with text "b" → exactly one new change_log row; text is "b".
+  5. test_save_tags_keeps_unsubmitted: save o1 and o2 (two options of
+     g1); then save a payload with only o1 changed → o2's row is
+     unchanged (same checked, same tag_id).
+  6. test_note_edit_with_same_tags_no_tag_bump: label a record with tags
+     via label_record, then update_result(record_id, tags=<same
+     payload>) → no new change_log row with source "tags".
+  Lists (call _insert_list_container(db, "l1") / "l2" first):
+  7. test_replace_lists_unchanged_no_bump: save two items, read version
+     and change_log length, save the same items again → both unchanged.
+  8. test_replace_lists_missing_sorted_at_keeps_stored: save an item with
+     sorted_at=5.0, save it again without sorted_at → no new change_log
+     row, get_lists shows sorted_at 5.0.
+  9. test_replace_lists_rename_one_bump: rename one of two items → exactly
+     one new change_log row (source "lists"); same item_id, new name.
+  10. test_replace_lists_remove_one_bump: drop one of two items → exactly
+     one new change_log row; the other item is untouched.
+  11. test_replace_lists_swap_names: items a="x", b="y" in list l1; save
+     a="y", b="x" → no error; get_lists shows a="y", b="x".
+  12. test_replace_lists_duplicate_rolls_back: save a="x"; then save
+     a="x", b="x" (same list) → sqlite3.IntegrityError, and get_lists
+     still shows only a="x"; no new change_log row.
+  Existing tests in test_change_tracking.py and test_database.py must
+  pass with no expectation changes (incl. the replace_lists ones).
+
+------------------------------------------------------------------------
+RUN (from the git root; see TEST RULES in context.txt)
+------------------------------------------------------------------------
+  Baseline (after 10e): 0 failures in these files (known; do not re-run).
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest tests/test_change_tracking.py -x -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest tests/test_database.py -q -p no:cacheprovider'
+  ruff check + ruff format --check on the two changed files.
+  Paste the output.
+
+DONE WHEN
+  - _save_tags upserts; no DELETE and no INSERT OR REPLACE remain in it.
+  - An unchanged save writes nothing (tests 1, 2, 6); a change is one
+    bump (tests 3, 4); tag_id is stable; unsubmitted options are kept.
+  - replace_lists writes only removed / new / changed items; identical
+    saves write nothing (tests 7, 8); a swap works (11); a failed save
+    writes nothing (12).
+  - Both docstrings describe the behaviour above.
+  - Only these files changed:
+      asreview/database/database.py
+      tests/test_change_tracking.py
+========================================================================
