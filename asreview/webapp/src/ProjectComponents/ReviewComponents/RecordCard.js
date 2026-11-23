@@ -43,6 +43,10 @@ import {
 
 import { fontSizeOptions } from "globals.js";
 
+// Live Zotero PDF check on the record card (see ZoteroFullTextButton).
+const ATTACHMENT_DWELL_MS = 3000;
+const ATTACHMENT_RECHECK_MS = 5 * 60 * 1000;
+
 const ZoteroFullTextButton = ({
   project_id,
   record,
@@ -50,27 +54,41 @@ const ZoteroFullTextButton = ({
   allowMemberReplace,
 }) => {
   // Resolving the Zotero attachment requires a live API call per record. To avoid
-  // firing one blocking request for every card at once (which monopolizes the server
-  // threads and trips Zotero's rate limit), only check once the card scrolls into
-  // view. `triggerOnce` keeps it checked afterwards.
-  const { ref, inView } = useInView({ triggerOnce: true, rootMargin: "200px" });
+  // firing one blocking request for every card scrolled past (which monopolizes the
+  // server threads and trips Zotero's rate limit), check only after the card has
+  // been in the viewport for ATTACHMENT_DWELL_MS without interruption. While it
+  // stays visible, re-check every ATTACHMENT_RECHECK_MS, also when a PDF was found
+  // (it can be removed in Zotero). staleTime keeps re-entries within that interval
+  // from refetching; a full page reload clears the cache and checks again.
+  const { ref, inView } = useInView();
+  const [dwelled, setDwelled] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!inView) {
+      setDwelled(false);
+      return undefined;
+    }
+    const timer = setTimeout(() => setDwelled(true), ATTACHMENT_DWELL_MS);
+    return () => clearTimeout(timer);
+  }, [inView]);
 
   const { data } = useQuery(
     ["fetchRecordAttachment", { project_id, record_id: record?.record_id }],
     ProjectAPI.fetchRecordAttachment,
     {
       enabled: !!(
-        inView &&
+        dwelled &&
         project_id &&
         record?.record_id !== undefined &&
         record?.record_id !== null &&
         record?.original_id
       ),
-      refetchOnWindowFocus: false,
-      refetchOnMount: false,
-      refetchOnReconnect: false,
-      staleTime: 5 * 60 * 1000,
-      cacheTime: 5 * 60 * 1000,
+      refetchOnWindowFocus: true,
+      refetchOnMount: true,
+      refetchOnReconnect: true,
+      refetchInterval: ATTACHMENT_RECHECK_MS,
+      staleTime: ATTACHMENT_RECHECK_MS,
+      cacheTime: ATTACHMENT_RECHECK_MS,
       retry: false,
     },
   );

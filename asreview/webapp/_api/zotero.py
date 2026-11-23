@@ -95,8 +95,9 @@ ZOTERO_API_BASE = "https://api.zotero.org"
 ZOTERO_WEB_BASE = "https://www.zotero.org"
 ZOTERO_API_VERSION = "3"
 
-# Re-check interval for on-demand attachment checks (record card scrolled into
-# view, LLM worker): every 5 minutes.
+# Re-check interval for failed attachment lookups by the LLM worker: every
+# 5 minutes. The record card's live check is paced by the client instead
+# (RecordCard.js: 3 s in view, then every 5 minutes).
 DEFAULT_RECHECK_INTERVAL = 300
 
 # The background sync (zotero_sync.py) skips records checked in the last 24 h.
@@ -193,17 +194,20 @@ def attachment_check_due(cached, max_age, now=None):
     return (now - last_checked).total_seconds() >= max_age
 
 
-def refresh_attachment(db, config, record, max_age):
+def refresh_attachment(db, config, record, max_age, recheck_keys=False):
     """Look up and cache a record's Zotero PDF attachment when due.
 
-    Does nothing (no network call) when Zotero is not configured, the
-    record has no ``original_id``, or ``attachment_check_due`` is False.
-    Otherwise queries Zotero and stores the attachment key, or the current
-    UTC timestamp when Zotero reports no PDF.
+    Does nothing (no network call) when Zotero is not configured or the
+    record has no ``original_id``. Otherwise a lookup runs when
+    ``attachment_check_due`` is True, or, with ``recheck_keys``, also when
+    a key is stored (the PDF may have been removed in Zotero since). The
+    lookup stores the attachment key when it differs from the stored value,
+    or the current UTC timestamp when Zotero reports no PDF.
 
-    Before storing a "no PDF" timestamp the record is re-read: if a key was
-    stored in the meantime (e.g. by a concurrent PDF upload) it is kept and
-    returned instead of being overwritten.
+    Before storing a "no PDF" timestamp the record is re-read: if a key
+    other than the one this call started from was stored in the meantime
+    (e.g. by a concurrent PDF upload) it is kept and returned instead of
+    being overwritten.
 
     Parameters
     ----------
@@ -214,6 +218,8 @@ def refresh_attachment(db, config, record, max_age):
         Record with ``record_id``, ``original_id`` and ``attachment``.
     max_age : float
         See ``attachment_check_due``.
+    recheck_keys : bool
+        Also look up a record whose stored value is an attachment key.
 
     Returns
     -------
@@ -226,20 +232,21 @@ def refresh_attachment(db, config, record, max_age):
         On a transient lookup failure. Nothing is written in that case.
     """
     cached = record.attachment
-    if (
-        not config.enabled
-        or not record.original_id
-        or not attachment_check_due(cached, max_age)
+    if not config.enabled or not record.original_id:
+        return cached
+    if not (recheck_keys and is_attachment_key(cached)) and not (
+        attachment_check_due(cached, max_age)
     ):
         return cached
 
     attachment_key = fetch_pdf_attachment_key(config, record.original_id)
     if attachment_key:
-        db.input.set_attachment(record.record_id, attachment_key)
+        if attachment_key != cached:
+            db.input.set_attachment(record.record_id, attachment_key)
         return attachment_key
 
     current = db.input.get_records(record.record_id).attachment
-    if is_attachment_key(current):
+    if is_attachment_key(current) and current != cached:
         return current
 
     checked_at = datetime.now(timezone.utc).isoformat()

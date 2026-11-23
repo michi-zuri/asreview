@@ -1,0 +1,134 @@
+========================================================================
+TASK 10f2 — live PDF check on the record card: 3 s in view, recheck
+           every 5 minutes, detect removed PDFs
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+STATUS: ALREADY IMPLEMENTED by Claude (2026-11-23), not yet committed.
+        This file records what was done. If you are given it, only
+        VERIFY (see RUN); do not re-implement.
+DEPENDS ON: 10f (record "version" in /labeled).
+SPEC: specs/0001-collection-snapshot.md, Part 3 (a record's version bumps
+      when its PDF appears or disappears). No spec text changes.
+
+WHY
+  Manual check of 10f: uploading a PDF bumped the record's version, but
+  removing the PDF in Zotero was never detected.
+  - Server: refresh_attachment skipped every record whose stored value is
+    an attachment key (attachment_check_due returns False for a key), so
+    a found PDF was final.
+  - Client: RecordCard.js used useInView({ triggerOnce: true,
+    rootMargin: "200px" }) with staleTime 5 min and refetchOnMount /
+    refetchOnWindowFocus false, so each record was checked once per page
+    load, however long the card stayed on screen.
+
+  The user decided:
+  - A card checks Zotero only after it has been in the viewport for 3 s
+    without interruption (a quick scroll fires nothing).
+  - While it stays visible, it rechecks every 5 minutes without any user
+    interaction (no scrolling; just an open tab).
+  - Found PDFs are rechecked too (they can be removed in Zotero).
+  - At least 5 minutes between two requests for the same record, except
+    on a full page reload.
+  - triggerOnce false; refetchOnMount / refetchOnWindowFocus true.
+
+FACTS (verified)
+  - trg_ct_record_attachment (database.py) bumps the record's version
+    only when OLD.attachment IS NOT NEW.attachment and one side is an
+    attachment key. key → timestamp (PDF removed) bumps; timestamp →
+    newer timestamp (another failed check) does not.
+  - refresh_attachment callers: the attachment route (projects.py), the
+    LLM worker (llm_worker.py, DEFAULT_RECHECK_INTERVAL = 300, skips keys
+    itself) and the background sync (zotero_sync.py, 24 h).
+  - react-query v3: a disabled query (enabled false) returns cached data
+    and never refetches; refetchInterval runs only while enabled and
+    (refetchIntervalInBackground false) while the tab is visible.
+
+------------------------------------------------------------------------
+CHANGE (asreview/webapp/_api/zotero.py)
+------------------------------------------------------------------------
+  1. refresh_attachment(db, config, record, max_age, recheck_keys=False):
+     - no lookup when Zotero is not configured or no original_id;
+     - lookup when attachment_check_due(cached, max_age), or, with
+       recheck_keys, also when cached is an attachment key;
+     - a found key is written only when it differs from cached;
+     - "no PDF": re-read the record; keep and return the current value
+       only if it is a key OTHER than cached (concurrent upload).
+       Otherwise write the UTC timestamp (this is how a removed PDF
+       becomes a timestamp and bumps the version).
+     - docstring describes recheck_keys and the race rule.
+  2. Comment at DEFAULT_RECHECK_INTERVAL: used by the LLM worker; the
+     card's live check is paced by the client.
+  LLM worker and background sync are unchanged (recheck_keys False).
+
+------------------------------------------------------------------------
+CHANGE (asreview/webapp/_api/projects.py, api_get_record_attachment)
+------------------------------------------------------------------------
+  refresh_attachment(db, config, record, 0, recheck_keys=True): every
+  request looks Zotero up, keys included. No server-side 5-minute rule,
+  so a full page reload rechecks at once; the client paces the requests.
+  Docstring updated. The now unused DEFAULT_RECHECK_INTERVAL import is
+  removed. The missing_pdf dispatch cleanup is unchanged.
+
+------------------------------------------------------------------------
+CHANGE (asreview/webapp/src/ProjectComponents/ReviewComponents/RecordCard.js,
+        ZoteroFullTextButton)
+------------------------------------------------------------------------
+  - Module constants ATTACHMENT_DWELL_MS = 3000 and
+    ATTACHMENT_RECHECK_MS = 5 * 60 * 1000.
+  - useInView() (no triggerOnce, no rootMargin: only cards actually on
+    screen). A `dwelled` state: an effect starts a 3 s timer when inView
+    turns true, clears it and sets dwelled false when inView turns false.
+  - The query is enabled on `dwelled` (instead of inView) plus the
+    existing project_id / record_id / original_id conditions;
+    refetchOnWindowFocus, refetchOnMount, refetchOnReconnect true;
+    refetchInterval, staleTime and cacheTime ATTACHMENT_RECHECK_MS.
+    staleTime keeps a re-entry within 5 minutes from refetching (the
+    cached answer is shown at once); a full page reload clears the
+    cache.
+  - Comment above useInView explains the pacing.
+  Side effects (accepted): the PDF link appears 3 s after the card
+  becomes visible; each open tab sends at most one request per visible
+  card per 5 minutes, with no server-side limit across tabs or users.
+
+------------------------------------------------------------------------
+TESTS (asreview/webapp/tests/test_api/test_zotero.py)
+------------------------------------------------------------------------
+  New:
+    test_refresh_attachment_key_not_rechecked_by_default
+    test_refresh_attachment_recheck_key_still_there (same key: no write)
+    test_refresh_attachment_recheck_key_removed (key → timestamp)
+    test_refresh_attachment_recheck_key_replaced (new key written)
+    test_refresh_attachment_recheck_race_with_concurrent_upload
+  Replaced: test_attachment_route_caches_failed_lookup (pinned the old
+  server-side 5-minute rule) by test_attachment_route_checks_every_request:
+  two requests → two lookups; then a PDF appears (available true) and is
+  removed again (available false, stored value no longer a key).
+  No client tests exist for RecordCard.
+
+------------------------------------------------------------------------
+RUN (from the git root; see TEST RULES in context.txt)
+------------------------------------------------------------------------
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest asreview/webapp/tests/test_api/test_zotero.py asreview/webapp/tests/test_api/test_zotero_sync.py asreview/webapp/tests/test_api/test_pdf_resolver.py -q -p no:cacheprovider'
+  Result 2026-11-23: 34 passed.
+  ruff check + ruff format --check on zotero.py, projects.py,
+  test_zotero.py: clean. prettier --check and eslint on RecordCard.js:
+  clean.
+
+MANUAL CHECK (user)
+  1. Look at a card with a PDF for 3 s: one /attachment request appears
+     (devtools → Network, filter "attachment"); a quick scroll past cards
+     sends none.
+  2. Leave it on screen: the next request comes after 5 minutes.
+  3. Remove the PDF in Zotero, reload, wait 3 s: the card shows no PDF.
+     After the next /labeled load, that record's "version" is higher.
+
+DONE WHEN
+  - A removed PDF is detected and bumps the record's version.
+  - Requests are paced as above; tests and linters pass.
+  - Only these files changed:
+      asreview/webapp/_api/zotero.py
+      asreview/webapp/_api/projects.py
+      asreview/webapp/src/ProjectComponents/ReviewComponents/RecordCard.js
+      asreview/webapp/tests/test_api/test_zotero.py
+      llm_prompts/10f2.txt
+========================================================================

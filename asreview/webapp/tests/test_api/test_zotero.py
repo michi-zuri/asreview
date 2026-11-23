@@ -229,6 +229,69 @@ def test_refresh_attachment_race_with_concurrent_upload(monkeypatch):
     assert db.input.writes == []
 
 
+def test_refresh_attachment_key_not_rechecked_by_default(monkeypatch):
+    """Without recheck_keys a stored key is final: no lookup, no write."""
+    db, record = _make_db(attachment="ABCD1234")
+    calls = _fake_fetch(monkeypatch, None)
+
+    result = refresh_attachment(db, make_config(), record, 0)
+
+    assert result == "ABCD1234"
+    assert calls == []
+    assert db.input.writes == []
+
+
+def test_refresh_attachment_recheck_key_still_there(monkeypatch):
+    """recheck_keys: the same key found again is not written."""
+    db, record = _make_db(attachment="ABCD1234")
+    calls = _fake_fetch(monkeypatch, "ABCD1234")
+
+    result = refresh_attachment(db, make_config(), record, 0, recheck_keys=True)
+
+    assert result == "ABCD1234"
+    assert len(calls) == 1
+    assert db.input.writes == []
+
+
+def test_refresh_attachment_recheck_key_removed(monkeypatch):
+    """recheck_keys: a PDF removed in Zotero replaces the key with a timestamp."""
+    db, record = _make_db(attachment="ABCD1234")
+    _fake_fetch(monkeypatch, None)
+
+    result = refresh_attachment(db, make_config(), record, 0, recheck_keys=True)
+
+    assert not is_attachment_key(result)
+    assert datetime.fromisoformat(result).tzinfo is not None
+    assert db.input.writes == [(7, result)]
+
+
+def test_refresh_attachment_recheck_key_replaced(monkeypatch):
+    """recheck_keys: a different PDF in Zotero replaces the stored key."""
+    db, record = _make_db(attachment="ABCD1234")
+    _fake_fetch(monkeypatch, "WXYZ9876")
+
+    result = refresh_attachment(db, make_config(), record, 0, recheck_keys=True)
+
+    assert result == "WXYZ9876"
+    assert db.input.writes == [(7, "WXYZ9876")]
+
+
+def test_refresh_attachment_recheck_race_with_concurrent_upload(monkeypatch):
+    """recheck_keys: a new key stored during the lookup is kept."""
+    db, record = _make_db(attachment="ABCD1234")
+
+    def stub(config, item_key):
+        record.attachment = "WXYZ9876"
+        return None
+
+    monkeypatch.setattr("asreview.webapp._api.zotero.fetch_pdf_attachment_key", stub)
+
+    result = refresh_attachment(db, make_config(), record, 0, recheck_keys=True)
+
+    assert result == "WXYZ9876"
+    assert db.input.writes == []
+
+
 def test_refresh_attachment_zotero_disabled(monkeypatch):
     """No fetch happens when Zotero is not configured."""
     config = ZoteroConfig(
@@ -244,8 +307,8 @@ def test_refresh_attachment_zotero_disabled(monkeypatch):
     assert db.input.writes == []
 
 
-def test_attachment_route_caches_failed_lookup(client, project, monkeypatch):
-    """The viewport contract: lookup runs once, then only after 5 minutes."""
+def test_attachment_route_checks_every_request(client, project, monkeypatch):
+    """Every request looks up Zotero (the client paces them), keys included."""
     Path(project.project_path, "zotero.json").write_text(
         json.dumps({"group_id": "123", "api_key": "KEY"})
     )
@@ -270,21 +333,24 @@ def test_attachment_route_caches_failed_lookup(client, project, monkeypatch):
     assert body["checked_at"] is not None
     assert len(calls) == 1
 
-    # Immediately again: the recent failed lookup is not repeated.
-    res = client.get(url)
-    assert res.status_code == 200
-    assert res.get_json()["available"] is False
-    assert len(calls) == 1
-
-    # Age the cached timestamp past the 5-minute rule -> lookup runs again.
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
-    with asr_project.db as db:
-        db.input.set_attachment(rid, stale)
-
+    # Immediately again: looked up again (a full page reload must re-check).
     res = client.get(url)
     assert res.status_code == 200
     assert res.get_json()["available"] is False
     assert len(calls) == 2
+
+    # A PDF appears in Zotero, then is removed again: both are detected.
+    calls = _fake_fetch(monkeypatch, "ABCD1234")
+    res = client.get(url)
+    assert res.get_json()["available"] is True
+    assert len(calls) == 1
+
+    calls = _fake_fetch(monkeypatch, None)
+    res = client.get(url)
+    assert res.get_json()["available"] is False
+    assert len(calls) == 1
+    with asr_project.db as db:
+        assert not is_attachment_key(db.input.get_records(rid).attachment)
 
 
 def test_attachment_route_clears_missing_pdf(client, project, monkeypatch):
@@ -318,12 +384,8 @@ def test_attachment_route_clears_missing_pdf(client, project, monkeypatch):
     assert res.get_json()["available"] is False
     assert dispatch_row() == ("missing_pdf",)
 
-    # Age the cached timestamp past the 5-minute rule and find a PDF: the
-    # row is deleted and nothing is queued in its place.
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
-    with asr_project.db as db:
-        db.input.set_attachment(rid, stale)
-
+    # A PDF appears in Zotero on the next request: the row is deleted and
+    # nothing is queued in its place.
     _fake_fetch(monkeypatch, "ABCD1234")
     res = client.get(url)
     assert res.status_code == 200

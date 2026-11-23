@@ -3,7 +3,10 @@ from datetime import datetime, timezone
 import pandas as pd
 
 import asreview as asr
+import asreview.webapp._api.projects as projects_mod
 import asreview.webapp.tests.utils.api_utils as au
+from asreview.database.database import Database
+from asreview.database.store import DataStore
 from asreview.webapp._api.projects import (
     _decode_cursor,
     _encode_cursor,
@@ -520,3 +523,94 @@ def test_put_note_returns_row(client, project):
     assert r.status_code == 200
     assert r.json["success"] is True
     assert r.json["result"]["state"]["note"] == "hello"
+
+
+def test_labeled_rows_have_versions(client, project):
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    ids = [r["record_id"] for r in res.json["result"]][:3]
+    for rid in ids:
+        au.label_project_record(client, project, rid, label=1)
+
+    labeled = _labeled(client, project).json
+    assert len(labeled["result"]) == 3
+    versions = [row["version"] for row in labeled["result"]]
+    assert all(isinstance(v, int) and v > 0 for v in versions)
+    assert labeled["watermark"] >= max(versions)
+    assert isinstance(labeled["config_version"], int)
+
+
+def test_unlabeled_rows_version_zero_or_more(client, project):
+    r = _labeled(client, project, subset="unlabeled", per_page=10)
+    assert r.status_code == 200
+    for row in r.json["result"]:
+        assert isinstance(row["version"], int)
+        assert row["version"] >= 0
+
+
+def test_put_note_bumps_version(client, project):
+    project_id = au.get_project_id(project)
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    rid = res.json["result"][0]["record_id"]
+    au.label_project_record(client, project, rid, label=1)
+
+    v1 = next(
+        row["version"]
+        for row in _labeled(client, project).json["result"]
+        if row["record_id"] == rid
+    )
+
+    r = client.put(
+        f"/api/projects/{project_id}/record/{rid}/note",
+        data={"note": "hello"},
+    )
+    assert r.status_code == 200
+    v2 = r.json["result"]["version"]
+    assert v2 > v1
+
+    labeled = _labeled(client, project).json
+    row = next(row for row in labeled["result"] if row["record_id"] == rid)
+    assert row["version"] == v2
+    assert labeled["watermark"] >= v2
+
+
+def test_watermark_read_before_rows(client, project, monkeypatch):
+    # The watermark must be read before the rows: /labeled reads results via
+    # sqlite3 and records via SQLAlchemy (two snapshots), so reading the
+    # watermark first means a concurrent write can only make the rows newer
+    # than it (D11). We verify the ordering by recording calls to
+    # Database.get_project_state (the watermark), _iter_labeled_matches (the
+    # results scan through sqlite3) and DataStore.get_records (the record
+    # fetch inside _build_rows). The view looks _iter_labeled_matches up in
+    # the module at call time, so patching the module attribute works.
+    res = au.search_project_data(client, project, query="The&n_max=10")
+    rid = res.json["result"][0]["record_id"]
+    au.label_project_record(client, project, rid, label=1)
+
+    calls = []
+    orig_ps = Database.get_project_state
+    orig_gr = DataStore.get_records
+    orig_iter = projects_mod._iter_labeled_matches
+
+    def tracking_ps(self):
+        calls.append("get_project_state")
+        return orig_ps(self)
+
+    def tracking_gr(self, record_id=None):
+        calls.append("get_records")
+        return orig_gr(self, record_id)
+
+    def tracking_iter(*args, **kwargs):
+        calls.append("scan")
+        return orig_iter(*args, **kwargs)
+
+    monkeypatch.setattr(Database, "get_project_state", tracking_ps)
+    monkeypatch.setattr(projects_mod, "_iter_labeled_matches", tracking_iter)
+    monkeypatch.setattr(DataStore, "get_records", tracking_gr)
+
+    _labeled(client, project)
+
+    assert "get_project_state" in calls
+    assert "scan" in calls
+    assert "get_records" in calls
+    assert calls.index("get_project_state") < calls.index("scan")
+    assert calls.index("get_project_state") < calls.index("get_records")

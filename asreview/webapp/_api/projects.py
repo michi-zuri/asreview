@@ -87,7 +87,6 @@ from asreview.webapp._api.utils import read_tags_data
 from asreview.webapp._api.zotero import ZoteroLookupError
 from asreview.webapp._api.zotero import ZoteroDeleteError
 from asreview.webapp._api.zotero import ZoteroUploadError
-from asreview.webapp._api.zotero import DEFAULT_RECHECK_INTERVAL
 from asreview.webapp._api.zotero import build_reader_url
 from asreview.webapp._api.zotero import delete_pdf as delete_zotero_pdf
 from asreview.webapp._api.zotero import get_zotero_config
@@ -1105,16 +1104,17 @@ def _build_rows(db, project, states):
     """Build ``/labeled``-shaped rows from result/unlabeled state rows.
 
     A row is ``asdict(record)`` plus a ``state`` dict with every results
-    column (missing values converted to ``None``) and the record's ``lists``.
-    It does NOT embed ``tags_form``, ``lists_form`` or a ``user`` object; the
-    caller adds those once per response.
+    column (missing values converted to ``None``), the record's ``lists`` and
+    a top-level ``version`` (Spec 0001; 0 when the record has no
+    ``record_versions`` row). It does NOT embed ``tags_form``, ``lists_form``
+    or a ``user`` object; the caller adds those once per response.
 
     Parameters
     ----------
     db : asreview.database.database.Database
         An open database connection.
     project : asreview.project.Project
-        The open project (unused for now; Part 3 adds the record version).
+        The open project (unused).
     states : iterable[pd.Series]
         The state rows to materialise.
 
@@ -1129,6 +1129,7 @@ def _build_rows(db, project, states):
     ids = [int(s["record_id"]) for s in states]
     records = db.input.get_records(ids)
     lists_by_record = db.get_lists_for_records(ids)
+    versions = db.get_record_versions(ids)
     result = []
     for state, record in zip(states, records):
         record_d = asdict(record)
@@ -1138,6 +1139,7 @@ def _build_rows(db, project, states):
         }
         state_d["lists"] = lists_by_record.get(int(state["record_id"]), [])
         record_d["state"] = state_d
+        record_d["version"] = int(versions.get(int(state["record_id"]), 0))
         result.append(record_d)
     return result
 
@@ -1182,6 +1184,11 @@ def api_get_labeled(project):  # noqa: F401
     users = _users_map(project)
 
     with project.db as db:
+        # Read the watermark BEFORE the rows (D11): /labeled reads results
+        # through sqlite3 and records through SQLAlchemy (two connections,
+        # two snapshots), so a concurrent write can only make the rows newer
+        # than this value — never miss a change.
+        ps = db.get_project_state()
         batch_size = (per_page + 1) if not q["post_scan"] else max(per_page + 1, 500)
         matched = []
         has_next = False
@@ -1202,6 +1209,8 @@ def api_get_labeled(project):  # noqa: F401
         {
             "count": len(result),
             "next_cursor": next_cursor,
+            "watermark": ps["version"],
+            "config_version": ps["config_version"],
             "result": result,
             "forms": _collection_forms(project, q["tags_form"]),
             "users": users,
@@ -2615,8 +2624,9 @@ def api_get_record_attachment(project, record_id):  # noqa: F401
     The record's ``original_id`` is treated as a Zotero item key. We look up the PDF
     attachment of that item through the Zotero API and cache the result in the record's
     ``attachment`` field: either the attachment key (full text available) or an ISO 8601
-    timestamp of when the lookup last failed. The lookup is re-run when the record was
-    never checked or when a previous failed check has gone stale.
+    timestamp of when the lookup last failed. Every request looks up Zotero again, also
+    when a key is stored (the PDF may have been removed since). The client paces the
+    requests (RecordCard.js: 3 s in view, then every 5 minutes while visible).
     """
     record_id = int(record_id)
 
@@ -2638,7 +2648,7 @@ def api_get_record_attachment(project, record_id):  # noqa: F401
             return abort(404)
 
         try:
-            value = refresh_attachment(db, config, record, DEFAULT_RECHECK_INTERVAL)
+            value = refresh_attachment(db, config, record, 0, recheck_keys=True)
         except ZoteroLookupError:
             # Transient failure: nothing cached, retried on the next request.
             value = record.attachment
