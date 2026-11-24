@@ -62,6 +62,8 @@ def assert_valid_project(project):
             "0000_tags_tables",
             "0001_change_tracking",
             "0002_user_version_mark",
+            "0003_record_versions_version_idx",
+            "0004_project_id_consistency",
         }
 
         # Verify tag_groups uses group_id (UUID v7 TEXT PK)

@@ -1,0 +1,397 @@
+========================================================================
+TASK 10g2 — prune_change_log: no write lock unless pruning is due,
+           refuse an open transaction, never fail a poll; make every
+           case of the equivalence test real
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10g (staged, NOT committed). 10g, 10g2 and 10g3 are
+            committed together by the user. Do not commit.
+SPEC: specs/0001-collection-snapshot.md, Part 4 and the note "Sync reads
+      `record_versions`, not `change_log` (2026-11-23)". No spec text
+      changes above the marker; this task appends one note below it.
+
+WHY
+  Review of 10g (Claude, 2026-11-24) found three problems:
+
+  1. Every poll takes the database write lock. prune_change_log runs
+     BEGIN IMMEDIATE BEFORE it checks the once-per-hour gate, so every
+     labeled/changes call (every 15 s per open tab) competes for the
+     write lock with the LLM worker, the Zotero sync and saves.
+     Measured on a copy of a real project (scratch, 2026-11-24): with
+     another connection holding the write lock, opening the Database,
+     get_project_state and get_changes_since each take 0 ms, and
+     prune_change_log fails with "database is locked" after 5.2 s
+     (sqlite3's default 5 s busy timeout). So a long write (bulk
+     relabel, import) makes polls fail.
+  2. prune_change_log does not guard against an open transaction. If
+     the connection is already in a transaction, BEGIN IMMEDIATE raises
+     "cannot start a transaction within a transaction". Safe in the
+     endpoint today (the prune is the first statement on a fresh
+     Database), but not for any other caller.
+  3. Many cases of test_ids_equal_concatenated_pages check nothing:
+     with 15 relevant / 15 irrelevant / 10 notes at per_page=7,
+     relevant, irrelevant and every has_note case run out of rows
+     before page 3 (boundary is always "end"); unlabeled + has_note has
+     no matches at all; no record has a PDF, so pdf=false returns the
+     same rows as no filter. Measured with an injected bug (labeled/ids
+     ignoring the pdf filter): none of the 24 matrix cases fail; only
+     the final "every loaded row leaves" block catches it.
+
+  The user decided: fix all three in a follow-up task.
+  Proposed by Claude and confirmed by the user (2026-11-24):
+  - An open transaction makes prune_change_log RAISE, not commit. A
+    silent commit would commit someone else's half-done work.
+  - A busy database (SQLITE_BUSY) while pruning is logged and ignored
+    by the endpoint: change_log is a debugging history, so pruning must
+    never fail a poll. Any other error still propagates.
+
+FACTS (verified 2026-11-24 — trust these)
+  - asreview/database/database.py, Database.prune_change_log(self,
+    older_than_s=7 * 86400, min_interval_s=3600, now=None): today it
+    does con.execute("BEGIN IMMEDIATE") first, then reads
+    last_pruned_at from project_state inside the transaction, returns 0
+    when now - last_pruned_at < min_interval_s, else deletes rows with
+    changed_at < now - older_than_s, sets last_pruned_at = now and
+    pruned_version = MAX(pruned_version, COALESCE(max_deleted, 0)),
+    commits and returns the deleted count. rollback on BaseException.
+  - The connection uses Python's legacy transaction control (default
+    isolation_level): a plain SELECT does not open a transaction;
+    INSERT/UPDATE/DELETE do (con.in_transaction becomes True).
+  - Opening a read-write Database (open_db) does NOT need the write
+    lock: its CREATE ... IF NOT EXISTS statements are no-ops on an
+    existing schema and succeed while another connection holds the
+    lock (measured).
+  - sqlite3.OperationalError carries e.sqlite_errorcode (Python 3.11+).
+    It is the EXTENDED result code: a duplicate primary key gives 1555
+    (SQLITE_CONSTRAINT_PRIMARYKEY), not 19. The busy variants are
+    SQLITE_BUSY 5, SQLITE_BUSY_RECOVERY 261, SQLITE_BUSY_SNAPSHOT 517
+    and SQLITE_BUSY_TIMEOUT 773; all are sqlite3 module constants. The
+    low byte (code & 0xFF) is the primary code, so all four give 5. The
+    busy-timeout case measured on 2026-11-24 gave exactly 5. The
+    attribute is writable on a hand-made exception, so a test can build
+    one:
+        e = sqlite3.OperationalError("database is locked")
+        e.sqlite_errorcode = sqlite3.SQLITE_BUSY
+  - asreview/webapp/_api/projects.py, api_get_labeled_changes: the
+    first statement inside `with project.db as db:` is
+    `db.prune_change_log()`, followed by a comment and
+    `ps = db.get_project_state()`. projects.py already imports logging
+    and sqlite3.
+  - Webapp tests run with app.config["TESTING"] = True
+    (asreview/webapp/tests/conftest.py), so an exception raised in a
+    view propagates to the test client call.
+  - asreview/webapp/tests/test_api/test_collection_sync.py: _label_30
+    and _page_three are used ONLY by test_ids_equal_concatenated_pages.
+    The `client` fixture is parametrized over three clients
+    (client_auth, client_implicit_auth, client_no_auth); the `project`
+    fixture creates a project from synergy:van_der_Valk_2021 (record
+    ids 0…N, several hundred records).
+  - Database.query_top_ranked(user_id) checks out the best-ranked
+    record that has no results row or a results row with label NULL
+    and user_id NULL; it needs a last_ranking (add_last_ranking(ids,
+    "nb", "max", "balanced", "tfidf", 0) ranks ids in list order). It
+    returns get_pending(user_id): ALL pending rows of that user.
+    update_note works on pending rows (results row, label NULL), which
+    is the only way to give an UNLABELED record a note.
+  - tests/test_change_tracking.py: the db / db_with_records fixtures
+    use a FILE database at Path(tmpdir, "test.db") (db.fp is the
+    path). Existing tests test_prune_change_log and
+    test_get_changes_since_unaffected_by_prune must keep passing
+    unchanged.
+
+PROTOTYPE (scratch copy of the staged 10g tree, 2026-11-24)
+  The exact changes and tests below were applied to a scratch copy:
+  tests/test_change_tracking.py 53 passed (50 + the 3 new),
+  test_collection_sync.py 42 passed (3 clients x (10 existing tests
+  + 3 cases of the busy test + 1 other-error test)).
+  Expect the same counts.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - database.py: prune_change_log and get_project_state
+  - projects.py: api_get_labeled_changes
+  - test_collection_sync.py (whole file)
+  - tests/test_change_tracking.py: the fixtures at the top and every
+    test after test_replace_lists_duplicate_rolls_back
+
+------------------------------------------------------------------------
+CHANGE (asreview/database/database.py)
+------------------------------------------------------------------------
+  1. New private method, directly above prune_change_log:
+
+     def _prune_due(self, now, min_interval_s):
+         """Whether pruning is due: never pruned, or the last prune is
+         at least ``min_interval_s`` old. A plain read; takes no write
+         lock."""
+         row = self._conn.execute(
+             "SELECT last_pruned_at FROM project_state"
+         ).fetchone()
+         last_pruned_at = row[0] if row is not None else None
+         return last_pruned_at is None or now - last_pruned_at >= min_interval_s
+
+  2. prune_change_log becomes (same signature, same return value):
+
+        if now is None:
+            now = time.time()
+        con = self._conn
+        if con.in_transaction:
+            raise RuntimeError(
+                "prune_change_log() must not run inside an open transaction"
+            )
+        # Cheap check without the write lock: almost every call ends here.
+        if not self._prune_due(now, min_interval_s):
+            return 0
+        cur = con.cursor()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            # Check again under the lock: another process may have pruned
+            # between the first check and BEGIN IMMEDIATE.
+            if not self._prune_due(now, min_interval_s):
+                con.commit()
+                return 0
+            ... (the existing cutoff / SELECT MAX / DELETE / UPDATE /
+                 commit / return deleted, unchanged)
+        except BaseException:
+            con.rollback()
+            raise
+
+     Update the docstring: it takes the write lock only when pruning is
+     due (at most once per min_interval_s); it raises RuntimeError
+     inside an open transaction; it may raise sqlite3.OperationalError
+     (SQLITE_BUSY) when pruning is due and another writer holds the
+     lock longer than the busy timeout. Add a "Raises" section.
+
+  This was prototyped against a copy of a real project (scratch,
+  2026-11-24) with these results: not due + another writer holding the
+  lock → returns 0 in 0 ms; due + unlocked → prunes; another process
+  pruning between the two checks → returns 0 without writing; open
+  transaction → RuntimeError; due + locked → OperationalError after
+  ~5 s, with con.in_transaction False afterwards.
+
+------------------------------------------------------------------------
+CHANGE (asreview/webapp/_api/projects.py, api_get_labeled_changes)
+------------------------------------------------------------------------
+  Keep the existing comment line ("Opportunistic prune of the debugging
+  log, at most once per hour.") and replace only the bare
+  `db.prune_change_log()` below it by:
+
+        try:
+            db.prune_change_log()
+        except sqlite3.OperationalError as e:
+            # change_log is a debugging history: a busy database must
+            # never fail a poll. Pruning runs again on a later poll.
+            # sqlite_errorcode is the extended code (e.g.
+            # SQLITE_BUSY_TIMEOUT); its low byte is the primary code.
+            if e.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY:
+                raise
+            logging.warning(
+                "Skipped change_log pruning for project %s: database busy",
+                project.project_id,
+            )
+
+  Keep the comment and code that follow (watermark read first, D11)
+  unchanged. No other change to the view.
+
+------------------------------------------------------------------------
+TESTS
+------------------------------------------------------------------------
+  A. tests/test_change_tracking.py (add after
+     test_get_changes_since_unaffected_by_prune):
+
+  1. test_prune_change_log_not_due_takes_no_lock(db_with_records):
+     label_record(1, 1); prune once with now = MAX(changed_at) + 8 days
+     (sets last_pruned_at). Open a second connection
+     sqlite3.connect(str(db_with_records.fp), timeout=0), execute
+     "BEGIN IMMEDIATE" on it (it now holds the write lock). Call
+     prune_change_log(now=<same now> + 10) → returns 0, and
+     time.monotonic() shows it took < 1 s. Roll back and close the
+     second connection in a finally block.
+
+  2. test_prune_change_log_rechecks_under_lock(db_with_records,
+     monkeypatch): label two records. Simulate another process that
+     prunes between the first check and BEGIN IMMEDIATE: wrap the real
+     Database._prune_due so that on its FIRST call it returns the real
+     result and then, through a separate
+     sqlite3.connect(str(db_with_records.fp)), sets
+     project_state.last_pruned_at = now and commits. Call
+     prune_change_log(now=MAX(changed_at) + 8 days) → returns 0; both
+     change_log rows still exist; last_pruned_at == now (written by the
+     "other process", not by this call); pruned_version unchanged (0).
+     The wrapper records each result in a list `calls`; assert
+     calls == [True, False]. This proves that the first check said
+     "due" and the recheck under the lock said "not due".
+
+  3. test_prune_change_log_refuses_open_transaction(db_with_records):
+     db_with_records._conn.execute(
+         "UPDATE project_state SET config_version = config_version")
+     → assert db_with_records._conn.in_transaction; pytest.raises
+     RuntimeError on prune_change_log(); then rollback().
+
+  B. asreview/webapp/tests/test_api/test_collection_sync.py
+
+  1. Replace _label_30, _page_three and test_ids_equal_concatenated_pages
+     with the version below. It was prototyped and passes on all three
+     clients against the staged 10g code (scratch, 2026-11-24, 3 passed
+     in ~5.6 s). It also fails on the injected "labeled/ids ignores the
+     pdf filter" bug at its first pdf case. Keep its checks: every case
+     must end on a real cursor with full pages, and every filter must
+     remove at least one row inside the window. These checks keep the
+     test from going blind again. Do not loosen them; if one fails,
+     change the data setup and say so in the report.
+
+     PER_PAGE = 2
+     PAGES = 3
+     FILTERS = ([], ["has_note"], ["pdf=false"], ["pdf"])
+     SUBSETS = ("relevant", "irrelevant", "all", "unlabeled")
+
+     def _setup_equivalence(client, project):
+         """Label 40 records and give the matrix of the equivalence test
+         real work.
+
+         Records labeled 0..39 alternate relevant / irrelevant. Notes on
+         labeled records with i % 4 in (0, 1) (10 relevant, 10
+         irrelevant) and on 8 pending (checked-out, unlabeled) records
+         spread over the id range. A Zotero attachment key on labeled
+         records with i % 5 < 3 (12 of 20 per label) and on every second
+         unlabeled record. With PER_PAGE * PAGES = 6, every (subset,
+         filter) case has more than 6 matches, so every boundary is a
+         real cursor.
+         """
+         res = au.search_project_data(client, project, query="The&n_max=80")
+         ids = [r["record_id"] for r in res.json["result"]][:40]
+         assert len(ids) == 40
+         for i, rid in enumerate(ids):
+             au.label_project_record(
+                 client, project, rid, label=1 if i % 2 == 0 else 0
+             )
+         with asr.Project(project.project_path) as p:
+             db = p.db
+             for i, rid in enumerate(ids):
+                 if i % 4 in (0, 1):
+                     db.update_note(rid, "hello")
+             all_ids = db.input["record_id"].tolist()
+             # Rank every 50th record first, so the pending records are
+             # spread over the id range (not all at one end).
+             first = all_ids[::50]
+             ranked = first + [r for r in all_ids if r not in first]
+             db.add_last_ranking(ranked, "nb", "max", "balanced", "tfidf", 0)
+             for _ in range(8):
+                 pending = db.query_top_ranked(user_id=1)
+             for rid in pending["record_id"].tolist():
+                 db.update_note(int(rid), "pending note")
+             labeled = set(ids)
+             unlabeled = [r for r in all_ids if r not in labeled]
+             with_pdf = [r for i, r in enumerate(ids) if i % 5 < 3]
+             for rid in with_pdf + unlabeled[::2]:
+                 db.input.set_attachment(rid, "ABCD1234")
+         return ids
+
+     def _page_three(client, project, subset, latest_first, filters):
+         """Page /labeled up to PAGES pages; return (ids, boundary,
+         last next_cursor)."""
+         params = {"subset": subset, "latest_first": latest_first,
+                   "per_page": PER_PAGE}
+         if filters:
+             params["filter"] = filters
+         ids, cursor, last_next = [], None, None
+         for _ in range(PAGES):
+             if cursor:
+                 params["cursor"] = cursor
+             page = _labeled(client, project, **params).json
+             ids.extend(item["record_id"] for item in page["result"])
+             last_next = page["next_cursor"]
+             if not last_next:
+                 break
+             cursor = last_next
+         return ids, (last_next or "end"), last_next
+
+     In test_ids_equal_concatenated_pages, the matrix loop becomes:
+
+         _setup_equivalence(client, project)
+         unfiltered = {}
+         for subset in SUBSETS:
+             for latest_first in (1, 0):
+                 for filters in FILTERS:
+                     case = (subset, latest_first, tuple(filters))
+                     paged, boundary, last_next = _page_three(
+                         client, project, subset, latest_first, filters)
+                     # The case is real: a cursor boundary after full
+                     # pages ...
+                     assert last_next is not None, case
+                     assert len(paged) == PER_PAGE * PAGES, case
+                     # ... and the filter removes a row inside the window.
+                     if not filters:
+                         unfiltered[(subset, latest_first)] = paged
+                     else:
+                         assert paged != unfiltered[(subset, latest_first)], case
+                     params = {"subset": subset, "latest_first": latest_first}
+                     if filters:
+                         params["filter"] = filters
+                     r = _ids(client, project, boundary=boundary, **params)
+                     assert r.status_code == 200, case
+                     assert [i[0] for i in r.json["items"]] == paged, case
+                     assert r.json["next_cursor"] is not None, case
+
+     ([] must come first in FILTERS: the unfiltered ids are stored
+     before the filtered cases compare against them.)
+     Keep the two blocks that follow the matrix today, VERBATIM:
+     boundary="end" down to exhaustion, and every loaded row leaving
+     the filter → items == [] and next_cursor == the boundary sent.
+     They pass unchanged with the new data setup (prototype).
+
+  2. test_changes_prune_busy_does_not_fail_poll(client, project,
+     monkeypatch, caplog, code), parametrized over code in
+     (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_TIMEOUT,
+     sqlite3.SQLITE_BUSY_SNAPSHOT): monkeypatch
+     Database.prune_change_log (import Database from
+     asreview.database.database) with a function that raises a
+     hand-made OperationalError with that sqlite_errorcode (see FACTS).
+     Label one record, then poll labeled/changes with since=0,
+     boundary="end", subset="relevant" inside
+     caplog.at_level(logging.WARNING) → 200, "reset" not in the
+     response, the labeled record's id is among
+     [c["record_id"] for c in r.json["changes"]], and
+     "Skipped change_log pruning" is in caplog.text.
+
+  3. test_changes_prune_other_error_propagates(client, project,
+     monkeypatch): same, but the error's sqlite_errorcode is
+     sqlite3.SQLITE_CORRUPT → the request raises
+     sqlite3.OperationalError (pytest.raises around the client call;
+     TESTING propagates view exceptions).
+
+------------------------------------------------------------------------
+SPEC NOTE (append at the END of specs/0001-collection-snapshot.md)
+------------------------------------------------------------------------
+  ### Polls never take the write lock for pruning (10g2, 2026-11-24)
+
+  `prune_change_log` checks the hourly gate with a plain read first and
+  takes the write lock (`BEGIN IMMEDIATE`, then checks again) only when
+  pruning is due. A busy database while pruning is logged and ignored by
+  `labeled/changes`, so pruning never fails a poll. It raises
+  `RuntimeError` inside an open transaction instead of committing the
+  caller's work. Measured before the fix: with another writer holding
+  the lock, every poll failed with "database is locked" after 5.2 s.
+
+------------------------------------------------------------------------
+RUN (from the git root; see TEST RULES in context.txt)
+------------------------------------------------------------------------
+  Baseline (staged 10g, 2026-11-24): test_collection_sync.py 30 passed,
+  test_change_tracking.py + test_migrate_project.py 61 passed,
+  test_labeled_pagination.py 50 passed. Do not re-run the baseline.
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest asreview/webapp/tests/test_api/test_collection_sync.py -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest tests/test_change_tracking.py -q -p no:cacheprovider'
+  ruff check + ruff format --check on the changed Python files.
+  Paste the output. There must be no failures.
+
+DONE WHEN
+  - A poll takes the write lock only when pruning is due; a busy
+    database while pruning never fails a poll; other errors propagate.
+  - prune_change_log refuses an open transaction.
+  - Every case of the equivalence matrix ends on a real cursor and
+    every filter removes a row (the test asserts both).
+  - Only these files changed:
+      asreview/database/database.py
+      asreview/webapp/_api/projects.py
+      asreview/webapp/tests/test_api/test_collection_sync.py
+      tests/test_change_tracking.py
+      specs/0001-collection-snapshot.md (the note, below the marker)
+========================================================================

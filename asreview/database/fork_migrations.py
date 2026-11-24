@@ -41,9 +41,10 @@ BASELINE_REVISIONS = ("0000_tags_tables", "0002_user_version_mark")
 class MigrationContext:
     """Context handed to each revision function.
 
-    ``project_id`` is the folder name of the database file (or "memory").
-    ``project_path`` is the folder holding ``results.db``, or ``None`` for
-    an in-memory database.
+    ``project_id`` is the SEED for ``project_state`` when 0001 creates it
+    (the folder name of the database file, or "memory"); after that the
+    stored row is the only authority. ``project_path`` is the folder holding
+    ``results.db``, or ``None`` for an in-memory database.
     """
 
     project_id: str
@@ -115,10 +116,51 @@ def _rev_0002_user_version_mark(cur, ctx):
     cur.execute(f"PRAGMA user_version = {FORK_USER_VERSION}")
 
 
+def _rev_0003_record_versions_version_idx(cur, ctx):
+    """Index ``record_versions`` by version for ``labeled/changes``.
+
+    Spec 0001 note "Sync reads ``record_versions``": the poll query filters
+    on ``(project_id, version > since)``, which costs 0.61 ms at 10k records
+    and 5.4 ms at 100k without this index and 0.004 ms with it. Not a
+    baseline revision: ``create_tables`` does not build it, the ledger
+    applies it to new and existing databases alike (like 0001).
+    """
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_record_versions_version "
+        "ON record_versions (project_id, version)"
+    )
+
+
+def _rev_0004_project_id_consistency(cur, ctx):
+    """Refuse a database whose change-tracking rows disagree on the project id.
+
+    ``project_state`` must hold exactly one row, and every ``record_versions``
+    and ``change_log`` row must carry its ``project_id``. From here on the
+    ``trg_pid_*`` triggers (see ``Database._ensure_change_tracking_triggers``)
+    keep it that way. Raising rolls back the whole migration run, so the
+    database stays as it was.
+    """
+    n_state = cur.execute("SELECT COUNT(*) FROM project_state").fetchone()[0]
+    if n_state != 1:
+        raise RuntimeError(f"project_state holds {n_state} rows; expected exactly one")
+    for table in ("record_versions", "change_log"):
+        n_foreign = cur.execute(
+            f"SELECT COUNT(*) FROM {table} "
+            "WHERE project_id IS NOT (SELECT project_id FROM project_state)"
+        ).fetchone()[0]
+        if n_foreign:
+            raise RuntimeError(
+                f"{n_foreign} {table} rows carry a project_id other than "
+                "project_state.project_id"
+            )
+
+
 REVISIONS = [
     ("0000_tags_tables", _rev_0000_tags_tables),
     ("0001_change_tracking", _rev_0001_change_tracking),
     ("0002_user_version_mark", _rev_0002_user_version_mark),
+    ("0003_record_versions_version_idx", _rev_0003_record_versions_version_idx),
+    ("0004_project_id_consistency", _rev_0004_project_id_consistency),
 ]
 
 
@@ -198,9 +240,11 @@ def rekey_project_id(db_fp, new_project_id):
     ``Project.load(safe_import=True)`` assigns a fresh id only after the
     project is migrated (or imported as an already-v4 fork project), so the
     change-tracking tables were written under the source project's id. Update
-    ``project_state``, ``record_versions`` and ``change_log`` so their rows
-    follow the new id instead of being orphaned. Idempotent: does nothing if
-    the id already matches or the change-tracking tables are absent.
+    ``project_state``, ``record_versions`` and ``change_log`` to the new id.
+    The guard triggers (``trg_pid_*``) refuse any order that does not update
+    ``project_state`` first; its cascade trigger then re-keys the other two.
+    Idempotent: does nothing if the id already matches or the change-tracking
+    tables are absent.
     """
     conn = sqlite3.connect(str(db_fp))
     try:
@@ -217,6 +261,10 @@ def rekey_project_id(db_fp, new_project_id):
         old_id = row[0]
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # project_state MUST be updated first: its cascade trigger
+            # (trg_pid_project_state_cascade) then re-keys record_versions and
+            # change_log, so the two later UPDATEs match no rows. They stay for
+            # databases opened before the triggers exist.
             for table in ("project_state", "record_versions", "change_log"):
                 conn.execute(
                     f"UPDATE {table} SET project_id = ? WHERE project_id = ?",

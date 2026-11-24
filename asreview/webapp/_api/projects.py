@@ -1076,6 +1076,65 @@ def _iter_labeled_matches(db, q, cursor=None, batch_size=500):
             break
 
 
+def _sort_tuple(q, key):
+    """Return a total-order tuple for a ``(time, record_id)`` key.
+
+    Smaller sorts first, matching the display order of the query. Used only
+    to compare a candidate key against a boundary; the tuple never leaves
+    this module.
+    """
+    t, rid = key
+    if q["subset"] == "unlabeled":
+        return (-rid,) if q["latest_first"] else (rid,)
+    if q["latest_first"]:
+        return (t is None, -(t or 0.0), -rid)
+    return (t is None, t or 0.0, rid)
+
+
+def _parse_boundary(q):
+    """Parse ``request.args["boundary"]`` into a decoded key or ``None``.
+
+    ``"end"`` means no limit (``None``); anything else is a cursor decoded
+    with the query's filter signature. Missing or malformed → ``ValueError``.
+    """
+    boundary = request.args.get("boundary")
+    if boundary == "end":
+        return None
+    if not boundary:
+        raise ValueError("boundary is required")
+    return _decode_cursor(boundary, q["filter_sig"])
+
+
+def _scan_to_boundary(db, q, boundary_key):
+    """Return ``(matches, has_more)`` for the view down to ``boundary_key``.
+
+    ``matches`` is every ``(state, key)`` at or before the boundary (all
+    matches when ``boundary_key`` is ``None``). ``has_more`` is whether at
+    least one match exists beyond the boundary.
+    """
+    matches = []
+    has_more = False
+    boundary_tuple = None if boundary_key is None else _sort_tuple(q, boundary_key)
+    for state, key in _iter_labeled_matches(db, q, None, 500):
+        if boundary_tuple is not None and _sort_tuple(q, key) > boundary_tuple:
+            has_more = True
+            break
+        matches.append((state, key))
+    return matches, has_more
+
+
+def _sort_key_json(q, key):
+    """Serialize a ``(time, record_id)`` key for the API.
+
+    ``record_id`` for the unlabeled subset; ``[time, record_id]`` (time may
+    be ``None``) for labeled subsets.
+    """
+    t, rid = key
+    if q["subset"] == "unlabeled":
+        return rid
+    return [t, rid]
+
+
 def _users_map(project):
     """Build the ``{user_id: summary}`` map for a response.
 
@@ -1214,6 +1273,180 @@ def api_get_labeled(project):  # noqa: F401
             "result": result,
             "forms": _collection_forms(project, q["tags_form"]),
             "users": users,
+        }
+    )
+
+
+@bp.route("/projects/<project_id>/labeled/changes", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_labeled_changes(project):  # noqa: F401
+    """Report what changed since ``since`` for the current Collection view.
+
+    Each change is one entry per record — its current version — read from
+    ``record_versions`` (not the debugging history). ``in_view`` says whether
+    the record would appear in a full reload of this filter at or before the
+    boundary; ``sort_key`` is its display position (``null`` when not in
+    view). Answers ``{"reset": true}`` when ``since`` is newer than the
+    watermark or more than 200 records changed, so the client falls back to
+    a reconciliation instead of an unbounded patch.
+    """
+    since_param = request.args.get("since")
+    if since_param is None:
+        return jsonify(message="'since' is required"), 400
+    try:
+        since = int(since_param)
+    except (TypeError, ValueError):
+        return jsonify(message="'since' must be an integer"), 400
+    if since < 0:
+        return jsonify(message="'since' must not be negative"), 400
+
+    q = _parse_labeled_query(project)
+    try:
+        boundary_key = _parse_boundary(q)
+    except ValueError as err:
+        return jsonify(message=str(err)), 400
+
+    with project.db as db:
+        try:
+            db.prune_change_log()  # opportunistic, at most once per hour
+        except RuntimeError as err:
+            # Pruning refused because the connection is already mid-transaction;
+            # committing here would commit someone else's half-done work. This
+            # never happens in practice, but the client still gets a controlled
+            # answer instead of a bare 500.
+            logging.error(
+                "Skipped change_log pruning for project %s: %s",
+                project.project_id,
+                err,
+            )
+            return jsonify(
+                message=(
+                    "The server was aiming to do some pruning to the change_log "
+                    "table, but the cleaning crew was getting in the way of some "
+                    "real work being done, so we stopped the crew before anything "
+                    "could go wrong. The janitor should look into this incident "
+                    "soon."
+                )
+            ), 409
+        except sqlite3.OperationalError as err:
+            # change_log is a debugging history: a busy database must never
+            # fail a poll. Pruning runs again on a later poll.
+            if err.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+                raise
+            logging.warning(
+                "Skipped change_log pruning for project %s: database busy",
+                project.project_id,
+            )
+        # Read the watermark FIRST (D11); prune touches neither version nor
+        # record_versions.
+        ps = db.get_project_state()
+        wm = ps["version"]
+        if since > wm:
+            return jsonify({"reset": True, "watermark": wm})
+        changes = db.get_changes_since(since, limit=201)
+        if len(changes) > 200:
+            return jsonify({"reset": True, "watermark": wm})
+
+        out = []
+        if changes:
+            # Membership only needs scanning when there is something to report
+            # (most polls are empty and cost two small SELECTs).
+            matches, _ = _scan_to_boundary(db, q, boundary_key)
+            keys = {int(s["record_id"]): k for s, k in matches}
+            for rid, version in changes:
+                in_view = rid in keys
+                out.append(
+                    {
+                        "record_id": rid,
+                        "version": version,
+                        "in_view": in_view,
+                        "sort_key": _sort_key_json(q, keys[rid]) if in_view else None,
+                    }
+                )
+
+    return jsonify(
+        {
+            "watermark": wm,
+            "config_version": ps["config_version"],
+            "changes": out,
+        }
+    )
+
+
+@bp.route("/projects/<project_id>/records", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_records(project):  # noqa: F401
+    """Return the given records in ``/labeled`` row shape.
+
+    Used for in-place patches and for the rows a reconciliation is missing.
+    Any filter is ignored; the rows come back in the same order as ``ids``.
+    """
+    ids_param = request.args.get("ids", "")
+    if not ids_param.strip():
+        ids = []
+    else:
+        try:
+            ids = [int(x) for x in ids_param.split(",")]
+        except ValueError:
+            return jsonify(message="ids must be comma-separated integers"), 400
+    if len(ids) > 500:
+        return jsonify(message="too many ids"), 400
+
+    users = _users_map(project)
+
+    with project.db as db:
+        # Read the watermark FIRST (D11).
+        wm = db.get_project_state()["version"]
+        states = [row for _, row in db.get_record_states(ids).iterrows()]
+        result = _build_rows(db, project, states)
+
+    return jsonify({"result": result, "watermark": wm, "users": users})
+
+
+@bp.route("/projects/<project_id>/labeled/ids", methods=["GET"])
+@login_required
+@project_authorization
+def api_get_labeled_ids(project):  # noqa: F401
+    """Return the full ordered membership down to ``boundary``.
+
+    The ``items`` list is ``[record_id, version, sort_key]`` in display
+    order. ``next_cursor`` lets the client keep scrolling from its (possibly
+    shifted) boundary with the normal ``/labeled?cursor=``; it is ``null``
+    exactly when nothing matches beyond the boundary.
+    """
+    q = _parse_labeled_query(project)
+    try:
+        boundary_key = _parse_boundary(q)
+    except ValueError as err:
+        return jsonify(message=str(err)), 400
+
+    with project.db as db:
+        # Read the watermark FIRST (D11).
+        ps = db.get_project_state()
+        matches, has_more = _scan_to_boundary(db, q, boundary_key)
+        ids = [int(s["record_id"]) for s, _ in matches]
+        versions = db.get_record_versions(ids)
+        items = [
+            [rid, int(versions.get(rid, 0)), _sort_key_json(q, key)]
+            for (state, key), rid in zip(matches, ids)
+        ]
+        if not has_more:
+            next_cursor = None
+        elif matches:
+            next_cursor = _encode_cursor(*matches[-1][1], q["filter_sig"])
+        else:
+            # Every loaded row left the view, but matches exist beyond the old
+            # boundary: hand the boundary back so scrolling resumes there.
+            next_cursor = request.args["boundary"]
+
+    return jsonify(
+        {
+            "watermark": ps["version"],
+            "config_version": ps["config_version"],
+            "items": items,
+            "next_cursor": next_cursor,
         }
     )
 

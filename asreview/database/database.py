@@ -217,6 +217,16 @@ def _ensure_decision_changes(cur):
 _ATTACHMENT_KEY_GLOB = "'" + "[A-Z0-9]" * 8 + "'"
 
 
+# Records changed after a watermark. The project id comes from the file
+# itself (project_state), never from the folder name: a copied or renamed
+# folder must not make every poll silently empty.
+_CHANGES_SINCE_SQL = (
+    "SELECT record_id, version FROM record_versions "
+    "WHERE project_id = (SELECT project_id FROM project_state) "
+    "AND version > ? ORDER BY version, record_id"
+)
+
+
 def _record_change_sql(rid, source):
     """SQL body recording a change to one record (``rid`` = NEW/OLD.record_id)."""
     return f"""
@@ -277,6 +287,24 @@ RESULTS_TABLE_COLUMNS_PANDAS_DTYPES = {
     "note": "object",
     "user_id": "Int64",
 }
+
+# The results columns of a page row, excluding ``record_id`` (selected as
+# ``rec.record_id`` on unlabeled rows) and the parsed ``tags`` column. Shared
+# by get_unlabeled_page and get_record_states so the two always agree on the
+# row shape.
+_PAGE_RESULTS_COLUMNS = [
+    "label",
+    "classifier",
+    "querier",
+    "balancer",
+    "feature_extractor",
+    "training_set",
+    "time",
+    "note",
+    "user_id",
+    "assigned_at",
+    "last_active",
+]
 
 RANKING_TABLE_COLUMNS_PANDAS_DTYPES = {
     "record_id": "Int64",
@@ -501,10 +529,27 @@ class Database:
 
     @property
     def project_id(self):
-        """Project id stored in ``project_state`` (informational).
+        """The project id stored in ``project_state``.
 
-        The folder name of the database file, or "memory".
+        The only authority for the id inside this file. None when the table
+        or its row does not exist (a new database before ``create_tables``,
+        or a read-only open of a database that was never migrated).
         """
+        con = self._conn
+        if (
+            con.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='project_state'"
+            ).fetchone()
+            is None
+        ):
+            return None
+        row = con.execute("SELECT project_id FROM project_state").fetchone()
+        return row[0] if row is not None else None
+
+    def _seed_project_id(self):
+        """The id 0001_change_tracking seeds project_state with: the folder
+        name of the database file, or "memory"."""
         if self._in_memory:
             return "memory"
         return Path(self.fp).parent.name
@@ -516,7 +561,7 @@ class Database:
         open never reaches this method.
         """
         project_path = None if self._in_memory else Path(self.fp).parent
-        apply_fork_migrations(self._conn, self.project_id, project_path)
+        apply_fork_migrations(self._conn, self._seed_project_id(), project_path)
 
     def _ensure_lists_table(self):
         """Create the ``lists`` table that stores per-record list items.
@@ -929,10 +974,13 @@ class Database:
         _ensure_decision_changes(self._conn.cursor())
 
     def _ensure_change_tracking_triggers(self):
-        """(Re)create the Spec 0001 change-tracking triggers.
+        """(Re)create the change-tracking and project-id guard triggers.
 
         Runs on every read-write open: SQLite drops a table's triggers
-        with the table, and some ``_fix_*`` functions rebuild tables.
+        with the table, and some ``_fix_*`` functions rebuild tables. The
+        ``trg_pid_*`` triggers enforce the Spec 0002 Phase 0 invariant:
+        exactly one ``project_state`` row with a non-empty id, and every
+        ``record_versions`` / ``change_log`` row carrying it.
         """
         record = self.record_table_name
         statements = []
@@ -1001,6 +1049,47 @@ class Database:
                     f"trg_ct_{table}_{suffix}",
                     f"AFTER {op} ON {table}",
                     _CONFIG_CHANGE_SQL,
+                )
+
+        # Project-id guard triggers (Spec 0002 Phase 0): project_state holds
+        # exactly one row with a non-empty id, and every record_versions /
+        # change_log row carries it. Changing the id in project_state cascades.
+        _add(
+            "trg_pid_project_state_insert",
+            "BEFORE INSERT ON project_state",
+            "SELECT RAISE(ABORT, 'project_state holds exactly one row');",
+            when="EXISTS (SELECT 1 FROM project_state)",
+        )
+        _add(
+            "trg_pid_project_state_delete",
+            "BEFORE DELETE ON project_state",
+            "SELECT RAISE(ABORT, 'project_state holds exactly one row');",
+        )
+        _add(
+            "trg_pid_project_state_update",
+            "BEFORE UPDATE OF project_id ON project_state",
+            "SELECT RAISE(ABORT, "
+            "'project_state.project_id must be a non-empty string');",
+            when="NEW.project_id IS NULL OR NEW.project_id = ''",
+        )
+        _add(
+            "trg_pid_project_state_cascade",
+            "AFTER UPDATE OF project_id ON project_state",
+            "UPDATE record_versions SET project_id = NEW.project_id; "
+            "UPDATE change_log SET project_id = NEW.project_id;",
+            when="OLD.project_id IS NOT NEW.project_id",
+        )
+        for table in ("record_versions", "change_log"):
+            for event, suffix in (
+                (f"BEFORE INSERT ON {table}", "insert"),
+                (f"BEFORE UPDATE OF project_id ON {table}", "update"),
+            ):
+                _add(
+                    f"trg_pid_{table}_{suffix}",
+                    event,
+                    f"SELECT RAISE(ABORT, "
+                    f"'{table}.project_id must equal project_state.project_id');",
+                    when="NEW.project_id IS NOT (SELECT project_id FROM project_state)",
                 )
 
         cur = self._conn.cursor()
@@ -2382,11 +2471,182 @@ class Database:
             placeholders = ",".join("?" * len(chunk))
             rows = cur.execute(
                 f"SELECT record_id, version FROM record_versions "
-                f"WHERE record_id IN ({placeholders})",
+                f"WHERE project_id = (SELECT project_id FROM project_state) "
+                f"AND record_id IN ({placeholders})",
                 chunk,
             ).fetchall()
             result.update({record_id: version for record_id, version in rows})
         return result
+
+    def get_changes_since(self, since, limit=None):
+        """Return the records whose current version is newer than ``since``.
+
+        Reads ``record_versions`` only, never ``change_log``. One entry per
+        record — its *current* version — ordered by ``version, record_id``.
+        A record written after the watermark was read is reported with its
+        newer version; the next poll reports it again with the same version
+        and the client ignores it (Spec 0001 D11).
+
+        Parameters
+        ----------
+        since : int
+            Report records with ``version > since``.
+        limit : int | None
+            Cap the number of entries returned.
+
+        Returns
+        -------
+        list[tuple[int, int]]
+            ``(record_id, version)`` pairs ordered by ``version, record_id``.
+        """
+        query = _CHANGES_SINCE_SQL
+        params = [int(since)]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._conn.execute(query, params).fetchall()
+        return [(int(record_id), int(version)) for record_id, version in rows]
+
+    def _prune_due(self, now, min_interval_s):
+        """Whether pruning is due: never pruned, or last prune long enough ago.
+
+        A plain read that takes no lock, so the once-per-hour gate can be
+        checked on every poll without touching the write lock.
+        """
+        row = self._conn.execute("SELECT last_pruned_at FROM project_state").fetchone()
+        last_pruned_at = row[0] if row is not None else None
+        return last_pruned_at is None or now - last_pruned_at >= min_interval_s
+
+    def prune_change_log(self, older_than_s=7 * 86400, min_interval_s=3600, now=None):
+        """Delete old ``change_log`` rows, at most once per ``min_interval_s``.
+
+        ``change_log`` is a debugging history only — no sync logic reads it
+        (Spec 0001 note "Sync reads ``record_versions``"). ``pruned_version``
+        records the highest deleted version (the log is complete above it) and
+        ``last_pruned_at`` gates the hourly minimum; neither is read by the
+        sync.
+
+        The once-per-hour gate is checked with a plain read first, so the
+        common "not due" path never takes the write lock. Only when pruning is
+        due does it ``BEGIN IMMEDIATE`` and re-check the gate under the lock
+        (another process may have pruned in between).
+
+        Parameters
+        ----------
+        older_than_s : float
+            Delete rows older than this many seconds.
+        min_interval_s : float
+            Run at most once per this many seconds.
+        now : float | None
+            Current Unix timestamp (defaults to ``time.time()``).
+
+        Returns
+        -------
+        int
+            Number of ``change_log`` rows deleted.
+
+        Raises
+        ------
+        RuntimeError
+            If the connection is already inside a transaction; pruning must
+            not commit the caller's half-done work.
+        sqlite3.OperationalError
+            If pruning is due and another writer holds the lock longer than
+            the busy timeout (``SQLITE_BUSY``).
+        """
+        if now is None:
+            now = time.time()
+        con = self._conn
+        if con.in_transaction:
+            raise RuntimeError(
+                "prune_change_log() must not run inside an open transaction"
+            )
+        # Cheap check without the write lock: almost every call ends here.
+        if not self._prune_due(now, min_interval_s):
+            return 0
+        cur = con.cursor()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            # Check again under the lock: another process may have pruned
+            # between the first check and BEGIN IMMEDIATE.
+            if not self._prune_due(now, min_interval_s):
+                con.commit()
+                return 0
+            cutoff = now - older_than_s
+            max_deleted = cur.execute(
+                "SELECT MAX(version) FROM change_log WHERE changed_at < ?",
+                (cutoff,),
+            ).fetchone()[0]
+            cur.execute("DELETE FROM change_log WHERE changed_at < ?", (cutoff,))
+            deleted = cur.rowcount
+            cur.execute(
+                "UPDATE project_state SET last_pruned_at = ?, "
+                "pruned_version = MAX(pruned_version, COALESCE(?, 0))",
+                (now, max_deleted),
+            )
+            con.commit()
+            return deleted
+        except BaseException:
+            con.rollback()
+            raise
+
+    def get_record_states(self, record_ids):
+        """Return results state for arbitrary base records, like a page.
+
+        Same columns as :meth:`get_unlabeled_page` (``record`` LEFT JOIN
+        ``results``, results columns NULL when there is no results row) with
+        ``tags`` parsed. Rows follow the order of ``record_ids``; unknown ids
+        are skipped. No filter and no ``duplicate_of`` condition.
+
+        Parameters
+        ----------
+        record_ids : Iterable[int]
+            The record ids to fetch, in the desired output order.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per known id, in ``record_ids`` order.
+        """
+        record_ids = [int(r) for r in record_ids]
+        select = "rec.record_id AS record_id, " + ", ".join(
+            f"r.{col}" for col in _PAGE_RESULTS_COLUMNS
+        )
+        frames = []
+        for i in range(0, len(record_ids), 900):
+            chunk = record_ids[i : i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            frames.append(
+                pd.read_sql_query(
+                    f"SELECT {select} FROM {self.record_table_name} AS rec "
+                    f"LEFT JOIN results AS r ON r.record_id = rec.record_id "
+                    f"WHERE rec.record_id IN ({placeholders})",
+                    self._conn,
+                    params=chunk,
+                    dtype=RESULTS_TABLE_COLUMNS_PANDAS_DTYPES,
+                )
+            )
+        if frames:
+            df = pd.concat(frames, ignore_index=True)
+        else:
+            df = pd.DataFrame(columns=["record_id", *_PAGE_RESULTS_COLUMNS])
+        # SQLite returns rows in an arbitrary order; restore the requested one
+        # and drop unknown ids (absent from the result).
+        if not df.empty:
+            order = {rid: pos for pos, rid in enumerate(record_ids)}
+            df = (
+                df.assign(_pos=df["record_id"].map(order))
+                .sort_values("_pos")
+                .drop(columns="_pos")
+                .reset_index(drop=True)
+            )
+            tags_by_record = self._load_tags(df["record_id"].tolist())
+            df["tags"] = df["record_id"].map(
+                lambda rid: tags_by_record.get(int(rid), [])
+            )
+        else:
+            df["tags"] = pd.Series(dtype="object")
+        return df
 
     def get_results_record(self, record_id):
         """Get the data of a specific query from the results table.
@@ -2705,21 +2965,8 @@ class Database:
         pd.DataFrame
             Up to ``limit`` rows, ordered by record_id, with ``tags`` parsed.
         """
-        results_columns = [
-            "label",
-            "classifier",
-            "querier",
-            "balancer",
-            "feature_extractor",
-            "training_set",
-            "time",
-            "note",
-            "user_id",
-            "assigned_at",
-            "last_active",
-        ]
         select = "rec.record_id AS record_id, " + ", ".join(
-            f"r.{col}" for col in results_columns
+            f"r.{col}" for col in _PAGE_RESULTS_COLUMNS
         )
         where = ["rec.duplicate_of IS NULL", "r.label IS NULL"]
         params = {}

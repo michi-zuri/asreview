@@ -1,12 +1,16 @@
+import shutil
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 import asreview as asr
 from asreview.data.record import Record
+from asreview.database.database import _CHANGES_SINCE_SQL
+from asreview.database.database import Database
 from asreview.database.database import ForeignDatabaseError
 from asreview.database.fork_migrations import FORK_APPLICATION_ID
 from asreview.database.fork_migrations import FORK_USER_VERSION
@@ -43,6 +47,19 @@ CT_TRIGGER_NAMES = [
     "trg_ct_list_containers_insert",
     "trg_ct_list_containers_update",
     "trg_ct_list_containers_delete",
+]
+
+
+# The project-id guard trigger names (Spec 0002 Phase 0).
+PID_TRIGGER_NAMES = [
+    "trg_pid_project_state_insert",
+    "trg_pid_project_state_delete",
+    "trg_pid_project_state_update",
+    "trg_pid_project_state_cascade",
+    "trg_pid_record_versions_insert",
+    "trg_pid_record_versions_update",
+    "trg_pid_change_log_insert",
+    "trg_pid_change_log_update",
 ]
 
 
@@ -105,12 +122,16 @@ def _insert_list_container(db, list_id="l1"):
 
 
 def _make_legacy_db(tmpdir):
-    """Build a marked database missing the 0001 and 0002 revisions.
+    """Build a marked database missing the 0001, 0002, 0003 and 0004 revisions.
 
     The mark, the 0000 baseline ledger row and the fork schema are kept;
-    the 0001 tables/ledger row and the 0002 ledger row are stripped and
-    ``user_version`` is rewound to the legacy 4, modelling a fork database
-    from before ``0001_change_tracking`` and ``0002_user_version_mark``.
+    the 0001 tables/ledger row, the 0002 ledger row, the 0003 ledger row and
+    the 0004 ledger row are stripped and ``user_version`` is rewound to the
+    legacy 4, modelling a fork database from before ``0001_change_tracking``
+    and ``0002_user_version_mark``. Dropping ``record_versions`` also drops
+    its index and the ``trg_pid_*`` triggers on the dropped tables, so the
+    0003 and 0004 rows must go too or the reopened database would claim
+    schema it no longer has.
     """
     path = Path(tmpdir, "test.db")
     with asr.Database(path) as db:
@@ -130,6 +151,13 @@ def _make_legacy_db(tmpdir):
         )
         cur.execute(
             "DELETE FROM fork_migrations WHERE revision = '0002_user_version_mark'"
+        )
+        cur.execute(
+            "DELETE FROM fork_migrations "
+            "WHERE revision = '0003_record_versions_version_idx'"
+        )
+        cur.execute(
+            "DELETE FROM fork_migrations WHERE revision = '0004_project_id_consistency'"
         )
         cur.execute(f"PRAGMA user_version = {LEGACY_FORK_USER_VERSION}")
         conn.commit()
@@ -158,6 +186,8 @@ def test_ledger_applied_on_create(db, tmpdir):
         "0000_tags_tables",
         "0001_change_tracking",
         "0002_user_version_mark",
+        "0003_record_versions_version_idx",
+        "0004_project_id_consistency",
     }
     assert cur.execute(
         "SELECT project_id, version, config_version FROM project_state"
@@ -179,6 +209,8 @@ def test_ledger_idempotent_on_reopen(tmpdir):
             "0000_tags_tables",
             "0001_change_tracking",
             "0002_user_version_mark",
+            "0003_record_versions_version_idx",
+            "0004_project_id_consistency",
         }
         assert cur.execute("SELECT COUNT(*) FROM project_state").fetchone()[0] == 1
 
@@ -194,6 +226,8 @@ def test_ledger_applied_on_legacy_open(tmpdir):
             "0000_tags_tables",
             "0001_change_tracking",
             "0002_user_version_mark",
+            "0003_record_versions_version_idx",
+            "0004_project_id_consistency",
         }
         assert {
             "project_state",
@@ -225,7 +259,7 @@ def test_ledger_concurrent_openers(tmpdir):
 
     with sqlite3.connect(str(path)) as conn:
         cur = conn.cursor()
-        assert cur.execute("SELECT COUNT(*) FROM fork_migrations").fetchone()[0] == 3
+        assert cur.execute("SELECT COUNT(*) FROM fork_migrations").fetchone()[0] == 5
         assert cur.execute("SELECT COUNT(*) FROM project_state").fetchone()[0] == 1
 
 
@@ -261,6 +295,8 @@ def test_new_database_is_marked(tmpdir):
             "0000_tags_tables",
             "0001_change_tracking",
             "0002_user_version_mark",
+            "0003_record_versions_version_idx",
+            "0004_project_id_consistency",
         }
 
 
@@ -328,6 +364,8 @@ def test_empty_file_is_created(tmpdir):
             "0000_tags_tables",
             "0001_change_tracking",
             "0002_user_version_mark",
+            "0003_record_versions_version_idx",
+            "0004_project_id_consistency",
         }
 
 
@@ -344,7 +382,12 @@ def test_missing_baseline_row_rolls_back(tmpdir):
         asr.open_db(path)
 
     with sqlite3.connect(str(path)) as conn:
-        assert _ledger(conn) == {"0001_change_tracking", "0002_user_version_mark"}
+        assert _ledger(conn) == {
+            "0001_change_tracking",
+            "0002_user_version_mark",
+            "0003_record_versions_version_idx",
+            "0004_project_id_consistency",
+        }
         assert "tag_options" in _table_names(conn)
 
 
@@ -534,7 +577,7 @@ def test_config_changes(db):
 
 
 def test_triggers_after_create_tables(db):
-    """create_tables creates every change-tracking trigger."""
+    """create_tables creates every change-tracking and guard trigger."""
     names = {
         row[0]
         for row in db._conn.execute(
@@ -542,6 +585,8 @@ def test_triggers_after_create_tables(db):
         )
     }
     for name in CT_TRIGGER_NAMES:
+        assert name in names
+    for name in PID_TRIGGER_NAMES:
         assert name in names
 
 
@@ -881,3 +926,295 @@ def test_replace_lists_duplicate_rolls_back(db_with_records):
         )
     assert len(log(db_with_records)) == n_log
     assert [i["item_id"] for i in db_with_records.get_lists(7)] == ["a"]
+
+
+def test_get_changes_since(db_with_records):
+    """One entry per record (its current version), ordered by version."""
+    db_with_records.label_record(1, 1)  # v1
+    db_with_records.label_record(2, 1)  # v2
+    db_with_records.update_note(1, "a")  # v3
+    db_with_records.update_note(1, "b")  # v4
+    assert db_with_records.get_changes_since(0) == [(2, 2), (1, 4)]
+    assert db_with_records.get_changes_since(4) == []
+    assert db_with_records.get_changes_since(0, limit=1) == [(2, 2)]
+
+
+def test_prune_change_log(db_with_records):
+    """Pruning deletes old rows, records the highest version, and is gated."""
+    db_with_records.label_record(1, 1)
+    db_with_records.label_record(2, 1)
+    now = (
+        db_with_records._conn.execute(
+            "SELECT MAX(changed_at) FROM change_log"
+        ).fetchone()[0]
+        + 8 * 86400
+    )
+    deleted = db_with_records.prune_change_log(now=now)
+    assert deleted == 2
+    assert db_with_records._conn.execute(
+        "SELECT pruned_version, last_pruned_at FROM project_state"
+    ).fetchone() == (2, now)
+    # A second call within the hour deletes nothing, even with a new row.
+    db_with_records.label_record(3, 1)
+    assert db_with_records.prune_change_log(now=now + 100) == 0
+
+
+def test_get_changes_since_unaffected_by_prune(db_with_records):
+    """Pruning change_log never changes what get_changes_since returns."""
+    db_with_records.label_record(1, 1)
+    db_with_records.label_record(2, 1)
+    before = db_with_records.get_changes_since(0)
+    now = (
+        db_with_records._conn.execute(
+            "SELECT MAX(changed_at) FROM change_log"
+        ).fetchone()[0]
+        + 8 * 86400
+    )
+    db_with_records.prune_change_log(now=now)
+    assert db_with_records.get_changes_since(0) == before
+
+
+def test_prune_change_log_not_due_takes_no_lock(db_with_records):
+    """Not due: returns 0 without waiting on another writer's lock."""
+    db_with_records.label_record(1, 1)
+    now = (
+        db_with_records._conn.execute(
+            "SELECT MAX(changed_at) FROM change_log"
+        ).fetchone()[0]
+        + 8 * 86400
+    )
+    db_with_records.prune_change_log(now=now)
+
+    second = sqlite3.connect(str(db_with_records.fp), timeout=0)
+    try:
+        second.execute("BEGIN IMMEDIATE")  # the second connection holds the lock
+        start = time.monotonic()
+        assert db_with_records.prune_change_log(now=now + 10) == 0
+        assert time.monotonic() - start < 1.0
+    finally:
+        second.rollback()
+        second.close()
+
+
+def test_prune_change_log_rechecks_under_lock(db_with_records, monkeypatch):
+    """Another process pruning between check and lock makes this a no-op."""
+    db_with_records.label_record(1, 1)
+    db_with_records.label_record(2, 1)
+    now = (
+        db_with_records._conn.execute(
+            "SELECT MAX(changed_at) FROM change_log"
+        ).fetchone()[0]
+        + 8 * 86400
+    )
+
+    real_prune_due = Database._prune_due
+    calls = []
+
+    def fake_prune_due(self, now_arg, min_interval_s):
+        result = real_prune_due(self, now_arg, min_interval_s)
+        if not calls:
+            calls.append(True)
+            # Another process prunes between the first check and BEGIN
+            # IMMEDIATE: it sets last_pruned_at and commits.
+            with sqlite3.connect(str(db_with_records.fp)) as conn:
+                conn.execute("UPDATE project_state SET last_pruned_at = ?", (now,))
+                conn.commit()
+        return result
+
+    monkeypatch.setattr(Database, "_prune_due", fake_prune_due)
+
+    assert db_with_records.prune_change_log(now=now) == 0
+    # Both rows survive; the "other process" wrote last_pruned_at; this call
+    # did not delete anything or bump pruned_version.
+    assert (
+        db_with_records._conn.execute("SELECT COUNT(*) FROM change_log").fetchone()[0]
+        == 2
+    )
+    assert (
+        db_with_records._conn.execute(
+            "SELECT last_pruned_at FROM project_state"
+        ).fetchone()[0]
+        == now
+    )
+    assert (
+        db_with_records._conn.execute(
+            "SELECT pruned_version FROM project_state"
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_prune_change_log_refuses_open_transaction(db_with_records):
+    """A caller's open transaction is never committed by pruning."""
+    db_with_records._conn.execute(
+        "UPDATE project_state SET config_version = config_version"
+    )
+    assert db_with_records._conn.in_transaction
+    with pytest.raises(RuntimeError):
+        db_with_records.prune_change_log()
+    db_with_records._conn.rollback()
+
+
+def test_copied_folder_changes_tracked(tmpdir):
+    """A copied folder keeps its stored id; polls still report changes."""
+    src = Path(tmpdir, "a")
+    src.mkdir()
+    with asr.Database(src / "results.db") as db:
+        db.create_tables()
+        db.input.add_records([Record(i, "d") for i in range(3)])
+    shutil.copytree(src, Path(tmpdir, "b"))
+    with asr.open_db(Path(tmpdir, "b", "results.db")) as db:
+        db.label_record(0, 1)
+        assert db.project_id == "a"
+        assert db.get_changes_since(0) == [(0, 1)]
+        assert db.get_record_versions([0, 1]) == {0: 1}
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO project_state (project_id) VALUES ('other')",
+        "INSERT OR IGNORE INTO project_state (project_id) VALUES ('other')",
+        "DELETE FROM project_state",
+        "UPDATE project_state SET project_id = NULL",
+        "UPDATE project_state SET project_id = ''",
+        "INSERT INTO record_versions (project_id, record_id, version) "
+        "VALUES ('other', 5, 99)",
+        "INSERT INTO change_log (project_id, version, record_id, source, changed_at) "
+        "VALUES ('other', 99, 5, 'results', 0)",
+        "UPDATE record_versions SET project_id = 'other'",
+        "UPDATE change_log SET project_id = 'other'",
+    ],
+)
+def test_pid_guards_refuse(db_with_records, sql):
+    """The guard triggers refuse every way to break the one-id invariant."""
+    db_with_records.label_record(1, 1)
+    with pytest.raises(sqlite3.IntegrityError):
+        db_with_records._conn.execute(sql)
+    db_with_records._conn.rollback()
+    assert (
+        db_with_records._conn.execute("SELECT COUNT(*) FROM project_state").fetchone()[
+            0
+        ]
+        == 1
+    )
+    assert db_with_records.get_changes_since(0) == [(1, 1)]
+
+
+def test_pid_cascade(db_with_records):
+    """Renaming project_state.project_id cascades to both tracked tables."""
+    db_with_records.label_record(1, 1)
+    db_with_records.label_record(2, 1)
+    db_with_records._conn.execute("UPDATE project_state SET project_id = 'renamed'")
+    db_with_records._conn.commit()
+    assert db_with_records.project_id == "renamed"
+    for table in ("record_versions", "change_log"):
+        rows = db_with_records._conn.execute(
+            f"SELECT DISTINCT project_id FROM {table}"
+        ).fetchall()
+        assert rows == [("renamed",)]
+    db_with_records.label_record(3, 1)
+    assert [r for r, _ in db_with_records.get_changes_since(0)] == [1, 2, 3]
+
+
+def test_project_id_property(tmpdir):
+    """project_id reads project_state; None before the row exists."""
+    with asr.Database() as db:
+        assert db.project_id is None
+        db.create_tables()
+        assert db.project_id == "memory"
+
+    path = _make_legacy_db(tmpdir)
+    with asr.open_db(path, read_only=True) as db:
+        assert db.project_id is None
+
+
+def test_0004_refuses_inconsistent_legacy_db(tmpdir):
+    """0004 refuses (and rolls back) a database with foreign or duplicate rows."""
+    # Case 1: a foreign record_versions row.
+    path = Path(tmpdir, "foreign.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+        db.input.add_records([Record(i, "d") for i in range(3)])
+        db.label_record(0, 1)
+    with sqlite3.connect(str(path)) as conn:
+        for name in PID_TRIGGER_NAMES:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute("UPDATE record_versions SET project_id = 'stale'")
+        conn.execute(
+            "DELETE FROM fork_migrations WHERE revision = '0004_project_id_consistency'"
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="record_versions"):
+        asr.open_db(path)
+    with sqlite3.connect(str(path)) as conn:
+        assert (
+            conn.execute(
+                "SELECT revision FROM fork_migrations "
+                "WHERE revision = '0004_project_id_consistency'"
+            ).fetchone()
+            is None
+        )
+        assert conn.execute("SELECT project_id FROM record_versions").fetchall() == [
+            ("stale",)
+        ]
+
+    # Case 2: a duplicate project_state row.
+    path2 = Path(tmpdir, "dup.db")
+    with asr.Database(path2) as db:
+        db.create_tables()
+        db.input.add_records([Record(i, "d") for i in range(3)])
+        db.label_record(0, 1)
+    with sqlite3.connect(str(path2)) as conn:
+        for name in PID_TRIGGER_NAMES:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute("INSERT INTO project_state (project_id) VALUES ('other')")
+        conn.execute(
+            "DELETE FROM fork_migrations WHERE revision = '0004_project_id_consistency'"
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="project_state holds 2 rows"):
+        asr.open_db(path2)
+
+
+def _has_version_index(conn):
+    return any(
+        row[0] == "idx_record_versions_version"
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    )
+
+
+def test_record_versions_version_index(tmpdir):
+    """New and legacy databases both have the index and the ledger rows."""
+    path = Path(tmpdir, "new.db")
+    with asr.Database(path) as db:
+        db.create_tables()
+    with sqlite3.connect(str(path)) as conn:
+        assert _has_version_index(conn)
+        assert "0003_record_versions_version_idx" in _ledger(conn)
+        assert "0004_project_id_consistency" in _ledger(conn)
+        plan = " ".join(
+            str(c)
+            for row in conn.execute("EXPLAIN QUERY PLAN " + _CHANGES_SINCE_SQL, (0,))
+            for c in row
+        )
+        assert "idx_record_versions_version" in plan
+
+    legacy = _make_legacy_db(tmpdir)
+    with asr.open_db(legacy):
+        pass
+    with sqlite3.connect(str(legacy)) as conn:
+        assert _has_version_index(conn)
+        assert "0003_record_versions_version_idx" in _ledger(conn)
+        assert "0004_project_id_consistency" in _ledger(conn)
+
+
+def test_get_record_states(db_with_records):
+    """Unlabeled, labeled and unknown ids: 2 rows in the requested order."""
+    db_with_records.label_record(3, 1)
+    df = db_with_records.get_record_states([999, 5, 3])
+    assert df["record_id"].tolist() == [5, 3]
+    assert "tags" in df.columns
+    labels = df.set_index("record_id")["label"]
+    assert labels.loc[3] == 1
+    assert pd.isna(labels.loc[5])

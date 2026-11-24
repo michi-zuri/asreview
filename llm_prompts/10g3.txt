@@ -1,0 +1,385 @@
+========================================================================
+TASK 10g3 — One project id per database file: project_state is the only
+           authority, guard triggers enforce it, reads never take an id
+           from outside the file (Spec 0002 Phase 0)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10g and 10g2 (both staged/uncommitted). 10g, 10g2 and 10g3
+            are committed together by the user. Do not commit.
+SPEC: specs/0001-collection-snapshot.md (D8, Q4, Part 4) and
+      specs/0002-central-database.md (DRAFT), "Phase 0". No spec text
+      changes above the marker; this task appends one note to 0001.
+
+WHY
+  Review of 10g (Claude, 2026-11-24), point 2: a silent mismatch in
+  get_changes_since. The change-tracking triggers stamp every
+  record_versions / change_log row with
+  (SELECT project_id FROM project_state): the id stored in the file
+  when 0001_change_tracking ran (the folder name at that time). But
+  get_changes_since filters on Database.project_id, which is the
+  CURRENT folder name. When the two differ, every poll silently
+  returns no changes, and no error is raised. Proven on the staged
+  code (scratch, 2026-11-24): copy a project folder under a new name,
+  open it, label a record → db.project_id == "b",
+  get_changes_since(0) == [].
+  Nothing in the file enforces the D8 invariant "one project_state row;
+  every row carries its id" either: a second project_state row, a
+  deleted row or a foreign row are all accepted silently.
+
+  The user decided:
+  - The project id mismatch is a major problem; fix it with guardrails.
+  - Keep the per-row project_id columns (D8): a later Postgres move
+    (Spec 0002 Phase 3) merges the per-project databases and needs them.
+  - Phase 0 (this task) makes the id consistent INSIDE one database
+    file. Checking the file's id against the folder name, project.json
+    and the auth DB is Phase 1 of Spec 0002, NOT this task.
+
+FACTS (verified 2026-11-24 — trust these)
+  - asreview/database/fork_migrations.py: REVISIONS lists 0000…0003.
+    0001_change_tracking creates project_state (project_id TEXT PRIMARY
+    KEY, …), record_versions (PK project_id, record_id), change_log (PK
+    project_id, version) and runs
+    "INSERT OR IGNORE INTO project_state (project_id) VALUES (?)" with
+    ctx.project_id. apply_fork_migrations runs the missing revisions
+    inside one BEGIN IMMEDIATE and rolls back on any exception (no
+    ledger row is written then). 0003 is ALREADY applied on the user's
+    dev database, so a new check must be a new revision (0004), not an
+    edit of 0001/0003.
+  - rekey_project_id(db_fp, new_project_id) (fork_migrations.py) updates
+    project_state, record_versions, change_log in that order, each
+    WHERE project_id = old, inside BEGIN IMMEDIATE, through a plain
+    sqlite3 connection. Project.load(safe_import=True) calls it.
+  - asreview/database/database.py:
+    - Database.project_id (property) returns "memory" for an in-memory
+      DB, else Path(self.fp).parent.name. Its ONLY users are
+      _apply_fork_migrations (passes it as the seed id) and
+      get_changes_since. No other module reads Database.project_id.
+    - _record_change_sql (the trigger body) already uses
+      (SELECT project_id FROM project_state) everywhere.
+    - get_record_versions(record_ids) has NO project_id filter.
+    - get_changes_since builds its query inline with
+      "WHERE project_id = ? AND version > ?" and
+      params = [self.project_id, int(since)].
+    - _ensure_change_tracking_triggers runs on every read-write open
+      AFTER _apply_fork_migrations (create_tables and the validation
+      path). Its local helper
+      _add(name, event, body, when=None) appends
+      "CREATE TRIGGER IF NOT EXISTS {name} {event} FOR EACH ROW
+       [WHEN …] BEGIN {body} END". A no-op CREATE TRIGGER IF NOT
+      EXISTS does not need the write lock.
+  - SQLite: RAISE(ABORT, msg) in a BEFORE trigger raises
+    sqlite3.IntegrityError and aborts the statement. It also fires for
+    INSERT OR IGNORE (OR IGNORE only covers constraint conflicts, not
+    RAISE(ABORT)). Dropping a table drops its triggers.
+  - Real projects in ~/.asreview (scanned read-only, 2026-11-24): 15
+    folders; in all 15 the folder name equals project.json "id". Only
+    one (99fafe13…) has the change-tracking tables: one project_state
+    row, 0 record_versions/change_log rows with another id. So 0004
+    passes on every real project.
+
+PROTOTYPE (scratch copy of the repo, 2026-11-24)
+  The exact design below was applied to a scratch copy of the staged
+  10g tree, together with the tests below. Results:
+  tests/test_change_tracking.py 65 passed,
+  tests/test_migrate_project.py 11 passed,
+  test_collection_sync.py 30 passed. (That copy had 10g only. With 10g2
+  applied first, expect test_change_tracking.py 68 and
+  test_collection_sync.py 42.) With the old get_changes_since,
+  the copied-folder test fails with `assert [] == [(0, 1)]`.
+  The guard triggers were also applied to a copy of the real 99fafe13
+  database: tracked writes still work; every refused case below raises
+  IntegrityError; the existing rekey loop still works.
+
+BEFORE WRITING ANYTHING — read IN FULL
+  - asreview/database/fork_migrations.py (whole file)
+  - database.py: _record_change_sql, open_db, the project_id property,
+    _apply_fork_migrations, _ensure_change_tracking_triggers,
+    get_project_state, get_record_versions, get_changes_since
+  - tests/test_change_tracking.py: the top (fixtures, CT_TRIGGER_NAMES),
+    _make_legacy_db, _ledger, every test that pins the ledger set or
+    counts fork_migrations rows, test_in_memory_project_id,
+    test_rekey_then_write_tracked, test_record_versions_version_index
+  - tests/test_migrate_project.py: the ledger pin near the top and
+    test_safe_import_rekeys_change_tracking
+
+------------------------------------------------------------------------
+CHANGE 1 (asreview/database/fork_migrations.py)
+------------------------------------------------------------------------
+  New revision, placed after _rev_0003_record_versions_version_idx:
+
+  def _rev_0004_project_id_consistency(cur, ctx):
+      """Refuse a database whose change-tracking rows disagree on the
+      project id.
+
+      ``project_state`` must hold exactly one row, and every
+      ``record_versions`` and ``change_log`` row must carry its
+      ``project_id``. From here on the ``trg_pid_*`` triggers (see
+      ``Database._ensure_change_tracking_triggers``) keep it that way.
+      Raising rolls back the whole migration run, so the database stays
+      as it was.
+      """
+      n_state = cur.execute("SELECT COUNT(*) FROM project_state").fetchone()[0]
+      if n_state != 1:
+          raise RuntimeError(
+              f"project_state holds {n_state} rows; expected exactly one"
+          )
+      for table in ("record_versions", "change_log"):
+          n_foreign = cur.execute(
+              f"SELECT COUNT(*) FROM {table} "
+              "WHERE project_id IS NOT (SELECT project_id FROM project_state)"
+          ).fetchone()[0]
+          if n_foreign:
+              raise RuntimeError(
+                  f"{n_foreign} {table} rows carry a project_id other than "
+                  "project_state.project_id"
+              )
+
+  Append ("0004_project_id_consistency", _rev_0004_project_id_consistency)
+  to REVISIONS. Do NOT add it to BASELINE_REVISIONS: on a new database
+  it runs right after 0001 and passes trivially.
+  It deliberately does NOT repair anything: an inconsistent file is a
+  bug to look at, not to paper over. (No real project is affected; see
+  FACTS.)
+
+  Update the MigrationContext docstring: ``project_id`` is the SEED for
+  project_state when 0001 creates it (folder name or "memory"); after
+  that the stored row is the only authority.
+
+  rekey_project_id: keep the code. Add a comment above the loop:
+  project_state MUST be updated first. Its cascade trigger
+  (trg_pid_project_state_cascade) then re-keys record_versions and
+  change_log, so the two later UPDATEs match no rows. They stay for
+  databases opened before the triggers exist. In the docstring, replace
+  "so their rows follow the new id instead of being orphaned" by
+  wording that says the guard triggers would refuse any other order.
+
+------------------------------------------------------------------------
+CHANGE 2 (asreview/database/database.py)
+------------------------------------------------------------------------
+  a. Module constant, directly above _record_change_sql:
+
+     # Records changed after a watermark. The project id comes from the
+     # file itself (project_state), never from the folder name: a copied
+     # or renamed folder must not make every poll silently empty.
+     _CHANGES_SINCE_SQL = (
+         "SELECT record_id, version FROM record_versions "
+         "WHERE project_id = (SELECT project_id FROM project_state) "
+         "AND version > ? ORDER BY version, record_id"
+     )
+
+     get_changes_since uses it: query = _CHANGES_SINCE_SQL;
+     params = [int(since)]; the LIMIT handling stays.
+
+  b. get_record_versions: add the same filter to its chunked query:
+     "WHERE project_id = (SELECT project_id FROM project_state) "
+     "AND record_id IN (…)". (Today it has no filter at all; with the
+     guards it is redundant but keeps the query correct for a later
+     Postgres merge, D8.)
+
+  c. Replace the project_id property:
+
+     @property
+     def project_id(self):
+         """The project id stored in ``project_state``.
+
+         The only authority for the id inside this file. None when the
+         table or its row does not exist (a new database before
+         create_tables, or a read-only open of a database that was
+         never migrated).
+         """
+         con = self._conn
+         if con.execute(
+             "SELECT 1 FROM sqlite_master "
+             "WHERE type='table' AND name='project_state'"
+         ).fetchone() is None:
+             return None
+         row = con.execute("SELECT project_id FROM project_state").fetchone()
+         return row[0] if row is not None else None
+
+     New private method below it, used ONLY by _apply_fork_migrations:
+
+     def _seed_project_id(self):
+         """The id 0001_change_tracking seeds project_state with: the
+         folder name of the database file, or "memory"."""
+         if self._in_memory:
+             return "memory"
+         return Path(self.fp).parent.name
+
+     _apply_fork_migrations passes self._seed_project_id() instead of
+     self.project_id.
+
+  d. _ensure_change_tracking_triggers: add these triggers with the
+     existing _add helper, after the trg_ct_* ones and before the
+     execute loop. Update the docstring: it also creates the
+     project-id guard triggers (Spec 0002 Phase 0).
+
+     _add("trg_pid_project_state_insert",
+          "BEFORE INSERT ON project_state",
+          "SELECT RAISE(ABORT, 'project_state holds exactly one row');",
+          when="EXISTS (SELECT 1 FROM project_state)")
+     _add("trg_pid_project_state_delete",
+          "BEFORE DELETE ON project_state",
+          "SELECT RAISE(ABORT, 'project_state holds exactly one row');")
+     _add("trg_pid_project_state_update",
+          "BEFORE UPDATE OF project_id ON project_state",
+          "SELECT RAISE(ABORT, "
+          "'project_state.project_id must be a non-empty string');",
+          when="NEW.project_id IS NULL OR NEW.project_id = ''")
+     _add("trg_pid_project_state_cascade",
+          "AFTER UPDATE OF project_id ON project_state",
+          "UPDATE record_versions SET project_id = NEW.project_id; "
+          "UPDATE change_log SET project_id = NEW.project_id;",
+          when="OLD.project_id IS NOT NEW.project_id")
+     for table in ("record_versions", "change_log"):
+         for event, suffix in (
+             (f"BEFORE INSERT ON {table}", "insert"),
+             (f"BEFORE UPDATE OF project_id ON {table}", "update"),
+         ):
+             _add(f"trg_pid_{table}_{suffix}", event,
+                  f"SELECT RAISE(ABORT, "
+                  f"'{table}.project_id must equal project_state.project_id');",
+                  when="NEW.project_id IS NOT "
+                       "(SELECT project_id FROM project_state)")
+
+     Why the cascade passes the row guards: it is an AFTER trigger, so
+     project_state already holds the new id when record_versions /
+     change_log are updated.
+     The trg_ct_* bodies insert with
+     SELECT project_id … FROM project_state, so they always pass.
+
+------------------------------------------------------------------------
+TESTS (tests/test_change_tracking.py unless noted)
+------------------------------------------------------------------------
+  Existing tests to update (they pin the ledger or count rows):
+  - Every ledger-set pin that lists "0003_record_versions_version_idx"
+    also lists "0004_project_id_consistency" (6 places in this file,
+    1 in tests/test_migrate_project.py).
+  - test_ledger_concurrent_openers: COUNT(*) FROM fork_migrations
+    == 5 (was 4).
+  - _make_legacy_db: also delete the 0004 ledger row (with the 0003
+    one) and mention 0004 in its docstring. Dropping the tables
+    already drops the trg_pid_* triggers on them.
+  - test_triggers_after_create_tables: also check every name in a new
+    PID_TRIGGER_NAMES list (the 8 trg_pid_* names), defined next to
+    CT_TRIGGER_NAMES.
+  - test_record_versions_version_index: the hand-written EXPLAIN query
+    ("WHERE project_id = 'x' …") becomes
+    "EXPLAIN QUERY PLAN " + _CHANGES_SINCE_SQL with params (0,)
+    (import _CHANGES_SINCE_SQL from asreview.database.database), so the
+    test checks the real query. Still asserts idx_record_versions_version.
+  Everything else in both files must pass unchanged.
+  (In the prototype, this was the full list of changes needed in the
+  existing tests.)
+
+  New tests (add after the 10g2 prune tests):
+
+  1. test_copied_folder_changes_tracked(tmpdir) — THE regression for
+     review point 2:
+       src = Path(tmpdir, "a"); src.mkdir()
+       asr.Database(src / "results.db"): create_tables, add 3 records.
+       shutil.copytree(src, Path(tmpdir, "b"))
+       with asr.open_db(Path(tmpdir, "b", "results.db")) as db:
+           db.label_record(0, 1)
+           assert db.project_id == "a"
+           assert db.get_changes_since(0) == [(0, 1)]
+           assert db.get_record_versions([0, 1]) == {0: 1}
+     Before changing database.py, run this test once alone against the
+     unchanged code and paste the failure (expected:
+     `assert [] == [(0, 1)]`).
+
+  2. test_pid_guards_refuse(db_with_records, sql), parametrized over:
+       INSERT INTO project_state (project_id) VALUES ('other')
+       INSERT OR IGNORE INTO project_state (project_id) VALUES ('other')
+       DELETE FROM project_state
+       UPDATE project_state SET project_id = NULL
+       UPDATE project_state SET project_id = ''
+       INSERT INTO record_versions (project_id, record_id, version)
+         VALUES ('other', 5, 99)
+       INSERT INTO change_log (project_id, version, record_id, source,
+         changed_at) VALUES ('other', 99, 5, 'results', 0)
+       UPDATE record_versions SET project_id = 'other'
+       UPDATE change_log SET project_id = 'other'
+     Label record 1 first (so both tables have a row). Each statement
+     raises sqlite3.IntegrityError; after rollback() project_state has
+     1 row and get_changes_since(0) == [(1, 1)].
+
+  3. test_pid_cascade(db_with_records): label 1 and 2;
+     UPDATE project_state SET project_id = 'renamed'; commit → every
+     record_versions and change_log row has 'renamed';
+     db.project_id == 'renamed'; label 3 →
+     [r for r, _ in get_changes_since(0)] == [1, 2, 3].
+
+  4. test_project_id_property(tmpdir): in-memory Database():
+     project_id is None before create_tables, "memory" after.
+     _make_legacy_db + asr.open_db(path, read_only=True) → None (the
+     table does not exist and a read-only open does not migrate).
+
+  5. test_0004_refuses_inconsistent_legacy_db(tmpdir): create a file DB
+     with 3 records, label one, close. Through sqlite3: DROP every
+     trg_pid_* trigger, UPDATE record_versions SET project_id = 'stale',
+     DELETE the 0004 ledger row, commit. asr.open_db(path) raises
+     RuntimeError matching "record_versions". Afterwards (sqlite3): the
+     0004 ledger row is still absent and record_versions still has
+     'stale' (the migration rolled back).
+     Add a second case with the same setup but a duplicate
+     project_state row (INSERT with id 'other' after dropping the
+     triggers) → RuntimeError matching "project_state holds 2 rows".
+
+  6. tests/test_migrate_project.py:
+     test_safe_import_rekeys_change_tracking must pass unchanged. It
+     covers rekey + cascade on a real import.
+
+------------------------------------------------------------------------
+SPEC NOTE (append at the END of specs/0001-collection-snapshot.md)
+------------------------------------------------------------------------
+  ### One project id per file (10g3, 2026-11-24)
+
+  Supersedes the Q4 answer ("project_state.project_id = folder name,
+  informational until a Postgres merge"). The folder name only seeds
+  `project_state` when `0001_change_tracking` creates it. After that
+  the stored row is the only authority inside the file:
+  `Database.project_id` reads it, and `get_changes_since` /
+  `get_record_versions` filter with `(SELECT project_id FROM
+  project_state)`. The trigger bodies already did this. Before the fix,
+  copying a project folder under a new name made every
+  `labeled/changes` poll silently empty.
+  Guard triggers (`trg_pid_*`, created on every read-write open)
+  enforce D8 inside the file: exactly one `project_state` row with a
+  non-empty id; every `record_versions` / `change_log` row carries it.
+  Changing the id in `project_state` cascades to both tables. Revision
+  `0004_project_id_consistency` refuses (and rolls back) a database
+  that breaks this before the guards existed. Matching the file's id
+  against the folder, `project.json` and the auth database is Spec 0002
+  Phase 1.
+
+------------------------------------------------------------------------
+RUN (from the git root; see TEST RULES in context.txt)
+------------------------------------------------------------------------
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest tests/test_change_tracking.py -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest tests/test_migrate_project.py -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 300 python -m pytest asreview/webapp/tests/test_api/test_collection_sync.py -q -p no:cacheprovider'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview && timeout 400 python -m pytest asreview/webapp/tests/test_api/test_labeled_pagination.py -q -p no:cacheprovider'
+  ruff check + ruff format --check on the changed Python files.
+  Paste the output. There must be no failures.
+
+MANUAL CHECK
+  Copy a real project folder (e.g. ~/.asreview/<id>) to a scratch dir
+  under a NEW name, open it with asr.open_db in read-write mode, and
+  confirm: the open succeeds (0004 passes), db.project_id is the
+  ORIGINAL id, and label_record + get_changes_since reports the record.
+  Never open the original folder read-write.
+
+DONE WHEN
+  - get_changes_since and get_record_versions take the project id only
+    from project_state; Database.project_id returns the stored id.
+  - The trg_pid_* triggers exist after every read-write open and refuse
+    every case in test_pid_guards_refuse; the cascade works.
+  - 0004 is in the ledger of new and migrated databases and refuses an
+    inconsistent one without changing it.
+  - Only these files changed:
+      asreview/database/fork_migrations.py
+      asreview/database/database.py
+      tests/test_change_tracking.py
+      tests/test_migrate_project.py
+      specs/0001-collection-snapshot.md (the note, below the marker)
+========================================================================

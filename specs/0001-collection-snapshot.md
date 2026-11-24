@@ -267,7 +267,7 @@ SELECT project_id, version, {rid}, '{source}', (julianday('now') - 2440587.5) * 
 
 Config tables: `UPDATE project_state SET version = version + 1, config_version = version + 1` (right-hand sides see the old row, so `config_version` = new version).
 
-**`labeled/changes` (10g).** Prune (≤ 1/hour) → read `project_state` (watermark, D11) → `reset` if `since > watermark` or `since < pruned_version` → `get_changes_since(since, watermark)` (one entry per record, its max version; clamped to the watermark) → `reset` if > 200 → only if there are changes, scan the membership down to the boundary with the same helpers as `/labeled`. Empty polls cost two small SELECTs.
+**`labeled/changes` (10g).** Prune the log (≤ 1/hour, debugging only) → read `project_state` (watermark, D11) → `reset` if `since > watermark` → `get_changes_since(since)` from `record_versions` (one row per record, its current version) → `reset` if > 200 → only if there are changes, scan the membership down to the boundary with the same helpers as `/labeled`. Empty polls cost two small SELECTs. See "Sync reads `record_versions`" below.
 
 **`labeled/ids` (10g).** Same scan; `next_cursor` is null exactly when nothing matches beyond the boundary. If every loaded row left the view but more matches exist, the old boundary is returned so scrolling resumes there.
 
@@ -319,3 +319,46 @@ project by `project_file_version` 3 and its database by `user_version` 3.
 - Known failures before this work: about 12 in `tests/test_database.py`, about 12 in `asreview/webapp/tests/test_api/test_projects.py`, and `test_list_item_cleaning` (fixed in 10a). Every prompt runs a baseline first; "no new failures" is the bar.
 - Baseline as of 2026-11-22 (after 10d3): `tests/test_database.py` has 10 failures, all from `ORDER BY rowid` on the `INTEGER PRIMARY KEY` results table (fixed in 10d4); the webapp suite has 0 failures (609 passed, 12 skipped). From 10e on, the bar is 0 failures in the files each prompt runs.
 - Flask API tests need the network (Synergy dataset). See the spec's open risk.
+
+### Sync reads `record_versions`, not `change_log` (2026-11-23)
+
+Decided by the user: `change_log` stays (10e triggers keep writing it) as a debugging history of what changed, when and from which source, pruned after 7 days at most once per hour. **No sync logic reads it.** This supersedes, in the spec above the line:
+
+- Part 4 "changes": entries come from `record_versions` rows with `version > since` (each record's current version), not from `change_log` rows. A record whose latest write is newer than the watermark is reported with that newer version; the next poll sees it again and the client ignores it (same version). Harmless, as in D11.
+- "`since` is older than the oldest retained log entry" is no longer a reset reason. `reset` happens only when `since > watermark` or more than 200 records changed. A client idle for weeks gets its changes (or a reset if > 200), never a reset caused by pruning.
+- The test "`reset` … after pruning" becomes: pruning does not change what `changes` returns.
+- `project_state.pruned_version` is still written by pruning, as debug information (the log is complete above it). `last_pruned_at` gates pruning. Neither is read by the sync.
+
+Why: `record_versions` already holds what the sync needs, so the log added a reset path and edge cases without information the sync uses. Ledger revision `0003_record_versions_version_idx` adds `idx_record_versions_version ON record_versions (project_id, version)` (10g). Measured: the poll query costs 0.61 ms at 10k records and 5.4 ms at 100k without it, 0.004 ms with it; the index adds < 1 µs per tracked write.
+
+### Polls never take the write lock for pruning (10g2, 2026-11-24)
+
+`prune_change_log` checks the hourly gate with a plain read first and
+takes the write lock (`BEGIN IMMEDIATE`, then checks again) only when
+pruning is due. A busy database while pruning is logged and ignored by
+`labeled/changes`, so pruning never fails a poll. It raises
+`RuntimeError` inside an open transaction instead of committing the
+caller's work; `labeled/changes` turns that into a 409 with a helpful
+message rather than a bare 500. Measured before the fix: with another
+writer holding the lock, every poll failed with "database is locked"
+after 5.2 s.
+
+### One project id per file (10g3, 2026-11-24)
+
+Supersedes the Q4 answer ("project_state.project_id = folder name,
+informational until a Postgres merge"). The folder name only seeds
+`project_state` when `0001_change_tracking` creates it. After that
+the stored row is the only authority inside the file:
+`Database.project_id` reads it, and `get_changes_since` /
+`get_record_versions` filter with `(SELECT project_id FROM
+project_state)`. The trigger bodies already did this. Before the fix,
+copying a project folder under a new name made every
+`labeled/changes` poll silently empty.
+Guard triggers (`trg_pid_*`, created on every read-write open)
+enforce D8 inside the file: exactly one `project_state` row with a
+non-empty id; every `record_versions` / `change_log` row carries it.
+Changing the id in `project_state` cascades to both tables. Revision
+`0004_project_id_consistency` refuses (and rolls back) a database
+that breaks this before the guards existed. Matching the file's id
+against the folder, `project.json` and the auth database is Spec 0002
+Phase 1.
