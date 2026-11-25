@@ -1,0 +1,115 @@
+========================================================================
+TASK 10i2 — Review feedback on 10h + 10i (Collection snapshot frontend)
+========================================================================
+(Paste the SHARED CONTEXT block (context.txt) ABOVE this task first.)
+DEPENDS ON: 10h + 10i (staged).
+STATE: Your 10h/10i work is STAGED. Claude's review fixes are already in
+       the working tree as UNSTAGED changes on top of it. Read them with
+       `git diff` (unstaged vs staged). Do NOT revert them. Check them,
+       finish item 6, run everything, and report.
+
+VERDICT ON 10h/10i
+  Good work: the model and the hook follow the prompts, only the allowed
+  files changed, nothing imports the deleted labeledPaging or
+  fetchLabeledRecord any more, Jest is green and the build adds no
+  ESLint warning (the one in ReviewPageTraining.js predates 10i).
+  The problems below are all in what happens when a request FAILS or
+  arrives while another one is running. Each is fixed in the working tree.
+
+------------------------------------------------------------------------
+PROBLEMS AND FIXES (already applied — review them)
+------------------------------------------------------------------------
+1. HIGH — a failed patch after a poll is lost for good (D2).
+   poll commits markChanges (new watermark, new configVersion) BEFORE it
+   fetches /records for idsToPatch and the forms. If either fetch fails,
+   the next poll asks `since` the NEW watermark, so the server never
+   reports those changes again: the card keeps its old content, or the
+   forms stay old, with no banner, until something else changes.
+   FIX (useCollection.js, poll .catch): roll back to the values from
+   before the poll, `watermark: since`, `configVersion:
+   prevConfigVersion`, but commit only if something actually moved (no
+   re-render every 15 s while offline). A re-reported change is harmless
+   (same version → no patch), a lost patch is not.
+
+2. HIGH — a failed Refresh hides cards and removes the banner.
+   refresh commits reconcile (stale = false, rows dropped for ids that
+   must be fetched) BEFORE /records. If that fetch fails: new or moved
+   cards are missing (visibleRows skips ids without a row), changed cards
+   show old content, and the banner is gone, so the user cannot retry.
+   FIX (refresh .catch): commit `stale: true` and the old configVersion.
+   The next reconcile fetches exactly what is still missing or old,
+   because versions only rise through applyRowUpdates.
+
+3. MEDIUM — a Refresh click while busy is dropped silently.
+   `if (busy.current) return;` A poll with patches can take a while; a
+   click in that window does nothing.
+   FIX: a `wantRefresh` ref, like `wantMore`. One `finish()` helper now
+   releases `busy` and then runs the queued Refresh first, else the
+   queued loadMore. All three operations end with `.finally(finish)`.
+   `refreshRef` mirrors `loadMoreRef`.
+
+4. LOW — a counter that went backwards breaks Refresh.
+   The server replies reset when `since > watermark`, i.e. the project's
+   version counter went backwards (a results.db restored under an open
+   tab). Then server versions are lower than the client's, and reconcile
+   (`item version > versions[id]`) would keep outdated rows.
+   FIX (collectionModel.js): emptyState gets `rewound: false`. A reset
+   whose watermark is lower than state.watermark sets the sticky
+   `rewound: true`. In useCollection the mount effect body moved into
+   `startSnapshot()`; Refresh calls it instead of reconciling when
+   `state.rewound`. The banner still appears first (D1: no jump without a
+   click). New Jest test "marks a reset with a lower watermark as rewound
+   (sticky)", plus `rewound` false in the existing reset test.
+
+5. LOW — lost "Loading more..." text, and an untested helper.
+   - The old sentinel showed "Loading more..." while fetching (prompt:
+     "keep today's look"). FIX: the hook returns `isLoadingMore`;
+     LabeledRecord shows the old text and disables the ButtonBase while
+     loading.
+   - snapshotParams was meant to be tested (10h: "keep it here so that
+     the rule is tested") but no test imported it. FIX: a snapshotParams
+     test (empty → "end", else the cursor).
+
+------------------------------------------------------------------------
+LEFT FOR YOU
+------------------------------------------------------------------------
+6. FORMATTING: your four new/changed HistoryComponents files are not
+   prettier-formatted (every other file in that folder is). package.json
+   configures husky + lint-staged, but that hook is not installed in
+   this clone (core.hooksPath is unset), so nothing formats on commit.
+   Run, from asreview/webapp:
+     npx prettier --write src/ProjectComponents/HistoryComponents/useCollection.js src/ProjectComponents/HistoryComponents/collectionModel.js src/ProjectComponents/HistoryComponents/collectionModel.test.js src/ProjectComponents/HistoryComponents/LabeledRecord.js
+   and nothing else. Do not reformat other files.
+
+7. REVIEW the fixes in 1–5. If you find a problem in one, STOP and
+   report it instead of rewriting it. Known and accepted: a failed first
+   page shows the error with no retry button (F5 retries); 10g2's 409 from
+   labeled/changes is a failed poll (swallowed, retried next tick).
+
+------------------------------------------------------------------------
+RUN (from the git root)
+------------------------------------------------------------------------
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && CI=true npx react-scripts test --watchAll=false src/ProjectComponents/HistoryComponents'
+    (Claude measured 25 passed before formatting)
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && npx prettier --check src/ProjectComponents/HistoryComponents src/ProjectComponents/ReviewComponents/RecordCard.js src/ProjectComponents/ReviewComponents/RecordCardLabeler.js src/api/ProjectAPI.js'
+  devbox run -- sh -c 'cd /Users/killi/Dev/asreview/asreview/asreview/webapp && npm run build'
+    (only warning allowed: TRAINING_STALE_SECONDS in ReviewPageTraining.js)
+  Paste all three outputs.
+
+  Manual checks for the user (report them; do not claim you did them),
+  in addition to the 8 checks in 10i:
+    9. With the Collection open, stop the server for ~20 s, then start
+       it again. Nothing breaks; within one poll the view is current
+       again (a change made by another browser meanwhile shows up).
+   10. Click Refresh right after a poll starts (devtools: throttle to
+       "Slow 3G"). The Refresh still runs once the poll finishes.
+
+DONE WHEN
+  - The fixes in 1–5 are kept (or a problem is reported), and 6 is done.
+  - Jest, prettier --check and the build are green as above.
+  - Only these files differ from the staged state:
+      .../HistoryComponents/useCollection.js
+      .../HistoryComponents/collectionModel.js
+      .../HistoryComponents/collectionModel.test.js
+      .../HistoryComponents/LabeledRecord.js
+========================================================================

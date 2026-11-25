@@ -1,22 +1,26 @@
-import { Box, ButtonBase, Fade, Stack, Typography } from "@mui/material";
+import {
+  Alert,
+  Box,
+  Button,
+  ButtonBase,
+  CircularProgress,
+  Fade,
+  Stack,
+  Typography,
+  useMediaQuery,
+} from "@mui/material";
 import { grey } from "@mui/material/colors";
 import React from "react";
 import { InView } from "react-intersection-observer";
-import { useInfiniteQuery, useQuery, useQueryClient } from "react-query";
+import { useQuery } from "react-query";
 
 import { InlineErrorHandler } from "Components";
 import { RecordCard } from "ProjectComponents/ReviewComponents";
 import { ProjectAPI } from "api";
-
-import { useMediaQuery } from "@mui/material";
 import { useReviewSettings } from "context/ReviewSettingsContext";
 
-import {
-  formsOf,
-  getNextPageParam,
-  patchRowInPages,
-  usersOf,
-} from "./labeledPaging";
+import { visibleRows } from "./collectionModel";
+import useCollection from "./useCollection";
 
 const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
   const { orientation, modelLogLevel, expandAbstract } = useReviewSettings();
@@ -37,119 +41,88 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
     },
   );
 
-  const queryClient = useQueryClient();
-  const filterValues = filterQuery.map((filter) => filter.value);
-
-  // The query key is memoised on the filter VALUES (JSON), not the array
-  // identity, so a parent re-render with the same filters keeps the same key
-  // and `setQueryData` patching (below) targets the right query.
-  const queryKey = React.useMemo(
-    () => [
-      "fetchLabeledRecord",
-      { project_id: project_id, subset: label, filter: filterValues },
-    ],
+  // Memoise on the filter VALUES so the snapshot key (and therefore the poll
+  // interval) stays stable across parent re-renders.
+  const filterValues = React.useMemo(
+    () => filterQuery.map((filter) => filter.value),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [project_id, label, JSON.stringify(filterValues)],
+    [JSON.stringify(filterQuery)],
   );
 
   const {
-    data,
-    error,
-    fetchNextPage,
-    hasNextPage,
-    isError,
-    isFetched,
-    isFetchingNextPage,
+    state,
     isLoading,
-  } = useInfiniteQuery(queryKey, ProjectAPI.fetchLabeledRecord, {
-    getNextPageParam,
-    refetchOnWindowFocus: false,
-    refetchOnReconnect: false,
-    refetchOnMount: "always",
-    cacheTime: 0, // no snapshot reuse after navigating away
-  });
+    isLoadingMore,
+    error,
+    loadMore,
+    refresh,
+    onRowUpdated,
+    onEditingChange,
+  } = useCollection({ project_id, subset: label, filter: filterValues });
 
-  // Patch exactly one row (an own edit) instead of refetching every page.
-  const onRowUpdated = React.useCallback(
-    (row) => {
-      if (!row) return;
-      queryClient.setQueryData(queryKey, (old) =>
-        old ? patchRowInPages(old, row) : old,
-      );
-      queryClient.invalidateQueries(["fetchLabeledStats", { project_id }]);
-    },
-    [queryClient, queryKey, project_id],
-  );
-
-  const forms = formsOf(data);
-  const users = usersOf(data);
-
-  /**
-   * Check if this component is mounted
-   */
-  const mounted = React.useRef(false);
-  React.useEffect(() => {
-    mounted.current = true;
-    return () => {
-      mounted.current = false;
-    };
-  }, []);
+  const rows = visibleRows(state);
 
   return (
     <Box aria-label="labeled record">
-      {isError && <InlineErrorHandler message={error?.message} />}
-      {/* {n_prior !== 0 && !isError && (isLoading || !mounted.current) && (
-        <Box className={classes.loading}>
+      {error && <InlineErrorHandler message={error} />}
+      {isLoading ? (
+        <Box sx={{ display: "flex", justifyContent: "center", pt: 5 }}>
           <CircularProgress />
         </Box>
-      )} */}
-      {!isError && !(isLoading || !mounted.current) && isFetched && (
-        <Fade in={!isError && !(isLoading || !mounted.current) && isFetched}>
+      ) : (
+        <Fade in={!isLoading}>
           <Stack aria-label="labeled record card" spacing={5}>
-            {isFetched &&
-              data?.pages.map((page) =>
-                page.result.map((record) => (
-                  <RecordCard
-                    project_id={project_id}
-                    record={record}
-                    collapseAbstract={!expandAbstract}
-                    disabled={true}
-                    isOwner={isOwner}
-                    allowMemberReplace={
-                      projectInfo?.allow_member_replace === true
-                    }
-                    transitionType={null}
-                    landscape={
-                      orientation === "landscape" && !landscapeDisabled
-                    }
-                    modelLogLevel={modelLogLevel}
-                    changeDecision={mode === "oracle"}
-                    tagsForm={forms.tags_form}
-                    listsForm={forms.lists_form}
-                    users={users}
-                    onRowUpdated={onRowUpdated}
-                    key={"record-card-" + project_id + "-" + record?.record_id}
-                  />
-                )),
-              )}
+            {state.stale && (
+              <Alert
+                severity="info"
+                action={
+                  <Button color="inherit" size="small" onClick={refresh}>
+                    Refresh
+                  </Button>
+                }
+                sx={{ position: "sticky", top: 0, zIndex: 2 }}
+              >
+                This view is out of date.
+              </Alert>
+            )}
+            {rows.map((record) => (
+              <RecordCard
+                project_id={project_id}
+                record={record}
+                collapseAbstract={!expandAbstract}
+                disabled={true}
+                isOwner={isOwner}
+                allowMemberReplace={projectInfo?.allow_member_replace === true}
+                transitionType={null}
+                landscape={orientation === "landscape" && !landscapeDisabled}
+                modelLogLevel={modelLogLevel}
+                changeDecision={mode === "oracle"}
+                tagsForm={state.forms.tags_form}
+                listsForm={state.forms.lists_form}
+                users={state.users}
+                onRowUpdated={onRowUpdated}
+                onEditingChange={onEditingChange}
+                key={"record-card-" + project_id + "-" + record?.record_id}
+              />
+            ))}
             <Box sx={{ display: "flex", justifyContent: "center" }}>
               <InView
                 as="div"
-                onChange={(inView, entry) => {
-                  if (inView && hasNextPage && !isFetchingNextPage) {
-                    fetchNextPage();
+                onChange={(inView) => {
+                  if (inView && state.hasMore) {
+                    loadMore();
                   }
                 }}
               >
-                <ButtonBase disabled={!hasNextPage || isFetchingNextPage}>
+                <ButtonBase disabled={!state.hasMore || isLoadingMore}>
                   <Typography
                     gutterBottom
                     variant="button"
                     sx={{ color: grey[500] }}
                   >
-                    {isFetchingNextPage
+                    {isLoadingMore
                       ? "Loading more..."
-                      : hasNextPage
+                      : state.hasMore
                         ? "Load More"
                         : "Nothing more to load"}
                   </Typography>

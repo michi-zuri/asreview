@@ -962,12 +962,31 @@ const RecordCardLabeler = ({
   onDirtyChange = null,
   disabled = false,
   onRowUpdated = null,
+  onEditingChange = null,
 }) => {
   const [editState] = useToggle(!(label === 1 || label === 0) && !disabled);
   const [showNotesDialog, toggleShowNotesDialog] = useToggle(false);
   const [showTagsDialog, toggleShowTagsDialog] = useToggle(false);
   const [showListsDialog, toggleShowListsDialog] = useToggle(false);
   const [isDirty, setIsDirty] = React.useState(false);
+
+  // The card is "editing" while it has unsaved labeler changes or an open
+  // Note/Tags/Lists dialog. Expose that to the Collection (Spec 0001) so a
+  // Refresh keeps such a card in place. A ref avoids re-firing the effect on
+  // every render (the parent creates a new arrow function each time).
+  const editing =
+    isDirty || showNotesDialog || showTagsDialog || showListsDialog;
+  const editingCb = React.useRef(onEditingChange);
+  editingCb.current = onEditingChange;
+  React.useEffect(() => {
+    if (editingCb.current) editingCb.current(editing);
+  }, [editing]);
+  React.useEffect(
+    () => () => {
+      if (editingCb.current) editingCb.current(false);
+    },
+    [],
+  );
 
   const initTags = React.useCallback(
     () => mergeTagValues(tagsForm, tagValues),

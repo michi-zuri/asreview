@@ -521,6 +521,7 @@ const RecordCard = ({
   listsForm,
   users,
   onRowUpdated,
+  onEditingChange = null,
 }) => {
   const tagsFormEff = tagsForm !== undefined ? tagsForm : record.tags_form;
   const listsFormEff = listsForm !== undefined ? listsForm : record.lists_form;
@@ -664,6 +665,11 @@ const RecordCard = ({
               onDirtyChange={setIsDirty}
               disabled={disabled}
               onRowUpdated={onRowUpdated}
+              onEditingChange={
+                onEditingChange
+                  ? (editing) => onEditingChange(record.record_id, editing)
+                  : null
+              }
             />
           </Grid>
         </Grid>

@@ -333,9 +333,7 @@ class ProjectAPI {
     });
   }
 
-  static fetchLabeledRecord({ pageParam, queryKey }) {
-    const { project_id, subset, filter } = queryKey[1];
-
+  static fetchLabeledPage({ project_id, subset, filter, cursor, per_page }) {
     const url = api_url + `projects/${project_id}/labeled`;
     return new Promise((resolve, reject) => {
       axios
@@ -343,12 +341,78 @@ class ProjectAPI {
           params: {
             subset: subset,
             filter: filter,
-            // Keyset (cursor) pagination: undefined on the first page.
-            cursor: pageParam ?? undefined,
+            cursor: cursor ?? undefined,
+            per_page: per_page,
           },
           paramsSerializer: (params) => {
             return qs.stringify(params, { arrayFormat: "repeat" });
           },
+          withCredentials: true,
+        })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static fetchLabeledChanges({ project_id, subset, filter, since, boundary }) {
+    const url = api_url + `projects/${project_id}/labeled/changes`;
+    return new Promise((resolve, reject) => {
+      axios
+        .get(url, {
+          params: {
+            subset: subset,
+            filter: filter,
+            since: since,
+            boundary: boundary,
+          },
+          paramsSerializer: (params) => {
+            return qs.stringify(params, { arrayFormat: "repeat" });
+          },
+          withCredentials: true,
+        })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static fetchLabeledIds({ project_id, subset, filter, boundary }) {
+    const url = api_url + `projects/${project_id}/labeled/ids`;
+    return new Promise((resolve, reject) => {
+      axios
+        .get(url, {
+          params: {
+            subset: subset,
+            filter: filter,
+            boundary: boundary,
+          },
+          paramsSerializer: (params) => {
+            return qs.stringify(params, { arrayFormat: "repeat" });
+          },
+          withCredentials: true,
+        })
+        .then((result) => {
+          resolve(result["data"]);
+        })
+        .catch((error) => {
+          reject(axiosErrorHandler(error));
+        });
+    });
+  }
+
+  static fetchRecordsByIds({ project_id, ids }) {
+    const url = api_url + `projects/${project_id}/records`;
+    return new Promise((resolve, reject) => {
+      axios
+        .get(url, {
+          params: { ids: ids.join(",") },
           withCredentials: true,
         })
         .then((result) => {
