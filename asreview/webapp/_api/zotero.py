@@ -97,7 +97,7 @@ ZOTERO_API_VERSION = "3"
 
 # Re-check interval for failed attachment lookups by the LLM worker: every
 # 5 minutes. The record card's live check is paced by the client instead
-# (RecordCard.js: 3 s in view, then every 5 minutes).
+# (RecordCard.js: 1 s in view, then every minute).
 DEFAULT_RECHECK_INTERVAL = 300
 
 # The background sync (zotero_sync.py) skips records checked in the last 24 h.

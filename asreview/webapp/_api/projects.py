@@ -2859,7 +2859,7 @@ def api_get_record_attachment(project, record_id):  # noqa: F401
     ``attachment`` field: either the attachment key (full text available) or an ISO 8601
     timestamp of when the lookup last failed. Every request looks up Zotero again, also
     when a key is stored (the PDF may have been removed since). The client paces the
-    requests (RecordCard.js: 3 s in view, then every 5 minutes while visible).
+    requests (RecordCard.js: 1 s in view, then every minute while visible).
     """
     record_id = int(record_id)
 

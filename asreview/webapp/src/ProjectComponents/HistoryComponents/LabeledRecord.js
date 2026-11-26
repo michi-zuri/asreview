@@ -80,7 +80,17 @@ const LabeledRecord = ({ project_id, label, filterQuery, mode = "oracle" }) => {
                     Refresh
                   </Button>
                 }
-                sx={{ position: "sticky", top: 0, zIndex: 2 }}
+                sx={(theme) => ({
+                  // Fixed, so it is in sight at every scroll position.
+                  position: "fixed",
+                  bottom: 24,
+                  left: { xs: "50%", md: "calc(50% + 44px)" }, // 88px nav rail
+                  transform: "translateX(-50%)",
+                  zIndex: theme.zIndex.snackbar,
+                  // The theme's outlined Alert is transparent; cards would show through.
+                  bgcolor: "background.paper",
+                  boxShadow: theme.shadows[6],
+                })}
               >
                 This view is out of date.
               </Alert>

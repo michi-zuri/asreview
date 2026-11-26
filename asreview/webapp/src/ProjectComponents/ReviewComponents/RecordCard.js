@@ -44,8 +44,17 @@ import {
 import { fontSizeOptions } from "globals.js";
 
 // Live Zotero PDF check on the record card (see ZoteroFullTextButton).
-const ATTACHMENT_DWELL_MS = 3000;
-const ATTACHMENT_RECHECK_MS = 5 * 60 * 1000;
+const ATTACHMENT_DWELL_MS = 1000;
+const ATTACHMENT_RECHECK_MS = 60 * 1000;
+
+// Mirrors is_attachment_key / build_reader_url in webapp/_api/zotero.py.
+const ZOTERO_KEY_RE = /^[A-Z0-9]{8}$/;
+const zoteroReaderUrl = (zotero, itemKey, attachmentKey) => {
+  const group = zotero.group_slug
+    ? `${zotero.group_id}/${zotero.group_slug}`
+    : `${zotero.group_id}`;
+  return `https://www.zotero.org/groups/${group}/items/${itemKey}/attachment/${attachmentKey}/reader`;
+};
 
 const ZoteroFullTextButton = ({
   project_id,
@@ -60,6 +69,8 @@ const ZoteroFullTextButton = ({
   // stays visible, re-check every ATTACHMENT_RECHECK_MS, also when a PDF was found
   // (it can be removed in Zotero). staleTime keeps re-entries within that interval
   // from refetching; a full page reload clears the cache and checks again.
+  // Until the live check answers, the card shows the state stored on the server
+  // (the row's `attachment` field), so the icon is there from the start.
   const { ref, inView } = useInView();
   const [dwelled, setDwelled] = React.useState(false);
 
@@ -92,6 +103,34 @@ const ZoteroFullTextButton = ({
       retry: false,
     },
   );
+
+  // One request per project, shared by every card.
+  const { data: zotero } = useQuery(
+    ["fetchZoteroConfig", { project_id }],
+    ProjectAPI.fetchZoteroConfig,
+    {
+      enabled: !!project_id,
+      refetchOnWindowFocus: false,
+      staleTime: Infinity,
+      retry: false,
+    },
+  );
+
+  const stored = React.useMemo(() => {
+    const attachment = record?.attachment;
+    if (!zotero?.group_id || !zotero?.api_key || !attachment) return undefined;
+    if (ZOTERO_KEY_RE.test(attachment)) {
+      return {
+        configured: true,
+        available: true,
+        url: zoteroReaderUrl(zotero, record.original_id, attachment),
+      };
+    }
+    // A timestamp: the last lookup found no PDF.
+    return { configured: true, available: false };
+  }, [zotero, record?.attachment, record?.original_id]);
+
+  const shown = data ?? stored;
 
   const uploadInputRef = React.useRef(null);
   const replaceFileInputRef = React.useRef(null);
@@ -193,14 +232,14 @@ const ZoteroFullTextButton = ({
 
   const originalId = record?.original_id;
 
-  if (data?.available && data?.url) {
+  if (shown?.available && shown?.url) {
     return (
       <>
         <span ref={ref}>
           <Tooltip title={`Open full text of ${originalId} in Zotero`}>
             <StyledIconButton
               className="record-card-icon"
-              href={data.url}
+              href={shown.url}
               target="pdfreader"
             >
               <PictureAsPdfIcon />
@@ -276,7 +315,7 @@ const ZoteroFullTextButton = ({
 
   // Zotero is configured and confirmed there is no full text for this record: show a
   // struck-through PDF icon that opens a file picker for uploading a PDF.
-  if (data?.configured && data?.available === false) {
+  if (shown?.configured && shown?.available === false) {
     return (
       <Tooltip title={`Upload full text PDF for ${originalId}`}>
         <span ref={ref}>
